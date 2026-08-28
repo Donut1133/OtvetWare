@@ -1,0 +1,40 @@
+name: Release
+
+# Собирает .exe и прикладывает его к релизу, когда пушится тег вида v1.0.0:
+#   git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Тесты
+        run: cargo test --workspace
+
+      - name: Сборка
+        run: cargo build --release -p otvet-gui
+
+      - name: Собрать архив
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/otvetware.exe dist/
+          Copy-Item README.md, LICENSE dist/
+          New-Item -ItemType Directory -Force dist/data | Out-Null
+          Copy-Item data/*.example.json, data/README.md dist/data/
+          Compress-Archive -Path dist/* -DestinationPath otvetware-windows-x64.zip
+
+      - name: Опубликовать релиз
+        uses: softprops/action-gh-release@v2
+        with:
+          files: otvetware-windows-x64.zip
+          generate_release_notes: true

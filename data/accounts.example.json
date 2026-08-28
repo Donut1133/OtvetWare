@@ -1,0 +1,19 @@
+[
+  {
+    "name": "Аккаунт 1",
+    "cookies": "Mpop=ЗДЕСЬ_КУКИ_СЕССИИ; oid=...; s=...",
+    "proxy": "socks5://user:pass@203.0.113.10:1080",
+    "userId": 123456789,
+    "username": "nick_from_mailru",
+    "authBad": false,
+    "karma": { "total": 12, "history": 3, "knowledge": 5, "discussion": 4 },
+    "karmaAt": 1787641518039
+  },
+  {
+    "name": "Аккаунт 2 — с несколькими прокси",
+    "cookies": "Mpop=...",
+    "proxy": "203.0.113.11:9000:login:pass | http://203.0.113.12:8080",
+    "userId": 987654321,
+    "username": "another_nick"
+  }
+]

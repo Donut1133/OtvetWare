@@ -1,0 +1,27 @@
+[package]
+name = "otvet-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+chrono.workspace = true
+regex.workspace = true
+parking_lot.workspace = true
+futures.workspace = true
+urlencoding.workspace = true
+
+# native-tls (schannel на Windows) — никаких cmake/nasm в сборке.
+reqwest = { version = "0.12", default-features = false, features = [
+  "default-tls", "http2", "json", "gzip", "brotli", "deflate", "socks", "multipart", "charset",
+] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+
+[dev-dependencies]
+parking_lot.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }

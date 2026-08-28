@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["core", "gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "process", "io-util", "net"] }
+anyhow = "1"
+rand = "0.8"
+chrono = "0.4"
+regex = "1"
+parking_lot = "0.12"
+futures = "0.3"
+urlencoding = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "unwind"
+strip = true
