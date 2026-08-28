@@ -82,7 +82,7 @@ impl AccountsPanel {
         if !self.initialized && !all.is_empty() {
             self.initialized = true;
             // Не-красные = те, про кого не известно точно, что они разлогинены.
-            for a in &all {
+            for a in all.iter() {
                 if a.auth_bad != Some(true) && a.has_cookies() {
                     self.selected.insert(a.name.clone());
                 }

@@ -9,6 +9,7 @@ use crate::theme;
 use egui::RichText;
 use otvet_core::journals::Styles;
 use otvet_core::runner::{self, RunOne, RunnerCfg};
+use otvet_core::util::Stop;
 use otvet_core::{answerer, asker, complain, replier, subscribe, votes};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -273,6 +274,7 @@ impl App {
                         Mode::Questions => self.forms.questions.ui(ui, &mut self.forms.ai, &self.styles),
                         Mode::Comments => self.forms.comments.ui(ui, &mut self.forms.ai, &self.styles),
                     }
+                    self.tools(ui);
 
                     ui.add_space(10.0);
                     ui.separator();
@@ -281,6 +283,118 @@ impl App {
                     ui.add_space(6.0);
                 });
             });
+    }
+
+    /// Инструменты режима: разовые проверки, которые не запускают прогон.
+    /// Пишут в ту же консоль, что и бот, — отдельного окна не нужно.
+    fn tools(&mut self, ui: &mut egui::Ui) {
+        match self.mode {
+            Mode::Subscribe => {
+                crate::forms::block(ui, "Проверка");
+                if ui
+                    .button("Проверить подписки")
+                    .on_hover_text("Пройтись по отмеченным аккаунтам и посмотреть, кто на кого уже подписан")
+                    .clicked()
+                {
+                    self.check_subscriptions();
+                }
+                crate::forms::hint(ui, "Ничего не меняет — только смотрит.");
+            }
+            Mode::Votes => {
+                crate::forms::block(ui, "Проверка");
+                if ui
+                    .button("Кто голосовал")
+                    .on_hover_text("Показать плюсы и минусы под постом или ответом из списка ссылок")
+                    .clicked()
+                {
+                    self.list_voters();
+                }
+                crate::forms::hint(ui, "Берёт первую ссылку вида /question/… из поля выше.");
+            }
+            _ => {}
+        }
+    }
+
+    /// Кто уже подписан: матрица «аккаунт → профили».
+    fn check_subscriptions(&self) {
+        let st = self.state(self.mode);
+        let log = st.log.clone();
+        let all = self.bg.accounts();
+        let accounts = self.accounts.selected_accounts(&all);
+        let profiles = crate::forms::split_lines(&self.forms.subs.links);
+        if accounts.is_empty() || profiles.is_empty() {
+            log.push("Нужны отмеченные аккаунты и хотя бы одна ссылка на профиль.");
+            return;
+        }
+        let core = self.bg.core.clone();
+        log.push(&format!("Проверяю подписки: аккаунтов {}, профилей {}", accounts.len(), profiles.len()));
+        self.bg.spawn(async move {
+            let stop = Stop::new();
+            for acc in accounts {
+                let mut ok = 0;
+                let mut parts = Vec::new();
+                for p in &profiles {
+                    match subscribe::subscription_status(&core, &acc, p, &stop).await {
+                        Some((who, true)) => {
+                            ok += 1;
+                            parts.push(format!("{} ✅", who.name));
+                        }
+                        Some((who, false)) => parts.push(format!("{} —", who.name)),
+                        None => parts.push("не понял профиль".into()),
+                    }
+                }
+                log.push(&format!("{}: {ok}/{} — {}", acc.name, profiles.len(), parts.join(", ")));
+            }
+            log.push("Проверка подписок закончена.");
+        });
+    }
+
+    /// Список проголосовавших под постом/ответом, с никами.
+    fn list_voters(&self) {
+        let st = self.state(self.mode);
+        let log = st.log.clone();
+        let all = self.bg.accounts();
+        let Some(acc) = self.accounts.selected_accounts(&all).into_iter().next() else {
+            log.push("Нужен хотя бы один отмеченный аккаунт — список смотрится из-под него.");
+            return;
+        };
+        let Some(target) =
+            crate::forms::split_lines(&self.forms.votes.links).iter().find_map(|l| votes::parse_target_id(l))
+        else {
+            log.push("В списке нет ссылки на пост или ответ (нужен /question/… или ?reply=…).");
+            return;
+        };
+
+        let core = self.bg.core.clone();
+        log.push(&format!("Смотрю голоса под {} #{}…", target.kind.ru(), target.id));
+        self.bg.spawn(async move {
+            let stop = Stop::new();
+            match votes::list_voters(&core, &acc, &target, &stop).await {
+                Err(e) => log.push(&format!("❌ {e}")),
+                Ok(voters) if voters.is_empty() => log.push("Голосов пока нет."),
+                Ok(voters) => {
+                    let plus = voters.iter().filter(|v| v.reaction == 1).count();
+                    let minus = voters.len() - plus;
+                    log.push(&format!("Всего {}: плюсов {plus}, минусов {minus}", voters.len()));
+                    // Ники резолвятся по одному: каждый заход проходит антибот,
+                    // поэтому делаем это только для показанных строк.
+                    for v in voters.iter().take(50) {
+                        let nick = votes::resolve_nick(&core, &acc, v.author_id, &stop)
+                            .await
+                            .unwrap_or_else(|| format!("id{}", v.author_id));
+                        log.push(&format!(
+                            "  {} {}{}",
+                            if v.reaction == 1 { "+" } else { "−" },
+                            nick,
+                            if v.mine { "  (это мы)" } else { "" }
+                        ));
+                    }
+                    if voters.len() > 50 {
+                        log.push(&format!("  …и ещё {}", voters.len() - 50));
+                    }
+                }
+            }
+        });
     }
 
     /// Что мешает запуститься прямо сейчас. Пустой список — можно жать.
