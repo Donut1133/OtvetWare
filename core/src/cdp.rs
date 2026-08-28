@@ -351,6 +351,10 @@ pub async fn login_and_harvest(
         cmd.arg(format!("--proxy-server={p}"));
     }
 
+    // Chromium щедро сыплет в stderr предупреждениями про песочницу и GCM.
+    // Пользователю это не нужно, а в GUI консоли и нет — глушим.
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+
     log("🪟 Открываю браузер — войди в аккаунт вручную. Окно закроется само.");
     let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("не запустить браузер: {e}"))?;
 

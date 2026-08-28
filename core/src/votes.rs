@@ -124,7 +124,12 @@ pub async fn vote_one(
         "entityID": target.id.parse::<i64>().unwrap_or(0),
         "reactionSource": target.kind.source(),
     });
-    let r = core.http.request(acc, &path, ReqOpts::post(body).referer(referer), stop).await?;
+    // Ретраи здесь ЗАПРЕЩЕНЫ. Повтор того же голоса сайт понимает как отмену:
+    // если первый POST дошёл, а ответ потерялся по дороге (обычное дело на
+    // дохлом прокси), вторая попытка снимет только что поставленный голос.
+    // Лучше потерять голос и честно написать об этом, чем тихо его отменить.
+    let opts = ReqOpts::post(body).referer(referer).no_retry();
+    let r = core.http.request(acc, &path, opts, stop).await?;
     if r.blocked {
         return Ok(VoteRes::Blocked);
     }

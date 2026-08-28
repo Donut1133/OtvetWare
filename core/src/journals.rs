@@ -221,7 +221,12 @@ pub struct Styles {
 
 impl Styles {
     pub fn load(root: &Path) -> Self {
-        let Ok(txt) = std::fs::read_to_string(root.join("styles.json")) else {
+        // Свой styles.json — главный источник. Если его ещё нет (свежая
+        // установка), берём пример из комплекта: пусть в списке стилей сразу
+        // будет из чего выбрать, а не одна строчка-заглушка.
+        let txt = std::fs::read_to_string(root.join("styles.json"))
+            .or_else(|_| std::fs::read_to_string(root.join("styles.example.json")));
+        let Ok(txt) = txt else {
             return Self::fallback();
         };
         let Ok(v) = serde_json::from_str::<Value>(&txt) else {
