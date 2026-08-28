@@ -365,7 +365,7 @@ impl AccountsPanel {
         match &mut dlg {
             Dialog::None => {}
             Dialog::Add { name, cookies, proxy, error } => {
-                egui::Window::new("🍪 Новый аккаунт по кукам")
+                egui::Window::new("Новый аккаунт по кукам")
                     .collapsible(false)
                     .resizable(true)
                     .default_width(560.0)
@@ -413,7 +413,7 @@ impl AccountsPanel {
                                     }
                                     match bg.core.accounts.add(acc.clone()) {
                                         Ok(()) => {
-                                            log.push(&format!("➕ Аккаунт «{}» добавлен, проверяю…", acc.name));
+                                            log.push(&format!("Аккаунт «{}» добавлен, проверяю…", acc.name));
                                             selected.insert(acc.name.clone());
                                             spawn_check_one(bg, log.clone(), acc);
                                             close = true;
@@ -429,7 +429,7 @@ impl AccountsPanel {
                     });
             }
             Dialog::Proxy { name, value } => {
-                egui::Window::new(format!("🌐 Прокси — {name}"))
+                egui::Window::new(format!("Прокси — {name}"))
                     .collapsible(false)
                     .default_width(520.0)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -455,7 +455,7 @@ impl AccountsPanel {
                             if ui.button("Сохранить").clicked() {
                                 bg.core.accounts.set_proxy(name, value);
                                 bg.refresh_accounts();
-                                log.push(&format!("🌐 Прокси «{name}» обновлён"));
+                                log.push(&format!("Прокси «{name}» обновлён"));
                                 close = true;
                             }
                             if ui.button("Отмена").clicked() {
@@ -465,7 +465,7 @@ impl AccountsPanel {
                     });
             }
             Dialog::Rename { old, new, error } => {
-                egui::Window::new(format!("✏ Переименовать — {old}"))
+                egui::Window::new(format!("Переименовать — {old}"))
                     .collapsible(false)
                     .default_width(420.0)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -486,7 +486,7 @@ impl AccountsPanel {
                                         if selected.remove(old) {
                                             selected.insert(new.trim().to_string());
                                         }
-                                        log.push(&format!("✏ «{old}» → «{}»", new.trim()));
+                                        log.push(&format!("Переименован: «{old}» → «{}»", new.trim()));
                                         bg.refresh_accounts();
                                         close = true;
                                     }
@@ -563,7 +563,7 @@ impl AccountsPanel {
                                 bg.core.accounts.remove(name);
                                 bg.core.personas.drop_persona(name);
                                 selected.remove(name);
-                                log.push(&format!("🗑 Аккаунт «{name}» удалён"));
+                                log.push(&format!("Аккаунт «{name}» удалён"));
                                 bg.refresh_accounts();
                                 close = true;
                             }
@@ -642,14 +642,14 @@ fn spawn_login(bg: &Arc<Bg>, log: Arc<LogBuf>, name: String, proxy: String, exis
                         a
                     }
                 };
-                log.push(&format!("🍪 Куки сняты ({} шт.)", h.cookies.split(';').count()));
+                log.push(&format!("Куки сняты ({} шт.)", h.cookies.split(';').count()));
                 // Сразу выясняем, кто вошёл: userId нужен для публикации вопросов.
                 let v = api::validate_account(&core, &acc, &Stop::new()).await;
                 api::persist_validation(&core, &name, &v);
                 log.push(&fmt_validation(&name, &v));
                 if let Some(u) = &v.username {
                     log.push(&format!(
-                        "👤 {name} → {u}{}",
+                        "{name} → {u}{}",
                         v.user_id.map(|i| format!(" (id{i})")).unwrap_or_default()
                     ));
                 }

@@ -1,5 +1,8 @@
 # OtvetWare
 
+<!-- Перед публикацией замени OWNER на свой ник на GitHub: в бейдже ниже и в
+     команде git clone. Больше нигде адрес репозитория не зашит. -->
+
 [![CI](https://github.com/OWNER/OtvetWare/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/OtvetWare/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-informational)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](https://www.rust-lang.org/)
