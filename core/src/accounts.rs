@@ -290,16 +290,52 @@ pub fn normalize_cookies_input(input: &str) -> String {
 pub struct AccountsStore {
     writer: crate::store_io::FileWriter,
     list: RwLock<Vec<Account>>,
+    /// Файл существует, но не разобрался. Держим текст ошибки, чтобы сказать о
+    /// ней вслух, а не делать вид, что аккаунтов просто нет.
+    load_error: RwLock<Option<String>>,
 }
 
 impl AccountsStore {
     pub fn open(root: &Path) -> Self {
         let path = root.join("accounts.json");
-        let list = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<Vec<Account>>(&t).ok())
-            .unwrap_or_default();
-        Self { writer: crate::store_io::FileWriter::new(path), list: RwLock::new(list) }
+        let (list, load_error) = Self::read_file(&path);
+        Self {
+            writer: crate::store_io::FileWriter::new(path),
+            list: RwLock::new(list),
+            load_error: RwLock::new(load_error),
+        }
+    }
+
+    /// Прочитать файл. Если он есть, но испорчен — СНАЧАЛА кладём копию рядом.
+    ///
+    /// Иначе выходило так: битый JSON читается как «аккаунтов нет», первая же
+    /// правка перезаписывает файл пустым списком — и куки всех аккаунтов
+    /// потеряны безвозвратно. Копия стоит миллисекунды и спасает от этого.
+    fn read_file(path: &Path) -> (Vec<Account>, Option<String>) {
+        let Ok(txt) = std::fs::read_to_string(path) else {
+            return (Vec::new(), None); // файла нет — обычный первый запуск
+        };
+        match serde_json::from_str::<Vec<Account>>(&txt) {
+            Ok(list) => (list, None),
+            Err(e) => {
+                let backup = path.with_extension(format!("broken-{}.json", crate::journals::now_ms()));
+                let saved = std::fs::write(&backup, &txt).is_ok();
+                let msg = format!(
+                    "accounts.json не разобрался ({e}). {}",
+                    if saved {
+                        format!("Копия сохранена: {}", backup.display())
+                    } else {
+                        "Скопировать не удалось — исправь файл вручную.".to_string()
+                    }
+                );
+                (Vec::new(), Some(msg))
+            }
+        }
+    }
+
+    /// Что пошло не так при чтении файла (если пошло).
+    pub fn load_error(&self) -> Option<String> {
+        self.load_error.read().clone()
     }
 
     pub fn path(&self) -> &Path {
@@ -443,12 +479,13 @@ impl AccountsStore {
 
     /// Перечитать файл с диска (его могла поправить JS-версия или руки).
     pub fn reload(&self) {
-        if let Some(list) = std::fs::read_to_string(self.writer.path())
-            .ok()
-            .and_then(|t| serde_json::from_str::<Vec<Account>>(&t).ok())
-        {
+        let (list, err) = Self::read_file(self.writer.path());
+        // Битый файл не должен молча превращать список в пустой: оставляем то,
+        // что уже загружено, и показываем ошибку.
+        if err.is_none() {
             *self.list.write() = list;
         }
+        *self.load_error.write() = err;
     }
 }
 

@@ -90,6 +90,16 @@ impl AccountsPanel {
         }
 
         self.toolbar(ui, bg, &all);
+        // Файл аккаунтов не прочитался — об этом нужно сказать громко: иначе
+        // человек увидит пустой список и решит, что аккаунты пропали.
+        if let Some(err) = bg.core.accounts.load_error() {
+            ui.add_space(4.0);
+            ui.colored_label(theme::WARN, format!("⚠ {err}"));
+            ui.colored_label(
+                theme::FG_DIM,
+                "Данные из копии никуда не делись. Почини файл (или удали его) и нажми «Перечитать файл».",
+            );
+        }
         ui.add_space(4.0);
         if all.is_empty() {
             // Пустой список — самое частое первое впечатление. Пусть он объясняет,

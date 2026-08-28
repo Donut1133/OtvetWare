@@ -561,7 +561,8 @@ pub async fn post_reply(
         .request(
             acc,
             "/api/topic/answers",
-            ReqOpts::post(body).referer(format!("https://otvet.mail.ru/question/{topic_id}")),
+            // Без ретрая: дубль реплики в ветке виден собеседнику сразу.
+            ReqOpts::post(body).referer(format!("https://otvet.mail.ru/question/{topic_id}")).no_retry(),
             stop,
         )
         .await

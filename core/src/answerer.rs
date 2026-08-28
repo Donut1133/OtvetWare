@@ -306,7 +306,10 @@ pub async fn post_answer(
         .request(
             acc,
             "/api/topic/answers",
-            ReqOpts::post(body).referer(format!("https://otvet.mail.ru/question/{topic_id}")),
+            // Без ретрая: если ответ дошёл, а подтверждение потерялось,
+            // повтор оставит под вопросом ДВА одинаковых ответа от одного
+            // аккаунта. Потерять ответ дешевле — просто возьмём следующий вопрос.
+            ReqOpts::post(body).referer(format!("https://otvet.mail.ru/question/{topic_id}")).no_retry(),
             stop,
         )
         .await
@@ -440,6 +443,10 @@ struct Shared {
     blocked: AtomicBool,
     /// Отказов подряд при отправке.
     fails: AtomicI64,
+    /// Подряд неудачных обращений к нейросети. Ключ может умереть посреди
+    /// прогона (кончился баланс), и без счётчика бот крутил бы ленту вечно,
+    /// каждый раз получая отказ.
+    ai_fails: AtomicI64,
     /// Что уже отвечено (журнал аккаунта + чужие, если включено).
     exclude: Mutex<HashSet<String>>,
     /// Пробовали в этой сессии, но не вышло — второй раз не берём.
@@ -457,7 +464,7 @@ impl Shared {
         limit > 0 && self.count() >= limit
     }
     fn too_many_fails(&self) -> bool {
-        self.fails.load(Ordering::SeqCst) >= MAX_FAILS
+        self.fails.load(Ordering::SeqCst) >= MAX_FAILS || self.ai_fails.load(Ordering::SeqCst) >= MAX_FAILS
     }
 }
 
@@ -594,6 +601,7 @@ pub async fn run_answerer(
         count: AtomicI64::new(0),
         blocked: AtomicBool::new(out.blocked),
         fails: AtomicI64::new(0),
+        ai_fails: AtomicI64::new(0),
         exclude: Mutex::new(exclude),
         tried: Mutex::new(HashSet::new()),
     };
@@ -701,6 +709,18 @@ impl RunCtx<'_> {
         self.stop.sleep_ms((d * 1000.0) as u64).await
     }
 
+    /// Записать неудачу нейросети и, если их подряд слишком много, сказать об
+    /// этом прямо: дальше крутиться бессмысленно и дорого.
+    fn note_ai_fail(&self, msg: &str) {
+        (self.log)(msg);
+        let n = self.sh.ai_fails.fetch_add(1, Ordering::SeqCst) + 1;
+        if n >= MAX_FAILS {
+            (self.log)(&format!(
+                "🛑 Нейросеть не отвечает {MAX_FAILS} раз подряд — останавливаю аккаунт (проверь ключ и баланс)."
+            ));
+        }
+    }
+
     /// Обработка одного вопроса: текст → картинка → постинг (repeat_per раз).
     async fn handle_one(&self, q: &Question) -> bool {
         let mut posted_any = false;
@@ -754,17 +774,18 @@ impl RunCtx<'_> {
                     };
                     match self.core.ai.generate(self.ai, &msgs, self.log, self.stop).await {
                         Ok(a) if !a.is_empty() => {
+                            self.sh.ai_fails.store(0, Ordering::SeqCst);
                             ai_raw = a.clone();
                             a
                         }
                         Ok(_) => {
-                            (self.log)("   ❌ Пустой ответ от нейросети");
+                            self.note_ai_fail("   ❌ Пустой ответ от нейросети");
                             self.stop.sleep_ms(3000).await;
                             break;
                         }
                         Err(crate::ai::AiError::Aborted) => break,
                         Err(e) => {
-                            (self.log)(&format!("   ❌ Нейросеть не ответила: {e}"));
+                            self.note_ai_fail(&format!("   ❌ Нейросеть не ответила: {e}"));
                             self.stop.sleep_ms(3000).await;
                             break;
                         }

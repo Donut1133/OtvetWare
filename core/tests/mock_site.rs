@@ -178,6 +178,12 @@ async fn serve(
         }
         .unwrap_or_else(|| Res::status(404));
 
+        // 599 — договорённость тестов: «ответ потерялся», рвём соединение.
+        // Так выглядит дохлый прокси, который принял запрос и умолк.
+        if res.status == 599 {
+            return Ok(());
+        }
+
         let mut head = format!(
             "HTTP/1.1 {} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n",
             res.status,
@@ -530,4 +536,38 @@ async fn network_failure_is_reported_not_panicked() {
         )
         .await;
     assert!(matches!(r, Err(otvet_core::http::HttpError::Network(_))), "ожидали сетевую ошибку");
+}
+
+/// Голос НЕ должен уходить повторно после обрыва связи: сайт понимает второй
+/// такой же голос как отмену первого.
+#[tokio::test]
+async fn lost_response_does_not_resend_the_vote() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("norepeat");
+    let acc = account("norepeat-acc");
+
+    m.route(|r| {
+        if r.method == "POST" && r.path.starts_with("/api/topic/topics/902") {
+            // Ответ «теряется»: сокет закрывается без ответа.
+            return Some(Res::status(599));
+        }
+        None
+    });
+
+    let mut blocked = false;
+    let voted = votes::vote_on_single(
+        &core,
+        &acc,
+        &format!("{}/question/902", m.base),
+        Vote::Plus,
+        0.0,
+        &no_log(),
+        &Stop::new(),
+        &mut blocked,
+    )
+    .await;
+
+    assert_eq!(voted, 0, "потерянный ответ не считается поставленным голосом");
+    let posts = m.hits_matching("POST /api/topic/topics/902");
+    assert_eq!(posts.len(), 1, "голос ушёл повторно и снял бы первый: {posts:?}");
 }

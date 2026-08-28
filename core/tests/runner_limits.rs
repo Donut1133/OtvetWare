@@ -166,3 +166,29 @@ fn rename_moves_journals_and_persona() {
     assert_eq!(persona_before.noise.canvas, persona_after.noise.canvas, "отпечаток обязан сохраниться");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Битый accounts.json не должен превращаться в «аккаунтов нет» с последующей
+/// перезаписью: сначала копия, потом честная ошибка.
+#[test]
+fn broken_accounts_file_is_backed_up_not_swallowed() {
+    let dir = std::env::temp_dir().join(format!("otvetware-broken-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("accounts.json");
+    // Оборванный файл — ровно то, что остаётся после сбоя питания на записи.
+    std::fs::write(&path, r#"[{"name":"Аккаунт 1","cookies":"Mpop=секрет"#).unwrap();
+
+    let core = Core::open(&dir);
+    let err = core.accounts.load_error().expect("ошибка чтения должна быть видна");
+    assert!(err.contains("accounts.json"), "непонятное сообщение: {err}");
+
+    let backups: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains("broken-"))
+        .collect();
+    assert_eq!(backups.len(), 1, "копия битого файла не сделана");
+    let saved = std::fs::read_to_string(backups[0].path()).unwrap();
+    assert!(saved.contains("Mpop=секрет"), "в копии нет исходных данных");
+    let _ = std::fs::remove_dir_all(&dir);
+}

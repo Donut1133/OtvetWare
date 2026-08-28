@@ -205,7 +205,9 @@ pub async fn post_question(
         .request(
             acc,
             "/api/topic/question",
-            ReqOpts::post(body_json).referer("https://otvet.mail.ru/ask"),
+            // Без ретрая — иначе при потерянном ответе получим два одинаковых
+            // вопроса подряд от одного аккаунта.
+            ReqOpts::post(body_json).referer("https://otvet.mail.ru/ask").no_retry(),
             stop,
         )
         .await?;
