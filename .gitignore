@@ -1,0 +1,31 @@
+# ─── Сборка ────────────────────────────────────────────────────────────────
+/target
+**/*.rs.bk
+
+# ─── ДАННЫЕ АККАУНТОВ ──────────────────────────────────────────────────────
+# Здесь лежат живые куки, прокси и переписка. Если это уедет в публичный
+# репозиторий, аккаунты можно считать чужими. Игнорируем всё, кроме примеров.
+accounts.json
+accounts.json.*
+personas.json
+convo.json
+styles.json
+gif-pool.json
+avatar-pool.json
+answered*.ndjson
+answered*.json
+asked*.ndjson
+asked*.json
+replied*.ndjson
+replied*.json
+/data/*
+!/data/README.md
+!/data/*.example.json
+
+# ─── Окружение ─────────────────────────────────────────────────────────────
+/profiles
+/browsers
+/images
+*.log
+.DS_Store
+Thumbs.db

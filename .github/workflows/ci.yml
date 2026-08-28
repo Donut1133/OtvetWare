@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows — сборка и тесты
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Формат
+        run: cargo fmt --all --check
+
+      - name: Clippy (предупреждения = ошибки)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Тесты
+        run: cargo test --workspace
+
+      - name: Релизная сборка
+        run: cargo build --release -p otvet-gui
+
+      - name: Загрузить .exe как артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: otvetware-windows
+          path: target/release/otvetware.exe
+
+  linux-core:
+    name: Linux — ядро
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Интерфейсу нужны системные библиотеки, поэтому на Linux проверяем ядро:
+      # вся логика бота живёт в нём и от платформы не зависит.
+      - name: Тесты ядра
+        run: cargo test -p otvet-core
