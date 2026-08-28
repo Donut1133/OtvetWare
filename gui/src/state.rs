@@ -157,8 +157,10 @@ pub struct Bg {
     pub core: Arc<Core>,
     rt: tokio::runtime::Runtime,
     ctx: Mutex<Option<egui::Context>>,
-    /// Снимок аккаунтов для отрисовки + время его получения.
-    snapshot: Mutex<(Vec<Account>, Instant)>,
+    /// Снимок аккаунтов для отрисовки + время его получения. Под `Arc`, потому
+    /// что за кадр его просят несколько панелей, а список с куками весит
+    /// сотни килобайт — копировать столько на каждую отрисовку незачем.
+    snapshot: Mutex<(Arc<Vec<Account>>, Instant)>,
     /// Счётчик активных фоновых задач — по нему GUI понимает, что надо
     /// перерисовываться и что «идёт работа».
     busy: Arc<AtomicI64>,
@@ -171,7 +173,7 @@ impl Bg {
             .enable_all()
             .build()
             .expect("tokio runtime");
-        let snap = core.accounts.all();
+        let snap = Arc::new(core.accounts.all());
         Arc::new(Self {
             core,
             rt,
@@ -210,9 +212,9 @@ impl Bg {
         });
     }
 
-    /// Снимок аккаунтов для UI. Обновляется не чаще, чем раз в 400 мс: список
-    /// с куками весит сотни килобайт, копировать его каждый кадр незачем.
-    pub fn accounts(&self) -> Vec<Account> {
+    /// Снимок аккаунтов для UI. Перечитывается не чаще раза в 400 мс: за это
+    /// время в списке всё равно ничего не меняется на глаз.
+    pub fn accounts(&self) -> Arc<Vec<Account>> {
         {
             let s = self.snapshot.lock();
             if s.1.elapsed() < Duration::from_millis(400) {
@@ -220,11 +222,12 @@ impl Bg {
             }
         }
         self.refresh_accounts();
-        self.snapshot.lock().0.clone()
+        let s = self.snapshot.lock();
+        s.0.clone()
     }
 
     pub fn refresh_accounts(&self) {
-        let fresh = self.core.accounts.all();
+        let fresh = Arc::new(self.core.accounts.all());
         *self.snapshot.lock() = (fresh, Instant::now());
     }
 
