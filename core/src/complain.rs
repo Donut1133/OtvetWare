@@ -9,7 +9,7 @@ use crate::accounts::Account;
 use crate::api;
 use crate::http::{HttpError, ReqOpts};
 use crate::util::{Log, Stop};
-use crate::votes::{parse_target_id, resolve_profile, Kind, Target};
+use crate::votes::{parse_target_id, Kind, Target};
 use crate::{Core, RunOutcome};
 use serde_json::json;
 use std::collections::HashSet;
@@ -115,9 +115,12 @@ pub async fn complain_on_profile(
     stop: &Stop,
     blocked: &mut bool,
 ) -> i64 {
-    let Some(who) = resolve_profile(core, acc, profile_url, stop).await else {
-        log("❌ Не понял профиль / не нашёл id жертвы");
-        return 0;
+    let who = match crate::votes::resolve_profile_result(core, acc, profile_url, stop).await {
+        Ok(w) => w,
+        Err(e) => {
+            log(&format!("❌ {e}"));
+            return 0;
+        }
     };
     let kind = if want_replies { Kind::Reply } else { Kind::Topic };
     log(&format!(
@@ -313,9 +316,9 @@ pub async fn run_complainer(
         }
 
         match p.target {
-            ComplainTarget::User => match resolve_profile(core, acc, t, stop).await {
-                None => log(&format!("⚠️  Не понял профиль / не нашёл id: {t}")),
-                Some(who) => {
+            ComplainTarget::User => match crate::votes::resolve_profile_result(core, acc, t, stop).await {
+                Err(e) => log(&format!("⚠️  {e}")),
+                Ok(who) => {
                     let referer = format!("https://otvet.mail.ru/profile/{}", who.name);
                     match complain_user(core, acc, who.id, &p.reason, &referer, stop).await {
                         Ok(ComplainRes::Ok) => {

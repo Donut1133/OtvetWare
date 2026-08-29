@@ -149,7 +149,7 @@ gui/src/
 ## Разработка
 
 ```bash
-cargo test --workspace       # 51 тест: юнит + интеграционные
+cargo test --workspace       # 60 тестов: юнит + интеграционные
 cargo clippy --all-targets   # чисто, без предупреждений
 cargo fmt --all              # форматирование
 ```
@@ -162,9 +162,21 @@ cargo fmt --all              # форматирование
 Проверить работу на живом аккаунте:
 
 ```bash
-cargo run -p otvet-core --example check -- "Аккаунт 1"
-cargo run -p otvet-core --example feed  -- "Аккаунт 1"
+cargo run -p otvet-core --example check -- "Аккаунт 1"   # жив ли, карма, ник
+cargo run -p otvet-core --example feed  -- "Аккаунт 1"   # читается ли лента
 ```
+
+Полный живой прогон по всем режимам (РЕАЛЬНО постит — нужен флаг подтверждения):
+
+```bash
+OTVET_LIVE=yes cargo run -p otvet-core --example live -- ask "Аккаунт 1"
+OTVET_LIVE=yes cargo run -p otvet-core --example live -- answer "Аккаунт 2" <url>
+OTVET_LIVE=yes cargo run -p otvet-core --example live -- vote-profile "Аккаунт 2" <профиль> 2
+OTVET_LIVE=yes cargo run -p otvet-core --example live -- comments "Аккаунт 2"
+```
+
+Так и нашлись ошибки, которые не видит ни один офлайн-тест: сайт разбирает тела
+запросов строго по типам и молча отвергает всё остальное.
 
 Отдельный тест `persona::tests::reproduces_personas_written_by_js` следит за
 совместимостью отпечатков со старой версией: если он покраснел — аккаунт под

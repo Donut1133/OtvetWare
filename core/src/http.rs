@@ -311,17 +311,26 @@ impl Http {
                         l(&msg);
                     }
                 }
-                // GET ретраим всегда; POST — только чисто сетевой сбой (ответ
-                // mail.ru всё равно не пришёл), чтобы обрыв прокси не терял ответ.
+                // Чтение повторяем дважды, запись — один раз. Дешёвые прокси
+                // отваливаются волнами: наблюдаемая картина — «tunnel error»
+                // на несколько попыток подряд, потом снова всё работает. Второй
+                // повтор с паузой вытаскивает как раз такие провалы, а для
+                // мутирующих запросов лишняя попытка опаснее потерянной.
+                let attempts_left = if opts.method == Method::Get { 2 } else { 1 };
                 if opts.retry && !stop.is_stopped() {
-                    let pause = if opts.method == Method::Get { 600 } else { 1500 };
-                    if stop.sleep_ms(pause).await {
-                        return Err(HttpError::Aborted);
+                    let mut last = HttpError::Network(e);
+                    for i in 0..attempts_left {
+                        let pause = if opts.method == Method::Get { 600 * (i + 1) } else { 1500 };
+                        if stop.sleep_ms(pause).await {
+                            return Err(HttpError::Aborted);
+                        }
+                        match self.attempt(acc, &url, &opts, stop).await {
+                            Ok(r) => return Ok(r),
+                            Err(HttpError::Aborted) => return Err(HttpError::Aborted),
+                            Err(e2) => last = e2,
+                        }
                     }
-                    match self.attempt(acc, &url, &opts, stop).await {
-                        Ok(r) => Ok(r),
-                        Err(_) => Err(HttpError::Network(e)),
-                    }
+                    Err(last)
                 } else {
                     Err(HttpError::Network(e))
                 }
@@ -624,15 +633,27 @@ fn expires_in_past(attrs: &str) -> bool {
 
 /// Короткое сообщение об ошибке: полный `reqwest::Error` в лог не влезает.
 fn short_err(e: &reqwest::Error) -> String {
-    if e.is_timeout() {
-        "таймаут".into()
+    // Самая глубокая причина полезнее верхнего слоя: reqwest на всё про всё
+    // говорит «error sending request», а внизу лежит «прокси отверг
+    // авторизацию» или «сертификат не проверился» — то, что реально чинят.
+    let mut cause: Option<String> = None;
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        cause = Some(s.to_string());
+        src = std::error::Error::source(s);
+    }
+    let head = if e.is_timeout() {
+        "таймаут"
     } else if e.is_connect() {
-        "нет соединения (прокси/сеть)".into()
+        "нет соединения (прокси/сеть)"
     } else if e.is_request() {
-        "запрос не ушёл".into()
+        "запрос не ушёл"
     } else {
-        let s = e.to_string();
-        crate::util::clip(&s, 120)
+        "сбой запроса"
+    };
+    match cause {
+        Some(c) => crate::util::clip(&format!("{head}: {c}"), 160),
+        None => crate::util::clip(&format!("{head}: {e}"), 160),
     }
 }
 

@@ -208,24 +208,78 @@ pub struct Victim {
 }
 
 /// userId + ник по ссылке на профиль (`/profile/id<N>` либо `/profile/<ник>`).
-pub async fn resolve_profile(core: &Core, acc: &Account, profile_url: &str, stop: &Stop) -> Option<Victim> {
-    let caps = re_profile().captures(profile_url)?;
-    let raw = caps.get(1)?.as_str();
+///
+/// Ошибку возвращаем текстом, а не просто `None`: «ссылка не похожа на профиль»
+/// и «прокси не ответил» чинятся совершенно по-разному, а в логе раньше и то и
+/// другое выглядело как «не понял профиль» — и человек шёл править ссылку,
+/// которая была в порядке.
+pub async fn resolve_profile_result(
+    core: &Core,
+    acc: &Account,
+    profile_url: &str,
+    stop: &Stop,
+) -> Result<Victim, String> {
+    let caps = re_profile()
+        .captures(profile_url)
+        .ok_or_else(|| format!("не похоже на ссылку профиля: {}", crate::util::clip(profile_url, 60)))?;
+    let raw = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
     let name = urlencoding::decode(raw).map(|c| c.into_owned()).unwrap_or_else(|_| raw.to_string());
     if let Some(rest) = name.strip_prefix("id") {
         if let Ok(id) = rest.parse::<i64>() {
-            return Some(Victim { id, name });
+            return Ok(Victim { id, name });
         }
     }
+    // Основной путь — служебный эндпоинт профиля.
     let r = core
         .http
         .request(acc, &format!("/api/auth/users/{}", urlencoding::encode(&name)), ReqOpts::get(), stop)
         .await
-        .ok()?;
-    let j = r.json.as_ref()?;
-    let id = j.get("id").and_then(|v| v.as_i64())?;
-    let uname = j.get("username").and_then(|v| v.as_str()).unwrap_or(&name).to_string();
-    Some(Victim { id, name: uname })
+        .map_err(|e| format!("сеть/прокси при поиске «{name}»: {e}"))?;
+    if r.blocked {
+        return Err(format!("антибот (HTTP {}) при поиске «{name}»", r.status));
+    }
+    if let Some(id) = r.json.as_ref().and_then(|j| j.get("id")).and_then(|v| v.as_i64()) {
+        let uname = r
+            .json
+            .as_ref()
+            .and_then(|j| j.get("username"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(&name)
+            .to_string();
+        return Ok(Victim { id, name: uname });
+    }
+
+    // Запасной путь — сама страница профиля. Служебный эндпоинт может отдать
+    // 404 (например, ник в ссылке устарел после переименования), а в разметке
+    // страницы id всё равно есть: Nuxt держит его в ключах состояния вида
+    // `list-requests-count-profile-<id>-posts`. Проверено на живой странице.
+    let page = core
+        .http
+        .request(acc, &format!("/profile/{}", urlencoding::encode(&name)), ReqOpts::get().html(), stop)
+        .await
+        .map_err(|e| format!("сеть/прокси при чтении профиля «{name}»: {e}"))?;
+    // В регулярке две ветки (ключ состояния и виджет кармы) — берём ту группу,
+    // которая сработала.
+    if let Some(c) = re_page_profile_id().captures(&page.text) {
+        if let Some(id) = c.get(1).or_else(|| c.get(2)).and_then(|m| m.as_str().parse::<i64>().ok()) {
+            return Ok(Victim { id, name });
+        }
+    }
+    Err(format!(
+        "не нашёл id профиля «{name}»: служебный ответ HTTP {}, страница HTTP {}. \
+         Если ник менялся — возьми ссылку вида /profile/id<номер>",
+        r.status, page.status
+    ))
+}
+
+fn re_page_profile_id() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"profile-(\d{5,})-(?:posts|replies)|/api/karma/score/(\d+)").unwrap())
+}
+
+/// Короткая форма для мест, где причина неважна.
+pub async fn resolve_profile(core: &Core, acc: &Account, profile_url: &str, stop: &Stop) -> Option<Victim> {
+    resolve_profile_result(core, acc, profile_url, stop).await.ok()
 }
 
 /// Голос по ВСЕМ постам (или ответам) профиля жертвы, до `limit`.
@@ -244,9 +298,12 @@ pub async fn vote_on_profile(
     stop: &Stop,
     blocked: &mut bool,
 ) -> i64 {
-    let Some(victim) = resolve_profile(core, acc, profile_url, stop).await else {
-        log("❌ Не нашёл user_id жертвы по ссылке профиля");
-        return 0;
+    let victim = match resolve_profile_result(core, acc, profile_url, stop).await {
+        Ok(v) => v,
+        Err(e) => {
+            log(&format!("❌ {e}"));
+            return 0;
+        }
     };
     let want_replies = {
         let s = profile_url.trim_end_matches('/');

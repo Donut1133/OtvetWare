@@ -137,26 +137,36 @@ pub async fn fetch_karma(core: &Core, acc: &Account, user_id: i64, stop: &Stop) 
     })
 }
 
-/// Проверка аккаунта без браузера. Дозаполняет userId/username.
+/// Проверка аккаунта без браузера. Заодно освежает userId и ник.
 ///
-/// Авторизацию проверяем по `/api/notificator/...` (требует логина), а НЕ по карме:
-/// карма отдаётся и разлогиненному, из-за чего разлогин раньше не детектился.
+/// Пробуем `/api/auth/user`: без кук он отдаёт 403, а с куками — актуальные
+/// id и ник одним запросом. Карма для проверки не годится в принципе:
+/// `/api/karma/score` публичный и отвечает 200 даже разлогиненному.
+///
+/// Ник ОБЯЗАТЕЛЬНО перечитываем каждый раз. Раньше он брался из базы, только
+/// если там пусто, и переименование на сайте не подхватывалось никогда: в
+/// accounts.json годами лежал старый ник, а ссылка на свой профиль отдавала 404.
 pub async fn validate_account(core: &Core, acc: &Account, stop: &Stop) -> Validation {
     let mut out = Validation { user_id: acc.user_id, username: acc.username.clone(), ..Default::default() };
 
-    if out.user_id.is_none() || out.username.is_none() {
-        if let Some(me) = resolve_me(core, acc, stop).await {
-            out.user_id = out.user_id.or(me.user_id);
-            out.username = out.username.or(me.username);
-        }
-    }
-
-    let probe = core.http.request(acc, "/api/notificator/notifications/unread", ReqOpts::get(), stop).await;
+    let probe = core.http.request(acc, "/api/auth/user", ReqOpts::get(), stop).await;
     match probe {
         Ok(p) => {
             out.blocked = p.blocked;
-            out.alive = p.ok;
             out.auth_bad = !p.ok && !p.blocked && (p.status == 401 || p.status == 403);
+            out.alive = p.ok;
+            if let Some(j) = p.json.as_ref().filter(|_| p.ok) {
+                if let Some(id) = j.get("id").and_then(|v| v.as_i64()) {
+                    out.user_id = Some(id);
+                }
+                if let Some(u) = j
+                    .get("username")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty() && !re_default_nick().is_match(s))
+                {
+                    out.username = Some(u.to_string());
+                }
+            }
         }
         Err(HttpError::Aborted) => {
             out.error = Some("остановлено".into());
@@ -165,6 +175,14 @@ pub async fn validate_account(core: &Core, acc: &Account, stop: &Stop) -> Valida
         Err(e) => {
             out.error = Some(e.to_string());
             return out;
+        }
+    }
+
+    // Аккаунт жив, но id так и не узнали — добираем окольным путём.
+    if out.alive && out.user_id.is_none() {
+        if let Some(me) = resolve_me(core, acc, stop).await {
+            out.user_id = out.user_id.or(me.user_id);
+            out.username = out.username.or(me.username);
         }
     }
 
