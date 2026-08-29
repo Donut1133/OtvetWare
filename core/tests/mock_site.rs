@@ -854,3 +854,274 @@ async fn auth_states_are_distinguished() {
     let v = otvet_core::api::validate_account(&core, &acc, &Stop::new()).await;
     assert!(v.blocked && !v.auth_bad && !v.alive, "418 = антибот, статус не трогаем: {v:?}");
 }
+
+// ─── Режим с нейросетью ────────────────────────────────────────────────────
+//
+// Ключа в тестах нет, поэтому нейросеть тоже заглушка: тот же мок-сервер
+// отвечает и за mail.ru, и за OpenAI-совместимый эндпоинт. Так проверяется
+// весь путь — проверка ключа, генерация, подстановка маркеров, отправка,
+// запись в журнал — без единого живого запроса.
+
+fn ai_cfg(base: &str) -> otvet_core::ai::AiCfg {
+    otvet_core::ai::AiCfg {
+        url: format!("{base}/v1/chat/completions"),
+        model: "test-model".into(),
+        api_key: "sk-test".into(),
+        temperature: 0.7,
+        max_tokens: 100,
+        timeout_sec: 10,
+        retries: 1,
+    }
+}
+
+/// Заглушка нейросети: отвечает фиксированным текстом и запоминает запрос.
+fn route_ai(m: &Mock, answer: &'static str) {
+    m.route(move |r| {
+        if r.path.starts_with("/v1/chat/completions") {
+            let body =
+                format!(r#"{{"choices":[{{"message":{{"role":"assistant","content":"{answer}"}}}}]}}"#);
+            return Some(Res::json(body));
+        }
+        None
+    });
+}
+
+#[tokio::test]
+async fn ai_answer_goes_through_the_whole_path() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("aianswer");
+    let acc = account("ai-acc");
+
+    route_ai(m, "ну такое, конечно");
+    m.route(|r| {
+        if r.path == "/api/auth/user" {
+            return Some(Res::json(r#"{"id":1000,"username":"botik"}"#));
+        }
+        if r.path.starts_with("/api/karma/score/") {
+            return Some(Res::json(
+                r#"{"result":{"total_score":1,"score":{"history":0,"knowledge":0,"discussion":1}}}"#,
+            ));
+        }
+        if r.path.starts_with("/api/topic/question/") {
+            return Some(Res::json(
+                r#"{"result":{"title":"Как варить пельмени?","content":{"type":"doc","content":[]},"author":{"username":"vasya"}}}"#,
+            ));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":555}}"#));
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::Ai,
+        target: answerer::TargetMode::Links,
+        links: vec![format!("{}/question/12345", m.base)],
+        limit: 1,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        check_auth: true,
+        ai: ai_cfg(&m.base),
+        style: "Обычный чел".into(),
+        ..Default::default()
+    };
+    let out = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+
+    assert_eq!(out.done, 1, "ответ должен уйти");
+    assert!(!out.blocked);
+
+    // В нейросеть ушёл текст вопроса, а на сайт — ответ нейросети.
+    let ai_body = m.last_body("/v1/chat/completions").expect("запрос к нейросети записан");
+    let msgs = ai_body["messages"].as_array().expect("messages");
+    assert!(
+        msgs.iter().any(|x| x["content"].as_str().unwrap_or("").contains("Как варить пельмени")),
+        "вопрос не попал в промпт: {ai_body}"
+    );
+    assert_eq!(ai_body["model"].as_str(), Some("test-model"));
+
+    let post = m.last_body("/api/topic/answers").expect("ответ отправлен");
+    let text = post["content"]["content"][0]["content"][0]["text"].as_str().unwrap_or("");
+    assert_eq!(text, "ну такое, конечно", "на сайт ушёл не текст нейросети: {post}");
+
+    // И вопрос записан в журнал — второй раз бот на него не полезет.
+    let answered = otvet_core::journals::load_answered(&dir, "ai-acc");
+    assert_eq!(answered.len(), 1, "журнал не пополнился: {answered:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Нейросеть молчит (кончился баланс — 402): аккаунт обязан остановиться, а не
+/// крутить ленту вечно, оплачивая каждый отказ.
+#[tokio::test]
+async fn dead_ai_key_stops_the_account() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("aidead");
+    let acc = account("ai-dead-acc");
+
+    m.route(|r| {
+        if r.path.starts_with("/v1/chat/completions") {
+            // Первый запрос — проверка ключа — проходит, дальше «нет денег».
+            static N: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Some(if n == 0 {
+                Res::json(r#"{"choices":[{"message":{"content":"ок"}}]}"#)
+            } else {
+                Res {
+                    status: 402,
+                    body: r#"{"error":{"message":"Insufficient credits"}}"#.into(),
+                    headers: vec![],
+                }
+            });
+        }
+        if r.path == "/api/auth/user" {
+            return Some(Res::json(r#"{"id":1000,"username":"botik"}"#));
+        }
+        if r.path.starts_with("/api/topic/feed") {
+            return Some(Res::json(
+                r#"{"result":{"feed":[
+                    {"id":501,"title":"Вопрос номер один про жизнь"},
+                    {"id":502,"title":"Вопрос номер два про жизнь"},
+                    {"id":503,"title":"Вопрос номер три про жизнь"},
+                    {"id":504,"title":"Вопрос номер четыре про жизнь"},
+                    {"id":505,"title":"Вопрос номер пять про жизнь"},
+                    {"id":506,"title":"Вопрос номер шесть про жизнь"},
+                    {"id":507,"title":"Вопрос номер семь про жизнь"}
+                ]}}"#,
+            ));
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::Ai,
+        target: answerer::TargetMode::Feed,
+        limit: 0, // без лимита — остановить должен именно счётчик отказов
+        delay_min: 0.0,
+        delay_max: 0.0,
+        feed_min: 0.0,
+        feed_max: 0.0,
+        check_auth: false,
+        ai: ai_cfg(&m.base),
+        ..Default::default()
+    };
+
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()),
+    )
+    .await
+    .expect("прогон обязан закончиться сам, а не крутиться вечно");
+
+    assert_eq!(out.done, 0, "при мёртвом ключе ничего не отправляется");
+    let calls = m.hits_matching("/v1/chat/completions").len();
+    assert!(calls <= 12, "слишком много попыток к нейросети: {calls}");
+}
+
+// ─── Картинки и память разговора ───────────────────────────────────────────
+
+/// Картинка из пула прикладывается к ответу как галерея. Пул — это готовые
+/// хэши на CDN, перезаливать их не нужно: в теле поста должен быть
+/// imageGallery, а лишних запросов на заливку — ноль.
+#[tokio::test]
+async fn pool_image_is_attached_without_upload() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("poolimg");
+    let acc = account("img-acc");
+
+    std::fs::write(dir.join("gif-pool.json"), r#"[{"hash":"abc123def","width":320,"height":240}]"#).unwrap();
+
+    m.route(|r| {
+        if r.path.starts_with("/api/topic/question/") {
+            return Some(Res::json(
+                r#"{"result":{"title":"Вопрос с картинкой","content":{"type":"doc","content":[]}}}"#,
+            ));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":1}}"#));
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::NoAi,
+        target: answerer::TargetMode::Links,
+        links: vec![format!("{}/question/700", m.base)],
+        limit: 1,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        check_auth: false,
+        image: answerer::ImageMode::Gif { selected: vec![] },
+        image_count: 1,
+        ..Default::default()
+    };
+    let out = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out.done, 1);
+
+    let body = m.last_body("/api/topic/answers").expect("ответ отправлен");
+    let nodes = body["content"]["content"].as_array().expect("узлы документа");
+    let gallery = nodes.iter().find(|n| n["type"] == "imageGallery").expect("картинки в посте нет");
+    assert_eq!(
+        gallery["attrs"]["gallery"][0]["src"].as_str(),
+        Some("abc123def.jpg?size=origin"),
+        "неверная ссылка на картинку: {gallery}"
+    );
+    // Последним узлом обязан идти пустой абзац, иначе редактор считает
+    // документ невалидным.
+    assert_eq!(nodes.last().unwrap()["type"], "paragraph");
+    assert!(m.hits_matching("/api/pictures/images").is_empty(), "пул не должен перезаливаться");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Диалоговый режим: вопрос и ответ попадают в общий чат, а следующий запрос к
+/// нейросети уже несёт эту историю. На этом держится «единый характер».
+#[tokio::test]
+async fn conversation_memory_is_kept_and_sent_back() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("convo");
+    let acc = account("convo-acc");
+
+    route_ai(m, "ага, бывает");
+    m.route(|r| {
+        if r.path.starts_with("/api/topic/question/") {
+            return Some(Res::json(
+                r#"{"result":{"title":"Первый вопрос про жизнь","content":{"type":"doc","content":[]},"author":{"username":"petya"}}}"#,
+            ));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":2}}"#));
+        }
+        None
+    });
+
+    let mut p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::Ai,
+        target: answerer::TargetMode::Links,
+        links: vec![format!("{}/question/801", m.base)],
+        limit: 1,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        check_auth: false,
+        conversational: true,
+        convo_budget_k: 0.0, // без сжатия
+        ai: ai_cfg(&m.base),
+        ..Default::default()
+    };
+    let out = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out.done, 1);
+
+    let convo = core.convo.snapshot();
+    assert_eq!(convo.turns.len(), 2, "в чат должны лечь вопрос и ответ: {:?}", convo.turns);
+    assert_eq!(convo.turns[1].content, "ага, бывает");
+    assert!(convo.turns[0].content.contains("Первый вопрос"), "вопрос не записан: {:?}", convo.turns[0]);
+
+    // Второй прогон: история обязана уехать в запрос к нейросети.
+    p.links = vec![format!("{}/question/802", m.base)];
+    let out2 = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out2.done, 1);
+    let ai_body = m.last_body("/v1/chat/completions").expect("запрос к нейросети");
+    let msgs = ai_body["messages"].as_array().unwrap();
+    assert!(
+        msgs.iter().any(|x| x["content"].as_str().unwrap_or("") == "ага, бывает"),
+        "прошлый ответ не попал в историю: {ai_body}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
