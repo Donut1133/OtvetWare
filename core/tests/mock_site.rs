@@ -12,6 +12,7 @@ use otvet_core::accounts::Account;
 use otvet_core::util::{no_log, Stop};
 use otvet_core::votes::{self, Vote};
 use otvet_core::Core;
+use otvet_core::{answerer, asker, replier};
 use parking_lot::Mutex;
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,6 +25,7 @@ pub struct Req {
     /// Путь вместе с query.
     pub path: String,
     pub cookie: String,
+    pub body: String,
 }
 
 pub struct Res {
@@ -56,6 +58,9 @@ pub struct Mock {
     pub base: String,
     routes: Arc<Mutex<Routes>>,
     hits: Arc<Mutex<Vec<String>>>,
+    /// Тела запросов: (путь, тело). По ним проверяются контракты API —
+    /// mail.ru разбирает поля строго по типам.
+    bodies: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl Mock {
@@ -73,9 +78,20 @@ impl Mock {
         self.hits().into_iter().filter(|h| h.contains(needle)).collect()
     }
 
+    /// Тело последнего запроса по пути, содержащему `needle`.
+    pub fn last_body(&self, needle: &str) -> Option<serde_json::Value> {
+        self.bodies
+            .lock()
+            .iter()
+            .rev()
+            .find(|(p, _)| p.contains(needle))
+            .and_then(|(_, b)| serde_json::from_str(b).ok())
+    }
+
     fn reset(&self) {
         self.routes.lock().handlers.clear();
         self.hits.lock().clear();
+        self.bodies.lock().clear();
     }
 }
 
@@ -96,9 +112,11 @@ pub fn mock() -> &'static Mock {
     M.get_or_init(|| {
         let routes: Arc<Mutex<Routes>> = Arc::new(Mutex::new(Routes::default()));
         let hits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let bodies: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         let r2 = routes.clone();
         let h2 = hits.clone();
+        let b2 = bodies.clone();
         // Отдельный поток со своим рантаймом: тесты сами по себе асинхронные,
         // а сервер должен жить дольше любого из них.
         std::thread::spawn(move || {
@@ -110,8 +128,9 @@ pub fn mock() -> &'static Mock {
                     let Ok((sock, _)) = listener.accept().await else { break };
                     let routes = r2.clone();
                     let hits = h2.clone();
+                    let bodies = b2.clone();
                     tokio::spawn(async move {
-                        let _ = serve(sock, routes, hits).await;
+                        let _ = serve(sock, routes, hits, bodies).await;
                     });
                 }
             });
@@ -119,7 +138,7 @@ pub fn mock() -> &'static Mock {
         let addr = rx.recv().unwrap();
         let base = format!("http://{addr}");
         std::env::set_var("OTVET_BASE", &base);
-        Mock { base, routes, hits }
+        Mock { base, routes, hits, bodies }
     })
 }
 
@@ -127,6 +146,7 @@ async fn serve(
     mut sock: tokio::net::TcpStream,
     routes: Arc<Mutex<Routes>>,
     hits: Arc<Mutex<Vec<String>>>,
+    bodies: Arc<Mutex<Vec<(String, String)>>>,
 ) -> std::io::Result<()> {
     loop {
         let mut buf = Vec::new();
@@ -160,18 +180,23 @@ async fn serve(
                 content_length = v.trim().parse().unwrap_or(0);
             }
         }
-        // Тело дочитываем, иначе клиент подвиснет на следующем запросе.
-        let mut body_read = buf.len() - head_end;
-        while body_read < content_length {
+        // Тело дочитываем целиком: и чтобы клиент не подвис на следующем
+        // запросе, и чтобы проверять контракты (типы полей у mail.ru строгие).
+        let mut body_bytes: Vec<u8> = buf[head_end..].to_vec();
+        while body_bytes.len() < content_length {
             let n = sock.read(&mut tmp).await?;
             if n == 0 {
                 break;
             }
-            body_read += n;
+            body_bytes.extend_from_slice(&tmp[..n]);
         }
+        let body = String::from_utf8_lossy(&body_bytes).to_string();
 
         hits.lock().push(format!("{method} {path}"));
-        let req = Req { method, path, cookie };
+        if !body.is_empty() {
+            bodies.lock().push((path.clone(), body.clone()));
+        }
+        let req = Req { method, path, cookie, body };
         let res = {
             let routes = routes.lock();
             routes.handlers.iter().find_map(|h| h(&req))
@@ -570,4 +595,262 @@ async fn lost_response_does_not_resend_the_vote() {
     assert_eq!(voted, 0, "потерянный ответ не считается поставленным голосом");
     let posts = m.hits_matching("POST /api/topic/topics/902");
     assert_eq!(posts.len(), 1, "голос ушёл повторно и снял бы первый: {posts:?}");
+}
+
+// ─── Контракты тел запросов ────────────────────────────────────────────────
+//
+// mail.ru разбирает тело строго по типам. `"topic_id":"270370769"` строкой —
+// это HTTP 400 «expected=int64, got=string», то есть НИ ОДИН ответ не уходит.
+// Такое ловится только живым запросом или вот такой проверкой.
+
+#[tokio::test]
+async fn answer_sends_numeric_topic_id() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("answerbody");
+    let acc = account("answer-acc");
+
+    m.route(|r| {
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":4242}}"#));
+        }
+        None
+    });
+
+    let res = answerer::post_answer(&core, &acc, "270370769", "текст", None, &no_log(), &Stop::new())
+        .await
+        .expect("запрос ушёл");
+    assert!(matches!(res, answerer::PostRes::Ok(4242)));
+
+    let body = m.last_body("/api/topic/answers").expect("тело запроса записано");
+    assert!(body["topic_id"].is_number(), "topic_id обязан быть числом: {}", body["topic_id"]);
+    assert_eq!(body["topic_id"].as_i64(), Some(270370769));
+}
+
+#[tokio::test]
+async fn reply_sends_numeric_ids() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("replybody");
+    let acc = account("reply-acc");
+
+    m.route(|r| {
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":77}}"#));
+        }
+        None
+    });
+
+    let res = replier::post_reply(&core, &acc, "111", "222", "ага", &no_log(), &Stop::new())
+        .await
+        .expect("запрос ушёл");
+    assert!(matches!(res, replier::PostRes::Ok(77)));
+    let body = m.last_body("/api/topic/answers").expect("тело записано");
+    assert!(
+        body["topic_id"].is_number() && body["reply_to"].is_number(),
+        "оба id должны быть числами: {body}"
+    );
+}
+
+#[tokio::test]
+async fn question_body_matches_contract() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("askbody");
+    let mut acc = account("ask-acc");
+    acc.user_id = Some(100200300);
+
+    m.route(|r| {
+        if r.method == "POST" && r.path == "/api/topic/question" {
+            return Some(Res::json(r#"{"result":{"id":99}}"#));
+        }
+        None
+    });
+
+    let res = asker::post_question(&core, &acc, "Заголовок", "тело", None, &no_log(), &Stop::new())
+        .await
+        .expect("запрос ушёл");
+    assert!(matches!(res, asker::PostResult::Ok(99)));
+    let body = m.last_body("/api/topic/question").expect("тело записано");
+    assert_eq!(body["author_id"].as_i64(), Some(100200300), "author_id обязан быть числом");
+    assert_eq!(body["title"].as_str(), Some("Заголовок"));
+    assert!(body["tags"].is_array() && body["spaces"].is_array(), "теги и spaces обязательны: {body}");
+}
+
+#[tokio::test]
+async fn vote_body_matches_contract() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("votebody");
+    let acc = account("vote-body-acc");
+
+    m.route(|r| {
+        if r.method == "POST" && r.path.starts_with("/api/topic/topics/903/2") {
+            return Some(Res::json(r#"{"result":{"user_reaction":2}}"#));
+        }
+        None
+    });
+
+    let mut blocked = false;
+    let voted = votes::vote_on_single(
+        &core,
+        &acc,
+        &format!("{}/question/903", m.base),
+        Vote::Minus,
+        0.0,
+        &no_log(),
+        &Stop::new(),
+        &mut blocked,
+    )
+    .await;
+    assert_eq!(voted, 1);
+    let body = m.last_body("/api/topic/topics/903").expect("тело записано");
+    assert_eq!(body["entityID"].as_i64(), Some(903), "entityID числом");
+    assert_eq!(body["reactionType"].as_i64(), Some(2), "минус = 2");
+    assert_eq!(body["reactionSource"].as_str(), Some("topics"));
+}
+
+// ─── Резолв профиля ────────────────────────────────────────────────────────
+
+/// Служебный эндпоинт отдал 404 (так и случилось на живом сайте) — id всё
+/// равно обязан находиться: он есть в разметке страницы профиля.
+#[tokio::test]
+async fn profile_id_falls_back_to_page_when_api_is_gone() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("resolve404");
+    let acc = account("resolve-acc");
+
+    m.route(|r| {
+        if r.path.starts_with("/api/auth/users/") {
+            return Some(Res { status: 404, body: r#"{"message":"Not Found"}"#.into(), headers: vec![] });
+        }
+        if r.path.starts_with("/profile/vasya") {
+            // Кусок РЕАЛЬНОЙ разметки профиля: Nuxt держит id в ключе состояния.
+            return Some(Res::json(
+                r#"<html><body>{"$slist-requests-count-profile-100200300-posts":16}</body></html>"#,
+            ));
+        }
+        None
+    });
+
+    let who = votes::resolve_profile_result(&core, &acc, &format!("{}/profile/vasya", m.base), &Stop::new())
+        .await
+        .expect("id должен найтись по странице профиля");
+    assert_eq!(who.id, 100200300);
+    assert_eq!(who.name, "vasya");
+}
+
+/// `/profile/id<N>` разбирается вообще без запросов — лишний трафик ни к чему.
+#[tokio::test]
+async fn profile_by_id_needs_no_requests() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("resolveid");
+    let acc = account("resolve-id-acc");
+
+    let who = votes::resolve_profile_result(&core, &acc, "https://otvet.mail.ru/profile/id777", &Stop::new())
+        .await
+        .expect("id прямо в ссылке");
+    assert_eq!(who.id, 777);
+    assert!(m.hits().is_empty(), "запросов быть не должно: {:?}", m.hits());
+}
+
+/// Сетевой сбой и «профиль не найден» — разные сообщения: чинятся по-разному.
+#[tokio::test]
+async fn resolve_errors_are_distinguishable() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("resolveerr");
+    let acc = account("resolve-err-acc");
+
+    // 1) мусор вместо ссылки
+    let e = votes::resolve_profile_result(&core, &acc, "просто текст", &Stop::new()).await.unwrap_err();
+    assert!(e.contains("не похоже на ссылку профиля"), "{e}");
+
+    // Порядок важен: обработчики обходятся сверху вниз, поэтому «оборванное
+    // соединение» для одного ника регистрируем ДО общего 404.
+    m.route(|r| {
+        if r.path.contains("lost") {
+            return Some(Res::status(599)); // соединение рвётся без ответа
+        }
+        None
+    });
+
+    // 2) сайт отвечает, но id нигде нет
+    m.route(|r| {
+        if r.path.starts_with("/api/auth/users/") || r.path.starts_with("/profile/") {
+            return Some(Res { status: 404, body: "нет такого".into(), headers: vec![] });
+        }
+        None
+    });
+    let e = votes::resolve_profile_result(&core, &acc, &format!("{}/profile/ghost", m.base), &Stop::new())
+        .await
+        .unwrap_err();
+    assert!(e.contains("не нашёл id профиля"), "{e}");
+
+    // 3) сеть рвётся — сообщение про сеть, а не про ссылку.
+    // Важно: путь к API строится от базового адреса, а хост из ссылки на профиль
+    // не используется вовсе, поэтому «сломать сеть» можно только ответом сервера.
+    let e = votes::resolve_profile_result(&core, &acc, &format!("{}/profile/lost", m.base), &Stop::new())
+        .await
+        .unwrap_err();
+    assert!(e.contains("сеть/прокси"), "{e}");
+}
+
+// ─── Личность аккаунта ─────────────────────────────────────────────────────
+
+/// Ник на сайте меняется (аккаунт переименовали) — бот обязан подхватить новый.
+/// Раньше он читал ник из базы, только если там пусто, и годами ходил со
+/// старым: ссылки на собственный профиль отдавали 404.
+#[tokio::test]
+async fn validation_refreshes_stale_username() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("ident");
+    let mut acc = Account::new("stale");
+    acc.cookies = Some("Mpop=x".into());
+    acc.user_id = Some(100200300);
+    acc.username = Some("старый_ник".into());
+    core.accounts.add(acc).unwrap();
+    let acc = core.accounts.get("stale").unwrap();
+
+    m.route(|r| {
+        if r.path == "/api/auth/user" {
+            return Some(Res::json(r#"{"id":100200300,"username":"новый_ник","nick":"Ботик"}"#));
+        }
+        if r.path.starts_with("/api/karma/score/") {
+            return Some(Res::json(
+                r#"{"result":{"total_score":3,"score":{"history":1,"knowledge":1,"discussion":1}}}"#,
+            ));
+        }
+        None
+    });
+
+    let v = otvet_core::api::validate_account(&core, &acc, &Stop::new()).await;
+    assert!(v.alive, "аккаунт жив");
+    assert_eq!(v.username.as_deref(), Some("новый_ник"), "ник обязан обновиться");
+    otvet_core::api::persist_validation(&core, "stale", &v);
+    assert_eq!(
+        core.accounts.get("stale").and_then(|a| a.username).as_deref(),
+        Some("новый_ник"),
+        "новый ник должен сохраниться в accounts.json"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 403 без кук — это «не залогинен», и красить аккаунт можно. 418 — антибот,
+/// и трогать статус нельзя: иначе мёртвый прокси «разлогинит» живые аккаунты.
+#[tokio::test]
+async fn auth_states_are_distinguished() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("authstates");
+    let acc = account("auth-acc");
+
+    static MODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(403);
+    m.route(|r| {
+        if r.path == "/api/auth/user" {
+            return Some(Res::status(MODE.load(std::sync::atomic::Ordering::SeqCst) as u16));
+        }
+        None
+    });
+
+    let v = otvet_core::api::validate_account(&core, &acc, &Stop::new()).await;
+    assert!(v.auth_bad && !v.alive && !v.blocked, "403 = разлогин: {v:?}");
+
+    MODE.store(418, std::sync::atomic::Ordering::SeqCst);
+    let v = otvet_core::api::validate_account(&core, &acc, &Stop::new()).await;
+    assert!(v.blocked && !v.auth_bad && !v.alive, "418 = антибот, статус не трогаем: {v:?}");
 }

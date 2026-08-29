@@ -299,7 +299,10 @@ pub async fn post_answer(
         "visible_to": 0,
         "content": doc_with_image(text, image),
         "mentions": [],
-        "topic_id": topic_id,
+        // ЧИСЛО, а не строка. mail.ru разбирает тело строго по типам и на
+        // `"topic_id":"270370769"` отвечает 400 с «expected=int64, got=string» —
+        // то есть ни один ответ не уходит вообще.
+        "topic_id": topic_id.parse::<i64>().unwrap_or(0),
     });
     let r = match core
         .http

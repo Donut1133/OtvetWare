@@ -98,20 +98,30 @@ pub fn split_proxies(raw: &str) -> Vec<String> {
 }
 
 /// Маска для лога: прячем пароль, оставляем хост:порт.
+///
+/// Формат `host:port:логин:пароль` тоже маскируем — раньше он проходил мимо
+/// (в нём нет `@`), и пароль от прокси спокойно уезжал в лог и на экран.
 pub fn mask_proxy(p: &str) -> String {
     let s = p.trim();
-    match s.rfind('@') {
-        Some(at) => {
-            let head = &s[..at];
-            let tail = &s[at..];
-            match head.rfind(':') {
-                // не путаем с двоеточием схемы (`http://`)
-                Some(i) if !head[i..].starts_with("://") => format!("{}:***{}", &head[..i], tail),
-                _ => format!("***{tail}"),
-            }
-        }
-        None => s.to_string(),
+    if let Some(at) = s.rfind('@') {
+        let head = &s[..at];
+        let tail = &s[at..];
+        return match head.rfind(':') {
+            // не путаем с двоеточием схемы (`http://`)
+            Some(i) if !head[i..].starts_with("://") => format!("{}:***{}", &head[..i], tail),
+            _ => format!("***{tail}"),
+        };
     }
+    // host:port:user:pass — четыре сегмента без схемы.
+    let (scheme, rest) = match s.split_once("://") {
+        Some((sc, r)) => (format!("{sc}://"), r),
+        None => (String::new(), s),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.len() == 4 && parts[1].chars().all(|c| c.is_ascii_digit()) && !parts[1].is_empty() {
+        return format!("{scheme}{}:{}:{}:***", parts[0], parts[1], parts[2]);
+    }
+    s.to_string()
 }
 
 #[cfg(test)]
@@ -147,5 +157,10 @@ mod tests {
     #[test]
     fn masks_credentials() {
         assert_eq!(mask_proxy("socks5://user:secret@1.2.3.4:1080"), "socks5://user:***@1.2.3.4:1080");
+        // Формат провайдеров host:port:логин:пароль — пароль тоже под маской.
+        assert_eq!(mask_proxy("1.2.3.4:9256:login:secret"), "1.2.3.4:9256:login:***");
+        assert_eq!(mask_proxy("http://1.2.3.4:9256:login:secret"), "http://1.2.3.4:9256:login:***");
+        // Без пароля ничего не портим.
+        assert_eq!(mask_proxy("http://1.2.3.4:8080"), "http://1.2.3.4:8080");
     }
 }

@@ -147,9 +147,12 @@ pub async fn run_subscriber(core: &Core, acc: &Account, p: &SubParams, log: &Log
             log("\n🛑 Блокировка mail.ru (418/429) — стоп аккаунта.");
             break;
         }
-        let Some(who) = resolve_profile(core, acc, t, stop).await else {
-            log(&format!("⚠️  Не понял профиль / не нашёл id: {t}"));
-            continue;
+        let who = match crate::votes::resolve_profile_result(core, acc, t, stop).await {
+            Ok(w) => w,
+            Err(e) => {
+                log(&format!("⚠️  {e}"));
+                continue;
+            }
         };
         let referer = format!("https://otvet.mail.ru/profile/{}", who.name);
         match subscribe_one(core, acc, who.id, p.action, &referer, stop).await {
