@@ -40,8 +40,12 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/otvetware.exe dist/
           Copy-Item README.md, LICENSE dist/
-          New-Item -ItemType Directory -Force dist/data | Out-Null
-          Copy-Item data/*.example.json, data/README.md dist/data/
+          # Примеры кладём в САМУ папку данных, а не рядом: программа берёт
+          # styles.example.json как стартовый набор стилей, если своего
+          # styles.json ещё нет. Лежал бы он в data/ — человек на первом запуске
+          # увидел бы один стиль-заглушку вместо готового списка.
+          New-Item -ItemType Directory -Force dist/accounts | Out-Null
+          Copy-Item data/*.example.json, data/README.md dist/accounts/
           Compress-Archive -Path dist/* -DestinationPath otvetware-windows-x64.zip
 
       - name: Скачать патченный Chromium
