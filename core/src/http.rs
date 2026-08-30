@@ -581,6 +581,47 @@ impl Http {
     }
 }
 
+impl Http {
+    /// Скачать картинку поста — она нужна не сайту, а нейросети, которой её
+    /// показывают. Обычный `request` не годится: он читает ответ как текст, а
+    /// тут байты. `max` — потолок размера; что крупнее, молча не берём, чтобы
+    /// не тащить в запрос к модели десяток мегабайт.
+    pub async fn fetch_image(
+        &self,
+        acc: &Account,
+        url: &str,
+        max: usize,
+        stop: &Stop,
+    ) -> Result<Vec<u8>, String> {
+        let persona = self.persona_for(acc);
+        let client = self.client_for(acc.active_proxy().as_deref(), None);
+        let opts = ReqOpts::get().accept("image/avif,image/webp,image/apng,image/*,*/*;q=0.8");
+        let headers = self.build_headers(acc, &persona, &opts);
+        let req = client.get(url).headers(headers);
+        let fut = async {
+            let resp = req.send().await.map_err(|e| short_err(&e))?;
+            let status = resp.status().as_u16();
+            if status != 200 {
+                return Err(format!("HTTP {status}"));
+            }
+            let b = resp.bytes().await.map_err(|e| short_err(&e))?;
+            Ok::<_, String>(b.to_vec())
+        };
+        let bytes = tokio::select! {
+            biased;
+            _ = stop.wait() => return Err("остановлено".into()),
+            r = tokio::time::timeout(Duration::from_secs(20), fut) => match r {
+                Ok(v) => v?,
+                Err(_) => return Err("таймаут".into()),
+            },
+        };
+        if bytes.len() > max {
+            return Err(format!("слишком большая: {} КБ", bytes.len() / 1024));
+        }
+        Ok(bytes)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UploadedPicture {
     pub url: String,

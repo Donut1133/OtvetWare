@@ -42,22 +42,53 @@ impl AiCfg {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Msg {
     pub role: String,
     pub content: String,
+    /// Картинки к этому сообщению, уже готовыми `data:`-ссылками. В историю
+    /// разговора не пишутся: файл распух бы на мегабайты, а модель к следующему
+    /// вопросу всё равно смотрит новые картинки.
+    #[serde(skip)]
+    pub images: Vec<String>,
 }
 
 impl Msg {
     pub fn system(c: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: c.into() }
+        Self { role: "system".into(), content: c.into(), images: vec![] }
     }
     pub fn user(c: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: c.into() }
+        Self { role: "user".into(), content: c.into(), images: vec![] }
     }
     pub fn assistant(c: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: c.into() }
+        Self { role: "assistant".into(), content: c.into(), images: vec![] }
     }
+
+    /// Показать модели картинки вместе с этим сообщением.
+    pub fn with_images(mut self, images: Vec<String>) -> Self {
+        self.images = images;
+        self
+    }
+
+    /// Сообщение в том виде, в каком его ждёт API. Без картинок это обычная
+    /// строка — так понимают все провайдеры; с картинками приходится
+    /// раскладывать содержимое на части, иначе текст и фото не соединить.
+    fn to_api(&self) -> serde_json::Value {
+        if self.images.is_empty() {
+            return json!({ "role": self.role, "content": self.content });
+        }
+        let mut parts = vec![json!({ "type": "text", "text": self.content })];
+        for url in &self.images {
+            parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+        }
+        json!({ "role": self.role, "content": parts })
+    }
+}
+
+/// Байты картинки в `data:`-ссылку, как её ждёт OpenAI-совместимый API.
+pub fn data_url(bytes: &[u8], mime: &str) -> String {
+    use base64::Engine;
+    format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 #[derive(Debug)]
@@ -152,6 +183,7 @@ impl AiClient {
     ) -> Result<String, AiError> {
         // Свежая директива на КАЖДЫЙ вызов, в том числе на каждый ретрай.
         let msgs = apply_directives(msgs);
+        let msgs: Vec<serde_json::Value> = msgs.iter().map(Msg::to_api).collect();
         let body = json!({
             "model": cfg.model,
             "messages": msgs,
@@ -346,7 +378,7 @@ pub fn apply_directives(msgs: &[Msg]) -> Vec<Msg> {
             if m.role == "system" {
                 let c = apply_markers(&m.content);
                 if c != m.content {
-                    return Msg { role: m.role.clone(), content: c };
+                    return Msg { role: m.role.clone(), content: c, images: m.images.clone() };
                 }
             }
             m.clone()

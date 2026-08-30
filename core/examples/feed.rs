@@ -5,7 +5,7 @@ use std::collections::HashSet;
 #[tokio::main]
 async fn main() {
     let name = std::env::args().nth(1).unwrap_or_else(|| "Аккаунт 2".into());
-    let root = std::env::var("OTVET_ROOT").unwrap_or_else(|_| ".".into());
+    let root = Core::find_root();
     let core = Core::open(&root);
     let Some(acc) = core.accounts.get(&name) else {
         eprintln!("нет аккаунта");

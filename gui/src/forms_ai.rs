@@ -199,11 +199,16 @@ pub struct ImageForm {
     pub kind: ImageKind,
     pub folder: String,
     pub count: i64,
+    /// Хэши картинок пула, которые разрешено прикладывать. Пусто — годится
+    /// любая. Отмечаются в окне пула, хранятся вместе с настройками режима:
+    /// к ответам и к вопросам обычно идут разные картинки.
+    #[serde(default)]
+    pub selected: Vec<String>,
 }
 
 impl Default for ImageForm {
     fn default() -> Self {
-        Self { kind: ImageKind::Off, folder: "images".into(), count: 1 }
+        Self { kind: ImageKind::Off, folder: "images".into(), count: 1, selected: vec![] }
     }
 }
 
@@ -211,7 +216,7 @@ impl ImageForm {
     pub fn to_core(&self) -> ImageMode {
         match self.kind {
             ImageKind::Off => ImageMode::Off,
-            ImageKind::Pool => ImageMode::Gif { selected: vec![] },
+            ImageKind::Pool => ImageMode::Gif { selected: self.selected.clone() },
             ImageKind::Folder => ImageMode::Upload { dir: self.folder.clone() },
         }
     }
@@ -250,8 +255,15 @@ impl ImageForm {
                     if ui.button("Пул картинок…").clicked() {
                         open_pool = true;
                     }
-                    hint(ui, "Загрузить свои, посмотреть, что уже есть.");
+                    ui.label(match self.selected.len() {
+                        0 => "берётся любая из пула".to_string(),
+                        n => format!("берутся только отмеченные: {n}"),
+                    });
                 });
+                hint(
+                    ui,
+                    "Какие именно прикладывать — отмечается галочками в окне пула. Без отметок бот берёт любую.",
+                );
                 hint(ui, "Картинки из пула уже лежат на CDN сайта — перезаливать их не нужно.");
             }
             ImageKind::Off => {}
@@ -316,6 +328,9 @@ pub struct AnswersForm {
     /// Не отвечать на вопросы своих же аккаунтов.
     #[serde(default = "yes")]
     pub skip_own_authors: bool,
+    /// Показывать нейросети картинки из вопроса.
+    #[serde(default)]
+    pub see_images: bool,
     #[serde(default)]
     pub uniq: UniqMode,
     #[serde(default)]
@@ -360,6 +375,7 @@ impl Default for AnswersForm {
             convo_budget_k: 60.0,
             skip_others: false,
             skip_own_authors: true,
+            see_images: false,
             uniq: UniqMode::Off,
             uniq_latin: false,
             verify_posted: true,
@@ -429,6 +445,7 @@ impl AnswersForm {
                 },
             );
             hint(ui, "Текст здесь только готовыми фразами: вопроса ещё нет, нейросети не о чем писать. Проверка отправки по той же причине не работает.");
+            hint(ui, "Номера общие на всех: каждый достаётся одному аккаунту, и под каждым окажется ровно один ответ. Чем больше аккаунтов работает разом, тем быстрее разбирается диапазон.");
         } else {
             ui.horizontal(|ui| {
                 ui.label("Смотреть последних");
@@ -442,23 +459,36 @@ impl AnswersForm {
         }
 
         block(ui, "Чем отвечаем");
-        ui.horizontal(|ui| {
-            seg(ui, &mut self.mode, AnswerMode::Ai, "Нейросетью");
-            seg(ui, &mut self.mode, AnswerMode::NoAi, "Готовыми фразами");
-            seg(ui, &mut self.mode, AnswerMode::Mangle, "Коверканьем");
-        });
+        // В диапазоне вопроса ещё нет: ни нейросети, ни коверканью не из чего
+        // исходить, поэтому выбора не показываем вовсе. Выбранный для ленты и
+        // ссылок режим при этом сохраняется — вернётся вместе с источником.
+        let how = self.effective_mode();
+        if self.source == Source::Range {
+            ui.label(egui::RichText::new("Готовыми фразами").color(theme::FG_STRONG));
+        } else {
+            ui.horizontal(|ui| {
+                seg(ui, &mut self.mode, AnswerMode::Ai, "Нейросетью");
+                seg(ui, &mut self.mode, AnswerMode::NoAi, "Готовыми фразами");
+                seg(ui, &mut self.mode, AnswerMode::Mangle, "Коверканьем");
+            });
+        }
         hint(
             ui,
-            match self.mode {
+            match how {
                 AnswerMode::Ai => "Настоящий ответ по смыслу вопроса. Нужен ключ нейросети.",
                 AnswerMode::NoAi => "Короткие реплики вроде «согласен» и «жиза». Бесплатно и быстро.",
                 AnswerMode::Mangle => "Слова вопроса в случайном порядке. Для кармы, а не для смысла.",
             },
         );
-        if self.mode == AnswerMode::Ai {
+        if how == AnswerMode::Ai {
             ai.ui(ui, styles);
+            ui.checkbox(&mut self.see_images, "показывать нейросети картинки из вопроса");
+            hint(
+                ui,
+                "Половина вопросов на сайте — это фото с подписью «как вам?»: без картинки текст пустой. Нужна модель, которая умеет смотреть, и каждая картинка стоит токенов.",
+            );
         }
-        if self.mode == AnswerMode::NoAi {
+        if how == AnswerMode::NoAi {
             list_edit(
                 ui,
                 "answers_noai",
@@ -487,12 +517,27 @@ impl AnswersForm {
                 ui.add(egui::DragValue::new(&mut self.repeat_per_question).range(1..=20));
             });
             hint(ui, "Сайт разрешает отвечать на один вопрос несколько раз подряд. Больше одного — заметно.");
+            // В диапазоне вопросы не надо ни искать, ни читать — узкое место
+            // только в том, как быстро уходят сами ответы. Поэтому пачка тут
+            // на виду, а не спрятана под заголовком, как у ленты.
+            if self.source == Source::Range {
+                ui.horizontal(|ui| {
+                    ui.label("Брать за проход по аккаунту");
+                    ui.add(egui::DragValue::new(&mut self.batch_size).range(1..=50));
+                    ui.label("номер(ов)");
+                });
+                ui.checkbox(&mut self.parallel, "отвечать на них разом");
+                hint(
+                    ui,
+                    "Без галки номера идут по одному. С галкой пачка уходит одновременно, и пауза считается между пачками, а не между ответами: так десять тысяч номеров разбираются за минуты — но нагрузка видна антиботу.",
+                );
+            }
         } else {
             extra(ui, "Лента и пачки", "ans_feed", |ui| {
                 range_row(ui, "Обновлять ленту через", &mut self.feed_min, &mut self.feed_max, 600.0);
                 hint(ui, "Пауза, когда отвечать не на что — все свежие вопросы уже разобраны.");
                 ui.horizontal(|ui| {
-                    ui.label("Брать за проход");
+                    ui.label("Брать за проход по аккаунту");
                     ui.add(egui::DragValue::new(&mut self.batch_size).range(1..=50));
                     ui.label("вопрос(ов)");
                 });
@@ -531,26 +576,36 @@ impl AnswersForm {
             });
         }
 
-        extra(ui, "Единый чат с памятью", "ans_convo", |ui| {
-            ui.checkbox(&mut self.conversational, "помнить прошлые вопросы и ответы");
-            hint(
-                ui,
-                "Нейросеть держит один разговор и общий характер. История общая на все аккаунты, поэтому работает один аккаунт за раз.",
-            );
-            ui.horizontal(|ui| {
-                ui.label("Сжимать историю после");
-                ui.add_enabled(
-                    self.conversational,
-                    egui::DragValue::new(&mut self.convo_budget_k).range(0.0..=1000.0).suffix(" тыс. знаков"),
+        // Память разговора — свойство нейросети. Готовым фразам и коверканью
+        // помнить нечего, и блок только сбивал бы с толку.
+        if how == AnswerMode::Ai {
+            extra(ui, "Единый чат с памятью", "ans_convo", |ui| {
+                ui.checkbox(&mut self.conversational, "помнить прошлые вопросы и ответы");
+                hint(
+                    ui,
+                    "Нейросеть держит один разговор и общий характер. История общая на все аккаунты, поэтому работает один аккаунт за раз.",
                 );
+                ui.horizontal(|ui| {
+                    ui.label("Сжимать историю после");
+                    ui.add_enabled(
+                        self.conversational,
+                        egui::DragValue::new(&mut self.convo_budget_k)
+                            .range(0.0..=1000.0)
+                            .suffix(" тыс. знаков"),
+                    );
+                });
+                hint(ui, "0 — не сжимать (для моделей с большим контекстом).");
             });
-            hint(ui, "0 — не сжимать (для моделей с большим контекстом).");
-        });
+        }
 
         extra(ui, "Уникальность и подпись", "ans_uniq", |ui| {
             ui.checkbox(&mut self.skip_others, "не отвечать туда, где уже был другой мой аккаунт");
-            ui.checkbox(&mut self.skip_own_authors, "не отвечать на вопросы своих аккаунтов");
-            hint(ui, "Свой аккаунт под своим же вопросом — готовая связка для модерации.");
+            // Автор вопроса известен только в ленте: по ссылкам и в диапазоне
+            // бот идёт по готовым номерам и ничьих вопросов не разбирает.
+            if self.source == Source::Feed {
+                ui.checkbox(&mut self.skip_own_authors, "не отвечать на вопросы своих аккаунтов");
+                hint(ui, "Свой аккаунт под своим же вопросом — готовая связка для модерации.");
+            }
             uniq_block(ui, &mut self.uniq, &mut self.uniq_latin);
             ui.label("Подпись в конце");
             ui.add(
@@ -560,33 +615,37 @@ impl AnswersForm {
             );
         });
 
-        extra(ui, "Только вопросы со словами", "ans_words", |ui| {
-            crate::forms::boxed_multiline(
-                ui,
-                "ans_words_edit",
-                &mut self.keywords,
-                2,
-                "vpn, впн, обход блокировок",
-            );
-            let words = otvet_core::answerer::parse_keywords(&self.keywords);
-            hint(
-                ui,
-                "Через запятую или с новой строки. Регистр не важен, слово ищется внутри заголовка и текста вопроса: «vpn» найдётся и в «VPN-сервис».",
-            );
-            hint(
-                ui,
-                &match words.len() {
-                    0 => "Пусто — бот отвечает на всё подряд.".to_string(),
-                    n => format!(
-                        "Слов: {n}. Остальные вопросы бот из ленты даже не возьмёт — ни лимита, ни запроса к нейросети на них не потратит."
-                    ),
-                },
-            );
-        });
+        // Отбор по словам и проверка отправки читают сам вопрос — в диапазоне
+        // его ещё нет. Ядро их там и не зовёт, так что показывать нечего.
+        if self.source != Source::Range {
+            extra(ui, "Только вопросы со словами", "ans_words", |ui| {
+                crate::forms::boxed_multiline(
+                    ui,
+                    "ans_words_edit",
+                    &mut self.keywords,
+                    2,
+                    "vpn, впн, обход блокировок",
+                );
+                let words = otvet_core::answerer::parse_keywords(&self.keywords);
+                hint(
+                    ui,
+                    "Через запятую или с новой строки. Регистр не важен, слово ищется внутри заголовка и текста вопроса: «vpn» найдётся и в «VPN-сервис».",
+                );
+                hint(
+                    ui,
+                    &match words.len() {
+                        0 => "Пусто — бот отвечает на всё подряд.".to_string(),
+                        n => format!(
+                            "Слов: {n}. Остальные вопросы бот из ленты даже не возьмёт — ни лимита, ни запроса к нейросети на них не потратит."
+                        ),
+                    },
+                );
+            });
 
-        extra(ui, "Проверка отправки", "ans_verify", |ui| {
-            verify_block(ui, &mut self.verify_posted, &mut self.verify_delay_sec, "ответ");
-        });
+            extra(ui, "Проверка отправки", "ans_verify", |ui| {
+                verify_block(ui, &mut self.verify_posted, &mut self.verify_delay_sec, "ответ");
+            });
+        }
 
         let mut open_pool = false;
         extra(ui, "Картинка к ответу", "ans_img", |ui| {
@@ -597,7 +656,7 @@ impl AnswersForm {
 
     pub fn to_params(&self, ai: &AiForm, check_auth: bool) -> AnswerParams {
         AnswerParams {
-            mode: self.mode,
+            mode: self.effective_mode(),
             target: match self.source {
                 Source::Feed => TargetMode::Feed,
                 Source::Links => TargetMode::Links,
@@ -620,6 +679,7 @@ impl AnswersForm {
             convo_budget_k: self.convo_budget_k,
             skip_others: self.skip_others,
             skip_own_authors: self.skip_own_authors,
+            see_images: self.see_images,
             keywords: otvet_core::answerer::parse_keywords(&self.keywords),
             uniq: self.uniq,
             uniq_latin: self.uniq_latin,
@@ -635,11 +695,24 @@ impl AnswersForm {
             mention: ai.mention.clone(),
             check_auth,
             progress: Progress::new(),
+            // Одна очередь номеров на прогон: параметры дальше клонируются под
+            // каждый аккаунт, и все получают ссылку на неё же.
+            range_queue: Default::default(),
+        }
+    }
+
+    /// Чем на самом деле пишется текст. В диапазон отвечаем заготовками при
+    /// любом выбранном режиме: вопроса ещё нет, читать нечего.
+    fn effective_mode(&self) -> AnswerMode {
+        if self.source == Source::Range {
+            AnswerMode::NoAi
+        } else {
+            self.mode
         }
     }
 
     pub fn summary(&self) -> String {
-        let how = match self.mode {
+        let how = match self.effective_mode() {
             AnswerMode::Ai => "нейросетью",
             AnswerMode::NoAi => "готовыми фразами",
             AnswerMode::Mangle => "коверканьем",
@@ -670,7 +743,10 @@ impl AnswersForm {
         if self.source == Source::Range && self.range().is_none() {
             v.push("Не задан диапазон: нужны номера первого и последнего вопроса".into());
         }
-        if self.mode == AnswerMode::Ai {
+        // Ключ нейросети спрашиваем только если она правда понадобится: в
+        // диапазоне её не зовут, и требовать ключ значило бы не пускать в
+        // работу из-за того, чем не пользуются.
+        if self.effective_mode() == AnswerMode::Ai {
             v.extend(ai.problems());
         }
         v
@@ -846,6 +922,9 @@ pub struct CommentsForm {
     pub pages: i64,
     pub use_question: bool,
     pub use_chain: bool,
+    /// Показывать нейросети картинки из реплики собеседника.
+    #[serde(default)]
+    pub see_images: bool,
     pub max_chain: usize,
     pub skip_own: bool,
     pub mark_read: bool,
@@ -876,6 +955,7 @@ impl Default for CommentsForm {
             pages: 1,
             use_question: true,
             use_chain: true,
+            see_images: false,
             max_chain: 6,
             skip_own: true,
             mark_read: false,
@@ -951,6 +1031,11 @@ impl CommentsForm {
                 ui.label("реплик");
             });
             hint(ui, "С перепиской ответы попадают в контекст разговора, но каждый запрос дороже.");
+            ui.checkbox(&mut self.see_images, "картинки из его реплики");
+            hint(
+                ui,
+                "Мемом отвечают не реже, чем словами, а текста у такой реплики нет вовсе. Нужна модель, которая умеет смотреть.",
+            );
         });
 
         extra(ui, "Уникальность и подпись", "cm_uniq", |ui| {
@@ -988,6 +1073,7 @@ impl CommentsForm {
             pages: self.pages,
             use_question: self.use_question,
             use_chain: self.use_chain,
+            see_images: self.see_images,
             max_chain: self.max_chain,
             ai: ai.cfg(),
             style: ai.style.clone(),
@@ -1032,5 +1118,56 @@ impl CommentsForm {
             v.extend(ai.problems());
         }
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// В диапазон бот отвечает заготовками, даже если в форме выбрана
+    /// нейросеть: вопроса ещё нет, читать ей нечего. И ключ за это спрашивать
+    /// не за что — иначе кнопка «Запустить» не пускала бы в работу из-за того,
+    /// чем не пользуются.
+    #[test]
+    fn range_answers_with_canned_text_and_needs_no_ai_key() {
+        let ai = AiForm::default();
+        let mut f = AnswersForm { mode: AnswerMode::Ai, ..Default::default() };
+
+        // Из ленты нейросеть остаётся нейросетью, и ключ ей нужен.
+        assert_eq!(f.to_params(&ai, false).mode, AnswerMode::Ai);
+        assert!(!f.problems(&ai).is_empty(), "лента без ключа нейросети запускаться не должна");
+
+        f.source = Source::Range;
+        f.range_from = "1000".into();
+        f.range_to = "1010".into();
+        assert_eq!(f.to_params(&ai, false).mode, AnswerMode::NoAi, "в диапазон ушла нейросеть");
+        assert!(f.problems(&ai).is_empty(), "диапазону ключ ни к чему: {:?}", f.problems(&ai));
+        assert!(f.summary().contains("готовыми фразами"), "сводка врёт: {}", f.summary());
+
+        // Возврат к ленте не должен стирать выбор человека.
+        f.source = Source::Feed;
+        assert_eq!(f.to_params(&ai, false).mode, AnswerMode::Ai);
+    }
+
+    /// Отмеченные в пуле картинки должны доезжать до прогона: без них ядро
+    /// берёт из пула любую, и выбор человека ни на что не влиял бы.
+    #[test]
+    fn chosen_pool_images_reach_the_run() {
+        let mut img = ImageForm { kind: ImageKind::Pool, ..Default::default() };
+        match img.to_core() {
+            ImageMode::Gif { selected } => assert!(selected.is_empty(), "по умолчанию годится любая"),
+            other => panic!("не пул: {other:?}"),
+        }
+
+        img.selected = vec!["aaa".into(), "bbb".into()];
+        match img.to_core() {
+            ImageMode::Gif { selected } => assert_eq!(selected, vec!["aaa", "bbb"]),
+            other => panic!("не пул: {other:?}"),
+        }
+
+        // Из папки отметки не при делах — там файлы, а не хэши пула.
+        img.kind = ImageKind::Folder;
+        assert!(matches!(img.to_core(), ImageMode::Upload { .. }));
     }
 }

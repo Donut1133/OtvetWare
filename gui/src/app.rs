@@ -354,7 +354,11 @@ impl App {
                     ui.separator();
                     let selected = self.accounts.selected_count(&self.bg.accounts());
                     let mode = self.mode;
-                    self.forms.common_mut(mode).ui(ui, selected, feed_mode(mode));
+                    // Диапазон — единственная работа, общая на все аккаунты:
+                    // лимиты там режут общую кучу, а не личную норму каждого.
+                    let shared =
+                        mode == Mode::Answers && self.forms.answers.source == crate::forms_ai::Source::Range;
+                    self.forms.common_mut(mode).ui(ui, selected, feed_mode(mode), shared);
                     ui.add_space(6.0);
                 });
                 if open_pool {
@@ -696,7 +700,15 @@ impl eframe::App for App {
         self.left_panel(ui);
         self.central(ui);
         let bg = self.bg.clone();
-        self.pool.ui(&ctx, &bg);
+        // Отметки «какие картинки прикладывать» принадлежат режиму, который
+        // открыл окно: к ответам и к вопросам обычно идут разные.
+        let mut spare = Vec::new();
+        let chosen = match self.mode {
+            Mode::Answers => &mut self.forms.answers.image.selected,
+            Mode::Questions => &mut self.forms.questions.image.selected,
+            _ => &mut spare,
+        };
+        self.pool.ui(&ctx, &bg, chosen);
 
         // Пока что-то работает — обновляем картинку 10 раз в секунду. В покое
         // окно не перерисовывается вообще: ноль нагрузки на простое.

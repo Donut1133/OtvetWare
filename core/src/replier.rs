@@ -122,6 +122,10 @@ pub struct ReplyParams {
     pub use_question: bool,
     /// Собирать полную цепочку разговора.
     pub use_chain: bool,
+    /// Показывать нейросети картинки из реплики собеседника. Нужна модель,
+    /// которая умеет смотреть.
+    #[serde(default)]
+    pub see_images: bool,
     pub max_chain: usize,
     pub ai: AiCfg,
     pub style: String,
@@ -157,6 +161,7 @@ impl Default for ReplyParams {
             pages: 1,
             use_question: true,
             use_chain: true,
+            see_images: false,
             max_chain: 6,
             ai: AiCfg::preset(),
             style: "Обычный чел".into(),
@@ -191,6 +196,9 @@ pub struct Target {
     pub root_text: String,
     /// Текст собеседника.
     pub comment_text: String,
+    /// Картинки его реплики — `src` из галерей, без адреса CDN. Мемом отвечают
+    /// не реже, чем словами, а текста у такой реплики нет вовсе.
+    pub comment_images: Vec<String>,
     pub created_at: String,
     pub url: String,
 }
@@ -327,6 +335,9 @@ pub fn to_target(n: &Value) -> Option<Target> {
         // title = ТЕКСТ НАШЕГО объекта, body = реплика собеседника (сверено с деревом).
         root_text: n.get("title").and_then(|v| v.as_str()).unwrap_or("").trim().to_string(),
         comment_text: n.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string(),
+        // В уведомлении лежит голый текст; картинки видны только в самой
+        // реплике — доберём их ниже, когда прочитаем её живьём.
+        comment_images: Vec::new(),
         created_at: norm_notif_time(n.get("created_at").and_then(|v| v.as_str()).unwrap_or("")),
         url: format!("https://otvet.mail.ru/question/{topic_id}"),
     })
@@ -1028,10 +1039,12 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
             continue;
         }
         // Живой текст точнее, чем поле уведомления (реплику могли отредактировать).
-        if let Some(live) = loc.entity.as_ref().and_then(|e| e.get("content")).map(doc_to_text) {
+        if let Some(doc) = loc.entity.as_ref().and_then(|e| e.get("content")) {
+            let live = doc_to_text(doc);
             if !live.is_empty() {
                 t.comment_text = live;
             }
+            t.comment_images = crate::content::doc_images(doc);
         }
 
         let mut text = if p.mode == ReplyMode::Ai {
@@ -1052,7 +1065,7 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
             if stop.is_stopped() {
                 break;
             }
-            let msgs = build_messages(
+            let mut msgs = build_messages(
                 &t,
                 question.as_ref(),
                 &loc.siblings,
@@ -1061,6 +1074,14 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
                 &p.mention,
                 &my_id,
             );
+            // Картинку из реплики показываем модели: мемом отвечают не реже,
+            // чем словами, и без неё разговор читается как обрывок.
+            if p.see_images && !t.comment_images.is_empty() {
+                let pics = crate::api::fetch_images(core, acc, &t.comment_images, log, stop).await;
+                if let Some(last) = msgs.last_mut() {
+                    last.images = pics;
+                }
+            }
             match core.ai.generate(&ai, &msgs, log, stop).await {
                 Ok(a) if !a.trim().is_empty() => a.trim().to_string(),
                 Ok(_) => {
