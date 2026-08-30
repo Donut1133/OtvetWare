@@ -44,6 +44,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # HTTP идёт через native-tls, которому на Linux нужен OpenSSL. На образах
+      # GitHub он обычно уже стоит, но «обычно» — плохая причина уронить сборку
+      # у человека, который просто форкнул репозиторий.
+      - name: Системные библиотеки
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
       # Интерфейсу нужны системные библиотеки, поэтому на Linux проверяем ядро:
       # вся логика бота живёт в нём и от платформы не зависит.
       - name: Тесты ядра
