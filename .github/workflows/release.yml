@@ -2,12 +2,23 @@ name: Release
 
 # Собирает .exe и прикладывает его к релизу, когда пушится тег вида v1.0.0:
 #   git tag v1.0.0 && git push origin v1.0.0
+#
+# Архива два. Лёгкий — только программа, ей нужен установленный Chrome. Полный —
+# с патченной сборкой Chromium внутри: она прячет следы автоматизации, которых
+# обычный Chrome не прячет, и человеку не надо ничего доустанавливать.
 on:
   push:
     tags: ["v*"]
 
 permissions:
   contents: write
+
+env:
+  # Версия закреплена намеренно: у неё Chromium 148.0.7778.96 — ровно тот, за
+  # который выдаёт себя персона. Разъедутся — UA будет говорить одно, а движок
+  # окажется другим, и это заметнее, чем отсутствие браузера. Ниже стоит
+  # проверка, которая на такое расхождение роняет сборку.
+  PATCHRIGHT_VERSION: "1.60.2"
 
 jobs:
   windows:
@@ -23,7 +34,7 @@ jobs:
       - name: Сборка
         run: cargo build --release -p otvet-gui
 
-      - name: Собрать архив
+      - name: Собрать лёгкий архив
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -33,8 +44,54 @@ jobs:
           Copy-Item data/*.example.json, data/README.md dist/data/
           Compress-Archive -Path dist/* -DestinationPath otvetware-windows-x64.zip
 
+      - name: Скачать патченный Chromium
+        shell: pwsh
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}\browsers
+        run: |
+          npx --yes patchright@$env:PATCHRIGHT_VERSION install chromium
+          Get-ChildItem $env:PLAYWRIGHT_BROWSERS_PATH | Select-Object Name
+
+      - name: Сверить версию браузера с той, которой представляется персона
+        shell: pwsh
+        run: |
+          $src = Get-Content core/src/persona.rs -Raw
+          if ($src -notmatch 'FALLBACK_VERSION: &str = "([^"]+)"') { throw "не нашёл FALLBACK_VERSION" }
+          $want = $matches[1]
+          $manifest = Get-ChildItem "browsers/chromium-*/chrome-win64/*.manifest" -ErrorAction Stop |
+                      Select-Object -First 1
+          $got = $manifest.BaseName
+          Write-Host "персона говорит: $want | сборка: $got"
+          if ($want -ne $got) {
+            throw "Версии разошлись. Либо закрепи другую patchright, либо поправь FALLBACK_VERSION в core/src/persona.rs"
+          }
+
+      - name: Собрать архив с браузером
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force full | Out-Null
+          Copy-Item dist/* full/ -Recurse
+          # Раскладку не меняем: бот сам ищет browsers/<что-угодно>/chrome-win64/chrome.exe
+          # рядом с программой, поэтому папка кладётся как есть.
+          Copy-Item browsers full/browsers -Recurse
+          Compress-Archive -Path full/* -DestinationPath otvetware-windows-x64-with-browser.zip
+
       - name: Опубликовать релиз
         uses: softprops/action-gh-release@v2
         with:
-          files: otvetware-windows-x64.zip
+          files: |
+            otvetware-windows-x64.zip
+            otvetware-windows-x64-with-browser.zip
           generate_release_notes: true
+          body: |
+            ## Что скачивать
+
+            **`otvetware-windows-x64-with-browser.zip`** — если не уверен.
+            Внутри всё нужное, включая браузер для входа в аккаунты. Распаковать
+            и запустить `otvetware.exe`.
+
+            **`otvetware-windows-x64.zip`** — если на компьютере уже стоит Google
+            Chrome и не хочется качать лишние две сотни мегабайт.
+
+            Данные (аккаунты, отпечатки, журналы) программа складывает в папку
+            `accounts` рядом с собой — переносится копированием этой папки.
