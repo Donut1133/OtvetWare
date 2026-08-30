@@ -1,4 +1,4 @@
-//! ai.rs — клиент OpenAI-совместимого API (OpenRouter и т.п.) + «директивы».
+//! ai.rs — клиент OpenAI-совместимого API (DeepSeek, OpenRouter и т.п.) + «директивы».
 //!
 //! Про директивы отдельно, потому что это неочевидно: разброс ответов — свойство
 //! НАБОРА, а не одного ответа. Внутри вызова модель прошлых ответов не помнит и
@@ -31,8 +31,8 @@ pub struct AiCfg {
 impl AiCfg {
     pub fn preset() -> Self {
         Self {
-            url: "https://openrouter.ai/api/v1/chat/completions".into(),
-            model: "deepseek/deepseek-v4-flash:nitro".into(),
+            url: "https://api.deepseek.com/chat/completions".into(),
+            model: "deepseek-chat".into(),
             api_key: String::new(),
             temperature: 0.7,
             max_tokens: 5000,
