@@ -292,10 +292,14 @@ pub struct AnswersForm {
     /// Сколько ответов на аккаунт за прогон (0 = без лимита).
     #[serde(default = "default_limit")]
     pub limit: i64,
-    /// Откуда берём вопросы. Старое поле `from_links` из прежних настроек
-    /// читается как «по ссылкам».
+    /// Откуда берём вопросы.
     #[serde(default)]
     pub source: Source,
+    /// Прежние настройки хранили вместо трёх источников одну галку `from_links`.
+    /// Читаем её, чтобы после обновления не сбрасывать выбор человека на ленту;
+    /// обратно не пишем — см. [`AnswersForm::migrate`].
+    #[serde(default, rename = "from_links", skip_serializing)]
+    legacy_from_links: bool,
     pub links: String,
     pub delay_min: f64,
     pub delay_max: f64,
@@ -341,6 +345,7 @@ impl Default for AnswersForm {
             mode: AnswerMode::Ai,
             limit: default_limit(),
             source: Source::default(),
+            legacy_from_links: false,
             links: String::new(),
             delay_min: 20.0,
             delay_max: 45.0,
@@ -370,6 +375,14 @@ impl Default for AnswersForm {
 }
 
 impl AnswersForm {
+    /// Перенести выбор из прежних настроек: галка «по ссылкам» → источник.
+    /// Новое поле, если оно есть в файле, важнее старой галки.
+    pub fn migrate(&mut self) {
+        if std::mem::take(&mut self.legacy_from_links) && self.source == Source::Feed {
+            self.source = Source::Links;
+        }
+    }
+
     /// Разобранный диапазон: меньший номер, больший. `None` — задан не полностью.
     pub fn range(&self) -> Option<(i64, i64)> {
         let a = topic_number(&self.range_from)?;

@@ -499,7 +499,11 @@ pub async fn open_as(
         alive.stop();
         return Err(anyhow::anyhow!("не удалось поставить куки: {e}"));
     }
-    cdp.call("Target.createTarget", serde_json::json!({ "url": url })).await?;
+    if let Err(e) = cdp.call("Target.createTarget", serde_json::json!({ "url": url })).await {
+        let _ = child.kill().await;
+        alive.stop();
+        return Err(anyhow::anyhow!("не удалось открыть вкладку: {e}"));
+    }
     // Стартовую пустую вкладку закрываем: она нужна была только чтобы куки
     // легли ДО первой загрузки страницы.
     if let Ok(list) = cdp.call("Target.getTargets", serde_json::json!({})).await {

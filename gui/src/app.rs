@@ -48,6 +48,10 @@ struct PersistedForms {
 }
 
 impl PersistedForms {
+    /// Дочитать то, что в прежних версиях называлось иначе.
+    fn migrate(&mut self) {
+        self.answers.migrate();
+    }
     fn common(&self, m: Mode) -> CommonForm {
         self.commons.get(&m).cloned().unwrap_or_default()
     }
@@ -74,11 +78,12 @@ impl App {
         theme::install(&cc.egui_ctx);
         bg.set_ctx(cc.egui_ctx.clone());
 
-        let forms = cc
+        let mut forms = cc
             .storage
             .and_then(|s| s.get_string(STATE_KEY))
             .and_then(|t| serde_json::from_str::<PersistedForms>(&t).ok())
             .unwrap_or_default();
+        forms.migrate();
 
         let modes = Mode::ALL.iter().map(|m| (*m, Arc::new(ModeState::default()))).collect();
         let styles = Styles::load(&bg.core.root);
@@ -720,6 +725,7 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forms_ai::Source;
 
     /// Настройки, сохранённые ПРОШЛОЙ версией, должны читаться и дальше.
     ///
@@ -735,7 +741,8 @@ mod tests {
                         "proxy_rotate_fails": 2, "check_auth": true },
             "votes": { "target_kind": "Profile", "links": "https://otvet.mail.ru/profile/id1",
                        "plus": true, "delay": 2.0, "limit": 0 },
-            "answers": { "mode": "NoAi", "limit": 9, "from_links": false, "links": "",
+            "answers": { "mode": "NoAi", "limit": 9, "from_links": true,
+                         "links": "https://otvet.mail.ru/question/1",
                          "delay_min": 20.0, "delay_max": 45.0, "feed_min": 10.0, "feed_max": 20.0,
                          "recent_scan": 10, "repeat_per_question": 1, "batch_size": 1,
                          "parallel": false, "continuous_feed": false, "conversational": false,
@@ -746,11 +753,14 @@ mod tests {
                            "topic": "рыбалка", "noai_list": "",
                            "image": { "kind": "Off", "folder": "images", "count": 1 } }
         }"#;
-        let f: PersistedForms = serde_json::from_str(legacy).expect("старые настройки не прочитались");
+        let mut f: PersistedForms = serde_json::from_str(legacy).expect("старые настройки не прочитались");
+        f.migrate();
         // Пережило переезд.
         assert_eq!(f.votes.links, "https://otvet.mail.ru/profile/id1");
         assert_eq!(f.answers.limit, 9);
         assert_eq!(f.answers.signature, "подпись");
+        // Галка «по ссылкам» стала источником, а не сбросилась на ленту.
+        assert_eq!(f.answers.source, Source::Links);
         // Новые поля взяли значения по умолчанию, а не сломали разбор.
         assert!(f.answers.verify_posted);
         assert!(f.answers.skip_own_authors);
