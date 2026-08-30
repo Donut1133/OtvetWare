@@ -235,6 +235,8 @@ impl App {
             ui.add_space(3.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new(theme::APP_NAME).size(17.0).strong().color(theme::FG_STRONG));
+                ui.label(RichText::new("pre-release").size(12.0).color(theme::WARN))
+                    .on_hover_text("Ранняя версия: что-то может работать не так, как ожидается");
                 ui.label(RichText::new("otvet.mail.ru").size(12.0).color(theme::FG_FAINT));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Статус справа одной строкой, без мигалок и спиннеров.
@@ -248,6 +250,14 @@ impl App {
                         ("готов", theme::FG_FAINT)
                     };
                     ui.label(RichText::new(txt).size(12.0).color(col));
+                    ui.add_space(10.0);
+                    // Автор — ссылкой, а не просто текстом: адрес хочется открыть,
+                    // а не переписывать руками.
+                    ui.hyperlink_to(
+                        RichText::new("t.me/rust_senior").size(12.0).color(theme::FG_DIM),
+                        "https://t.me/rust_senior",
+                    )
+                    .on_hover_text("Автор");
                 });
             });
             ui.add_space(3.0);
