@@ -14,12 +14,13 @@
 
 use crate::accounts::Account;
 use crate::ai::{AiCfg, AiError, Msg, NO_MARKDOWN};
-use crate::answerer::{with_random_tag, with_signature};
+use crate::answerer::with_signature;
 use crate::api;
 use crate::content::{doc_to_text, text_to_doc};
 use crate::http::{HttpError, ReqOpts};
 use crate::journals::{self, RepliedEntry};
-use crate::util::{clip, pick_one, rand_f64, Log, Stop};
+use crate::uniq::{uniquify, UniqMode};
+use crate::util::{clip, pick_one, rand_f64, Log, Progress, Stop};
 use crate::{Core, RunOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -47,6 +48,11 @@ pub const NOAI_REPLIES: &[&str] = &[
     "бывает и хуже",
     "ну ты понял",
 ];
+
+/// Сколько отказов подряд считать «дальше бесполезно». Обычная причина —
+/// исчерпан дневной лимит ответов или умер ключ нейросети; каждая следующая
+/// цель стоит запроса к сайту и оплаченной генерации, а результат тот же.
+const MAX_FAILS: i64 = 5;
 
 pub const TYPE_REPLY: &str = "new_reply_reply";
 pub const TYPE_TOPIC: &str = "new_topic_reply";
@@ -122,11 +128,19 @@ pub struct ReplyParams {
     pub custom_prompt: String,
     pub mention: String,
     pub noai_replies: Vec<String>,
-    pub random_tag: bool,
+    /// Уникализация текста реплики.
+    pub uniq: UniqMode,
+    pub uniq_latin: bool,
+    /// Проверять, что реплика осталась в ветке (её мог снести антиспам).
+    pub verify_posted: bool,
+    pub verify_delay_sec: f64,
     pub signature: String,
     /// Пометить уведомления прочитанными в конце (mail.ru пометит ВСЕ).
     pub mark_read: bool,
     pub check_auth: bool,
+    /// Живой счётчик для интерфейса.
+    #[serde(skip)]
+    pub progress: Progress,
 }
 
 impl Default for ReplyParams {
@@ -149,10 +163,14 @@ impl Default for ReplyParams {
             custom_prompt: String::new(),
             mention: String::new(),
             noai_replies: vec![],
-            random_tag: false,
+            uniq: UniqMode::Off,
+            uniq_latin: false,
+            verify_posted: true,
+            verify_delay_sec: 6.0,
             signature: String::new(),
             mark_read: false,
             check_auth: true,
+            progress: Progress::new(),
         }
     }
 }
@@ -530,11 +548,13 @@ pub async fn fetch_question_brief(
     ))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PostRes {
     Ok(i64),
     /// Антибот mail.ru — аккаунт дальше не идёт.
     Blocked,
+    /// Сайт не принял этот текст (4xx, но не антибот): реплики не создано.
+    Rejected(String),
     Failed,
 }
 
@@ -570,7 +590,7 @@ pub async fn post_reply(
         Ok(r) => r,
         Err(HttpError::Aborted) => return Err(HttpError::Aborted),
         Err(e) => {
-            log(&format!("   ⚠️  Сеть/прокси при отправке ({e}) — не отправлено, продолжаю."));
+            log(&format!("   [!] Сеть/прокси при отправке ({e}) — не отправлено, продолжаю."));
             return Ok(PostRes::Failed);
         }
     };
@@ -580,9 +600,34 @@ pub async fn post_reply(
     if let Some(id) = r.result().and_then(|res| res.get("id")).and_then(|v| v.as_i64()) {
         return Ok(PostRes::Ok(id));
     }
+    if (400..500).contains(&r.status) {
+        return Ok(PostRes::Rejected(crate::answerer::refusal_reason(&r)));
+    }
     // Сюда же попадает исчерпанный дневной лимит ответов mail.ru.
-    log(&format!("   ⚠️  Не прошло: HTTP {} {}", r.status, r.snippet(200)));
+    log(&format!("   [!] Не прошло: HTTP {} {}", r.status, r.snippet(200)));
     Ok(PostRes::Failed)
+}
+
+/// Осталась ли наша реплика в ветке. `true` и при сетевом сбое: наказывать за
+/// то, что не удалось проверить, нельзя — иначе живой ответ уедет в «не вышло».
+pub async fn reply_is_there(core: &Core, acc: &Account, t: &Target, reply_id: i64, stop: &Stop) -> bool {
+    let url = format!("/api/topic/answers/{}?reply_id={}", t.topic_id, t.entity_id);
+    let Ok(r) = core.http.request(acc, &url, ReqOpts::get(), stop).await else { return true };
+    if r.blocked || !r.ok {
+        return true;
+    }
+    let Some(res) = r.result() else { return true };
+    let Some(list) = res.get("replies").and_then(|v| v.as_array()) else { return true };
+    // Пустая ветка сразу после отправки — это «снесли». А вот полная страница
+    // может просто не вместить нашу реплику: считать её пропавшей и слать
+    // вторую нельзя.
+    if list.is_empty() {
+        return false;
+    }
+    if list.len() >= 20 {
+        return true;
+    }
+    list.iter().any(|x| x.get("id").and_then(|v| v.as_i64()) == Some(reply_id))
 }
 
 pub async fn mark_all_read(core: &Core, acc: &Account, stop: &Stop) -> bool {
@@ -716,7 +761,7 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
 
     let wanted = p.types.wanted();
     if wanted.is_empty() {
-        log("❌ Не выбран ни один тип событий (комменты / ответы на вопросы / упоминания).");
+        log("[-] Не выбрано ни одного вида уведомлений (под моим ответом / на мой вопрос / упоминания).");
         return out;
     }
     let d_min = p.delay_min.max(0.0);
@@ -728,23 +773,24 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
     let mut ai = p.ai.clone();
     let custom = p.custom_prompt.trim();
     let system_prompt = if custom.is_empty() { styles.prompt(&p.style, "reply") } else { custom.to_string() };
-    if ai.temperature <= 0.0 {
+    // Ноль — это ноль (см. комментарий в answerer.rs); «из стиля» = отрицательное.
+    if ai.temperature < 0.0 {
         ai.temperature = styles.temperature(&p.style).unwrap_or(0.7);
     }
 
     if p.mode == ReplyMode::Ai {
-        log("🔌 Проверяю API...");
+        log("[>] Проверяю нейросеть...");
         match core.ai.check(&ai, stop).await {
-            Ok(m) => log(&format!("✅ {m}")),
+            Ok(m) => log(&format!("[+] {m}")),
             Err(e) => {
                 if !stop.is_stopped() {
-                    log(&format!("❌ {e}"));
+                    log(&format!("[-] {e}"));
                 }
                 return out;
             }
         }
         log(&format!(
-            "🎨 Стиль: {} | 🌡 {} | 🎟 {} | ⏱ {}с | 🔁 {}",
+            "[>] Стиль: {} | {} | токенов: {} | таймаут: {}с | повторов при ошибке: {}",
             if custom.is_empty() { p.style.as_str() } else { "свой промпт" },
             ai.temperature,
             ai.max_tokens,
@@ -752,24 +798,28 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
             ai.retries
         ));
     } else {
-        log("💬 Режим без AI — короткие готовые реплики");
+        log("[>] Режим без AI — короткие готовые реплики");
     }
 
     if p.check_auth {
-        let v = api::validate_account(core, acc, stop).await;
+        let v = api::validate_cached(core, acc, stop).await;
         api::persist_validation(core, &acc.name, &v);
         out.karma = v.karma.clone();
         if v.blocked {
             out.blocked = true;
-            log("🛑 Антибот (418/429) при проверке — статус не меняю.");
+            log("[x] Антибот (418/429) при проверке — статус не меняю.");
+        } else if v.banned {
+            log("[x] Аккаунт заблокирован сайтом — пропускаю. Сессия жива, но действия молча не проходят.");
+            out.skipped = true;
+            return out;
         } else if v.alive {
-            log("✅ Авторизован");
+            log("[+] Авторизован");
         } else if v.auth_bad {
-            log("🔒 НЕ авторизован — пропускаю аккаунт.");
+            log("[x] НЕ авторизован — пропускаю аккаунт.");
             out.skipped = true;
             return out;
         } else {
-            log("⚠️  Не удалось проверить авторизацию (ошибка/сеть) — продолжаю, статус не трогаю.");
+            log("[!] Не удалось проверить авторизацию (ошибка/сеть) — продолжаю, статус не трогаю.");
         }
     }
 
@@ -794,16 +844,16 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
 
     let limit_label = if p.limit > 0 { p.limit.to_string() } else { "∞".into() };
     log(&format!(
-        "📥 Слушаю уведомления: {}",
+        "[>] Слушаю уведомления: {}",
         wanted.iter().map(|t| type_label(t)).collect::<Vec<_>>().join(", ")
     ));
     log(&format!(
-        "⚙️  Лимит {limit_label} | пауза {d_min}–{d_max}с | не старше {} | не больше {per_thread} в ветку | страниц {page_cnt}{}",
+        "[>] Лимит {limit_label} | пауза {d_min}–{d_max}с | не старше {} | не больше {per_thread} в ветку | страниц {page_cnt}{}",
         if p.max_age_hours > 0.0 { format!("{} ч", p.max_age_hours) } else { "∞".into() },
         if p.skip_own { " | свои аккаунты пропускаю" } else { "" }
     ));
     if !seen.is_empty() {
-        log(&format!("🗂  В журнале уже отвечено: {}", seen.len()));
+        log(&format!("[>] В журнале уже отвечено: {}", seen.len()));
     }
 
     // 1) собираем уведомления
@@ -816,15 +866,15 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
         let n = fetch_notifications(core, acc, before.as_deref(), stop).await;
         if n.blocked {
             out.blocked = true;
-            log("🛑 Антибот (418/429) при чтении уведомлений.");
+            log("[x] Антибот (418/429) при чтении уведомлений.");
             break;
         }
         if n.throttled {
-            log("⚠️  mail.ru отдал пустой ответ на уведомления (троттлинг аккаунта/IP). Нужна пауза или живой прокси.");
+            log("[!] mail.ru отдал пустой ответ на уведомления (троттлинг аккаунта/IP). Нужна пауза или живой прокси.");
             break;
         }
         if !n.ok {
-            log(&format!("⚠️  Не прочитать уведомления ({}).", n.error.unwrap_or_else(|| "ошибка".into())));
+            log(&format!("[!] Не прочитать уведомления ({}).", n.error.unwrap_or_else(|| "ошибка".into())));
             break;
         }
         if n.items.is_empty() {
@@ -849,18 +899,26 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
         return out;
     }
     if targets.is_empty() {
-        log("📭 Новых реплик нет.");
+        log("[>] Новых реплик нет.");
         return out;
     }
-    log(&format!("📬 Найдено подходящих уведомлений: {}", targets.len()));
+    log(&format!("[>] Найдено подходящих уведомлений: {}", targets.len()));
 
     // 2) отсев
     let (mut s_seen, mut s_own, mut s_old, mut s_thread) = (0, 0, 0, 0);
     let mut planned: HashMap<String, i64> = HashMap::new();
-    let mut queue: Vec<Target> = Vec::new();
+    let mut queue: std::collections::VecDeque<Target> = std::collections::VecDeque::new();
+    // Одна реплика может прийти дважды: секции ответа (`unread` и `day`)
+    // пересекаются, да и курсор `before` у mail.ru инклюзивный. Без этой
+    // проверки при «не больше 2 в ветку» бот отвечал бы одному человеку два
+    // раза подряд — в журнал entity_id попадает только после отправки.
+    let mut queued: HashSet<String> = HashSet::new();
     for t in targets {
         if seen.contains(&t.entity_id) {
             s_seen += 1;
+            continue;
+        }
+        if !queued.insert(t.entity_id.clone()) {
             continue;
         }
         if p.skip_own && !t.author_id.is_empty() && own.contains(&t.author_id) {
@@ -879,7 +937,7 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
             continue;
         }
         *planned.entry(root_key).or_insert(0) += 1;
-        queue.push(t);
+        queue.push_back(t);
     }
     let skips: Vec<String> =
         [(s_seen, "уже отвечено"), (s_own, "свои"), (s_old, "старые"), (s_thread, "лимит ветки")]
@@ -888,13 +946,13 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
             .map(|(n, label)| format!("{label} {n}"))
             .collect();
     if !skips.is_empty() {
-        log(&format!("⏭️  Пропущено: {}", skips.join(", ")));
+        log(&format!("[!] Пропущено: {}", skips.join(", ")));
     }
     if queue.is_empty() {
-        log("📭 Отвечать не на что.");
+        log("[>] Отвечать не на что.");
         return out;
     }
-    log(&format!("🎯 К ответу: {}", queue.len()));
+    log(&format!("[=] К ответу: {}", queue.len()));
 
     // 3) отвечаем
     let noai: Vec<String> = if p.noai_replies.is_empty() {
@@ -903,23 +961,35 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
         p.noai_replies.clone()
     };
 
-    for mut t in queue {
+    // Отказы подряд: сайт перестал принимать ответы (дневной лимит) или умер
+    // ключ нейросети. Дальше по очереди идти бессмысленно и дорого.
+    let mut fails = 0i64;
+
+    // Сколько раз цель уже возвращали в очередь после отказа по тексту.
+    let mut retried: HashSet<String> = HashSet::new();
+    while let Some(mut t) = queue.pop_front() {
         if stop.is_stopped() {
-            log("\n⛔ Остановлено пользователем");
+            log("\n[x] Остановлено пользователем");
             break;
         }
         if out.blocked {
-            log("\n🛑 Блокировка mail.ru (418/429) — останавливаю аккаунт.");
+            log("\n[x] Блокировка mail.ru (418/429) — останавливаю аккаунт.");
             break;
         }
         if p.limit > 0 && out.done >= p.limit {
-            log(&format!("\n🏁 Достигнут лимит {limit_label}."));
+            log(&format!("\n[=] Достигнут лимит {limit_label}."));
+            break;
+        }
+        if fails >= MAX_FAILS {
+            log(&format!(
+                "\n[x] Подряд {MAX_FAILS} отказов — останавливаю аккаунт (обычно это дневной лимит ответов или мёртвый ключ нейросети)."
+            ));
             break;
         }
 
         let who = t.who();
         log(&format!(
-            "\n💬 {} от {who}{}",
+            "\n[>] {} от {who}{}",
             type_label(&t.kind),
             if t.created_at.is_empty() { String::new() } else { format!(" ({})", ago(&t.created_at)) }
         ));
@@ -929,19 +999,19 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
         let loc = locate_entity(core, acc, &t, stop).await;
         if loc.blocked {
             out.blocked = true;
-            log("   🛑 Антибот при чтении ветки.");
+            log("   [x] Антибот при чтении ветки.");
             break;
         }
         if loc.throttled {
-            log("   ⚠️  Пустой ответ от mail.ru (троттлинг) — пропускаю.");
+            log("   [!] Пустой ответ от mail.ru (троттлинг) — пропускаю.");
             continue;
         }
         if let Some(e) = loc.error {
-            log(&format!("   ⚠️  Не прочитать ветку ({e}) — пропускаю."));
+            log(&format!("   [!] Не прочитать ветку ({e}) — пропускаю."));
             continue;
         }
         if !loc.found {
-            log("   🗑  Реплика удалена/недоступна — отмечаю обработанной, пропускаю.");
+            log("   [!] Реплика удалена/недоступна — отмечаю обработанной, пропускаю.");
             journals::append_replied(
                 &core.root,
                 &acc.name,
@@ -968,7 +1038,7 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
             let chain = if p.use_chain && t.kind == TYPE_REPLY && mine_replies.contains(&t.root_id) {
                 let c = fetch_chain(core, acc, &t, &my_id, p.max_chain, loc.siblings.clone(), stop).await;
                 if let Some(c) = &c {
-                    log(&format!("   🧵 Цепочка разговора: {} реплик", c.len()));
+                    log(&format!("   [>] Цепочка разговора: {} реплик", c.len()));
                 }
                 c
             } else {
@@ -994,12 +1064,14 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
             match core.ai.generate(&ai, &msgs, log, stop).await {
                 Ok(a) if !a.trim().is_empty() => a.trim().to_string(),
                 Ok(_) => {
-                    log("   ⚠️  Пустой ответ ИИ — пропускаю.");
+                    fails += 1;
+                    log("   [!] Пустой ответ ИИ — пропускаю.");
                     continue;
                 }
                 Err(AiError::Aborted) => break,
                 Err(e) => {
-                    log(&format!("   ❌ ИИ не ответил ({e}) — пропускаю."));
+                    fails += 1;
+                    log(&format!("   [-] ИИ не ответил ({e}) — пропускаю."));
                     continue;
                 }
             }
@@ -1007,8 +1079,8 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
             pick_one(&noai).cloned().unwrap_or_default()
         };
 
-        if p.random_tag {
-            text = with_random_tag(&text);
+        if p.uniq != UniqMode::Off {
+            text = uniquify(&text, p.uniq, p.uniq_latin);
         }
         text = with_signature(&text, &p.signature);
         log(&format!("   Я: «{}»", clip(&text, 160)));
@@ -1017,12 +1089,44 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
             Err(_) => break,
             Ok(PostRes::Blocked) => {
                 out.blocked = true;
-                log("   🛑 Антибот при отправке — стоп аккаунта.");
+                log("   [x] Антибот при отправке — стоп аккаунта.");
                 break;
             }
-            Ok(PostRes::Failed) => continue,
+            Ok(PostRes::Rejected(why)) => {
+                fails += 1;
+                // Отказ по тексту: реплики не появилось, значит можно сочинить
+                // другую. Одна попытка на цель — если сайт отказывает и ей, дело
+                // не в тексте.
+                if retried.insert(t.entity_id.clone()) {
+                    log(&format!("   [!] Сайт не принял реплику ({why}) — напишу другую."));
+                    queue.push_front(t);
+                } else {
+                    log(&format!("   [!] Сайт не принял и вторую реплику ({why}) — пропускаю."));
+                }
+                continue;
+            }
+            Ok(PostRes::Failed) => {
+                fails += 1;
+                continue;
+            }
             Ok(PostRes::Ok(id)) => {
+                // Реплику могли снести за спам сразу после отправки: сайт при
+                // этом отвечает «принято» и отдаёт id. Проверяем, что она
+                // действительно осталась в ветке.
+                if p.verify_posted {
+                    let wait = p.verify_delay_sec.clamp(0.0, 120.0);
+                    if wait > 0.0 && stop.sleep_ms((wait * 1000.0) as u64).await {
+                        break;
+                    }
+                    if !reply_is_there(core, acc, &t, id, stop).await {
+                        fails += 1;
+                        log("   [!] Реплики в ветке нет — снесла автомодерация. Не засчитываю.");
+                        continue;
+                    }
+                }
+                fails = 0;
                 out.done += 1;
+                p.progress.inc();
                 seen.insert(t.entity_id.clone());
                 let root_key = if t.root_id.is_empty() { t.topic_id.clone() } else { t.root_id.clone() };
                 *per_root.entry(root_key).or_insert(0) += 1;
@@ -1038,13 +1142,13 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
                         ts: journals::now_ms(),
                     },
                 );
-                log(&format!("   ✅ Ответ отправлен (reply #{id}) → {who}"));
+                log(&format!("   [+] Ответ отправлен (reply #{id}) → {who}"));
             }
         }
 
         if (p.limit <= 0 || out.done < p.limit) && d_max > 0.0 {
             let pause = (d_min + rand_f64() * (d_max - d_min)).round();
-            log(&format!("   ⏳ Пауза {pause:.0}с"));
+            log(&format!("   [>] Пауза {pause:.0}с"));
             if stop.sleep_ms((pause * 1000.0) as u64 + crate::util::rand_range(80, 300) as u64).await {
                 break;
             }
@@ -1054,13 +1158,13 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
     if p.mark_read && out.done > 0 && !stop.is_stopped() {
         let ok = mark_all_read(core, acc, stop).await;
         log(if ok {
-            "📗 Уведомления помечены прочитанными (mail.ru помечает все разом)."
+            "[+] Уведомления помечены прочитанными (mail.ru помечает все разом)."
         } else {
-            "⚠️  Не удалось пометить уведомления прочитанными."
+            "[!] Не удалось пометить уведомления прочитанными."
         });
     }
 
-    log(&format!("\n📊 Ответов в комментариях: {}", out.done));
+    log(&format!("\n[=] Ответов в комментариях: {}", out.done));
     out
 }
 

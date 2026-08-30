@@ -10,7 +10,7 @@ use otvet_core::Core;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 /// память и отрисовка не бесплатны.
 const LOG_CAP: usize = 20_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
     Votes,
     Answers,
@@ -54,29 +54,42 @@ impl Mode {
     }
 }
 
+/// Строка лога: время и текст. Время храним секундами от полуночи — это 4
+/// байта вместо строки на каждую из двадцати тысяч строк.
+pub struct LogLine {
+    pub secs: u32,
+    pub text: String,
+}
+
 /// Кольцевой буфер лога с дешёвым доступом по индексу — консоль рисуется
 /// виртуализованно, поэтому важно уметь брать произвольный диапазон строк.
 pub struct LogBuf {
-    lines: Mutex<VecDeque<String>>,
+    lines: Mutex<VecDeque<LogLine>>,
+    /// Растёт на каждое изменение: по нему консоль понимает, что список
+    /// отфильтрованных строк пора пересобрать, а не делать это каждый кадр.
+    version: AtomicU64,
 }
 
 impl Default for LogBuf {
     fn default() -> Self {
-        Self { lines: Mutex::new(VecDeque::with_capacity(1024)) }
+        Self { lines: Mutex::new(VecDeque::with_capacity(1024)), version: AtomicU64::new(0) }
     }
 }
 
 impl LogBuf {
     pub fn push(&self, text: &str) {
+        let secs = seconds_of_day();
         let mut lines = self.lines.lock();
         // Бот шлёт многострочные сообщения одним куском — разворачиваем, иначе
         // виртуализация консоли поедет (одна «строка» высотой в пять).
         for raw in text.split('\n') {
-            lines.push_back(raw.trim_end_matches('\r').to_string());
+            lines.push_back(LogLine { secs, text: raw.trim_end_matches('\r').to_string() });
             if lines.len() > LOG_CAP {
                 lines.pop_front();
             }
         }
+        drop(lines);
+        self.version.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn len(&self) -> usize {
@@ -87,23 +100,53 @@ impl LogBuf {
         self.len() == 0
     }
 
-    pub fn with_range<R>(
-        &self,
-        range: std::ops::Range<usize>,
-        f: impl FnOnce(&mut dyn Iterator<Item = &str>) -> R,
-    ) -> R {
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
+    }
+
+    /// Пройтись по строкам с указанными номерами (их выбирает фильтр консоли).
+    pub fn with_indices(&self, idx: &[usize], mut f: impl FnMut(&LogLine)) {
         let lines = self.lines.lock();
-        let mut it =
-            lines.iter().skip(range.start).take(range.end.saturating_sub(range.start)).map(|s| s.as_str());
-        f(&mut it)
+        for i in idx {
+            if let Some(l) = lines.get(*i) {
+                f(l);
+            }
+        }
+    }
+
+    /// Подряд идущие строки диапазона — путь без фильтра.
+    pub fn with_range(&self, range: std::ops::Range<usize>, mut f: impl FnMut(&LogLine)) {
+        let lines = self.lines.lock();
+        for i in range {
+            if let Some(l) = lines.get(i) {
+                f(l);
+            }
+        }
+    }
+
+    /// Номера строк, подходящих под фильтр.
+    ///
+    /// Пустой фильтр сюда не приходит: собирать список «все двадцать тысяч»
+    /// заново на каждую новую строку лога — это мусор на ровном месте, консоль
+    /// в этом случае просто идёт по порядку.
+    pub fn matching(&self, needle: &str) -> Vec<usize> {
+        let n: Vec<char> = needle.to_lowercase().chars().collect();
+        let lines = self.lines.lock();
+        lines.iter().enumerate().filter(|(_, l)| contains_ci(&l.text, &n)).map(|(i, _)| i).collect()
     }
 
     pub fn all_text(&self) -> String {
-        self.lines.lock().iter().cloned().collect::<Vec<_>>().join("\n")
+        self.lines
+            .lock()
+            .iter()
+            .map(|l| format!("{} {}", hhmmss(l.secs), l.text))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn clear(&self) {
         self.lines.lock().clear();
+        self.version.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Логгер для ядра.
@@ -113,15 +156,75 @@ impl LogBuf {
     }
 }
 
+/// Подстрока без учёта регистра и без единой лишней аллокации: фильтр гоняется
+/// по всему логу, а лог — это десятки тысяч строк.
+fn contains_ci(haystack: &str, needle_lower: &[char]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    for (at, _) in haystack.char_indices() {
+        let mut hay = haystack[at..].chars().flat_map(|c| c.to_lowercase());
+        if needle_lower.iter().all(|n| hay.next() == Some(*n)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn seconds_of_day() -> u32 {
+    use chrono::Timelike;
+    let now = chrono::Local::now();
+    now.hour() * 3600 + now.minute() * 60 + now.second()
+}
+
+/// «14:03:27» из секунд от полуночи.
+pub fn hhmmss(secs: u32) -> String {
+    format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+}
+
+/// Как показана консоль: прокрутка, фильтр, время. Живёт рядом с логом, но это
+/// про показ, а не про данные.
+pub struct ConsoleView {
+    /// Автопрокрутка вниз. Снимается сама, когда человек уезжает вверх.
+    pub follow: bool,
+    pub show_time: bool,
+    pub filter: String,
+    /// Кэш номеров строк под фильтр: версия лога + сам фильтр.
+    pub cache: (u64, String, Vec<usize>),
+    /// Прокрутка на прошлом кадре — по ней видно, что список увели ВВЕРХ.
+    pub last_offset: f32,
+    /// Куда едем: положение прокрутки, к которому подтягиваемся по кадрам.
+    /// Мгновенный прыжок к последней строке читать невозможно — глаз теряет
+    /// место, — поэтому доводим плавно.
+    pub glide_to: f32,
+    /// Нижний край прокрутки на прошлом кадре: цель для плавного доезда.
+    pub max_offset: f32,
+}
+
+impl Default for ConsoleView {
+    fn default() -> Self {
+        Self {
+            follow: true,
+            show_time: true,
+            filter: String::new(),
+            cache: (u64::MAX, String::new(), vec![]),
+            last_offset: 0.0,
+            glide_to: 0.0,
+            max_offset: 0.0,
+        }
+    }
+}
+
 /// Состояние одного режима: свой лог, своя кнопка «Стоп», свой признак работы.
 pub struct ModeState {
     pub log: Arc<LogBuf>,
     pub stop: Mutex<Stop>,
     pub running: Arc<AtomicBool>,
-    /// Автопрокрутка консоли вниз.
-    pub follow: AtomicBool,
-    /// Сделано за текущий прогон. Считаем по факту (что вернул бот), а не по
-    /// галочкам в логе: там ✅ ставится и на «Авторизован», и счётчик врал.
+    /// Как показана консоль этого режима.
+    pub view: Mutex<ConsoleView>,
+    /// Сделано за текущий прогон. Считаем по факту (режимы дёргают счётчик на
+    /// каждом успешном действии), а не по галочкам в логе — там отметка стоит и
+    /// на строке «Авторизован».
     pub done: Arc<AtomicI64>,
 }
 
@@ -131,7 +234,7 @@ impl Default for ModeState {
             log: Arc::new(LogBuf::default()),
             stop: Mutex::new(Stop::new()),
             running: Arc::new(AtomicBool::new(false)),
-            follow: AtomicBool::new(true),
+            view: Mutex::new(ConsoleView::default()),
             done: Arc::new(AtomicI64::new(0)),
         }
     }
@@ -143,6 +246,20 @@ impl ModeState {
     }
     pub fn request_stop(&self) {
         self.stop.lock().stop();
+    }
+    pub fn is_paused(&self) -> bool {
+        self.is_running() && self.stop.lock().is_paused()
+    }
+    /// Переключить паузу. `true` — теперь на паузе.
+    pub fn toggle_pause(&self) -> bool {
+        let s = self.stop.lock();
+        if s.is_paused() {
+            s.resume();
+            false
+        } else {
+            s.pause();
+            true
+        }
     }
     /// Новый прогон: свежий сигнал остановки (старый уже «взведён»).
     pub fn fresh_stop(&self) -> Stop {
@@ -235,5 +352,38 @@ impl Bg {
     pub fn reload_accounts(&self) {
         self.core.accounts.reload();
         self.refresh_accounts();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Лог не должен расти бесконечно: прогон на ночь пишет десятки тысяч
+    /// строк, и без кольцевого буфера окно к утру съело бы всю память.
+    #[test]
+    fn log_never_grows_past_the_cap() {
+        let log = LogBuf::default();
+        for i in 0..LOG_CAP * 3 {
+            log.push(&format!("[+] строка номер {i} с каким-то текстом внутри"));
+        }
+        assert_eq!(log.len(), LOG_CAP, "буфер лога перестал ограничиваться");
+
+        // Выбрасываются САМЫЕ СТАРЫЕ: последняя строка обязана остаться.
+        let last = format!("строка номер {}", LOG_CAP * 3 - 1);
+        assert!(log.all_text().contains(&last), "потеряли свежие строки вместо старых");
+        assert!(!log.all_text().contains("строка номер 0 "), "старые строки не выбрасываются");
+
+        log.clear();
+        assert!(log.is_empty());
+    }
+
+    /// Многострочное сообщение разворачивается в отдельные строки — и они тоже
+    /// считаются: иначе одна «строка» на пять экранов обошла бы ограничение.
+    #[test]
+    fn multiline_messages_count_as_many_lines() {
+        let log = LogBuf::default();
+        log.push("первая\nвторая\nтретья");
+        assert_eq!(log.len(), 3);
     }
 }

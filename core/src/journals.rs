@@ -314,6 +314,12 @@ pub struct PoolImage {
     pub tag: String,
 }
 
+/// Записать пул целиком. Формат — массив, как у JS-версии.
+pub fn save_gif_pool(root: &Path, items: &[PoolImage]) -> std::io::Result<()> {
+    let txt = serde_json::to_string_pretty(items).unwrap_or_else(|_| "[]".into());
+    crate::store_io::FileWriter::new(root.join("gif-pool.json")).write(&txt)
+}
+
 pub fn load_gif_pool(root: &Path) -> Vec<PoolImage> {
     let Ok(txt) = std::fs::read_to_string(root.join("gif-pool.json")) else { return vec![] };
     match serde_json::from_str::<Value>(&txt) {

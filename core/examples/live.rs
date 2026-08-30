@@ -1,6 +1,6 @@
 //! Живой прогон боевых путей по НАСТОЯЩЕМУ сайту.
 //!
-//! ⚠️ Этот пример реально постит: задаёт вопросы, пишет ответы, ставит голоса,
+//! ВНИМАНИЕ: этот пример реально постит: задаёт вопросы, пишет ответы, ставит голоса,
 //! подписывается и отправляет жалобы. Запускать только на своих аккаунтах и
 //! только осознанно — поэтому нужен флаг подтверждения:
 //!
@@ -64,8 +64,8 @@ async fn main() {
             let acc = account(&need(&args, 1, "имя аккаунта"));
             let v = api::validate_account(&core, &acc, &stop).await;
             println!(
-                "{}: alive={} authBad={} blocked={} id={:?} ник={:?} карма={:?}",
-                acc.name, v.alive, v.auth_bad, v.blocked, v.user_id, v.username, v.karma
+                "{}: alive={} authBad={} banned={} blocked={} id={:?} ник={:?} карма={:?}",
+                acc.name, v.alive, v.auth_bad, v.banned, v.blocked, v.user_id, v.username, v.karma
             );
             if let Some(u) = &v.username {
                 println!("профиль: https://otvet.mail.ru/profile/{u}");
@@ -74,10 +74,21 @@ async fn main() {
 
         "feed" => {
             let acc = account(&need(&args, 1, "имя аккаунта"));
-            let qs =
-                answerer::collect_questions(&core, &acc, &Default::default(), &Default::default(), 5, &stop)
-                    .await
-                    .unwrap_or_default();
+            // Сколько последних смотреть — то же, что «Смотреть последних» в
+            // интерфейсе. Полезно проверить, сколько сайт отдаёт на самом деле.
+            let n: i64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
+            let qs = answerer::collect_questions(
+                &core,
+                &acc,
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                n,
+                &stop,
+            )
+            .await
+            .unwrap_or_default();
+            println!("просили {n}, отвечаемых нашлось {}", qs.len());
             for q in &qs {
                 println!("#{} {}", q.id, q.title);
             }
@@ -100,11 +111,15 @@ async fn main() {
         "answer" => {
             let acc = account(&need(&args, 1, "имя аккаунта"));
             let url = need(&args, 2, "ссылка на вопрос");
+            // Третьим аргументом — «ответов на один вопрос»: тем же аккаунтом
+            // подряд. Проверка того, что сайт вообще такое разрешает.
+            let rep: i64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
             let p = answerer::AnswerParams {
                 mode: answerer::AnswerMode::NoAi,
                 target: answerer::TargetMode::Links,
                 links: vec![url],
-                limit: 1,
+                limit: rep,
+                repeat_per_question: rep,
                 delay_min: 0.0,
                 delay_max: 0.0,
                 check_auth: true,
@@ -124,6 +139,7 @@ async fn main() {
                 delay: 0.0,
                 limit: 0,
                 check_auth: true,
+                progress: Default::default(),
             };
             let out = votes::run_votes(&core, &acc, &p, &log, &stop).await;
             println!("итог: голосов {} blocked={}", out.done, out.blocked);
@@ -163,7 +179,9 @@ async fn main() {
                     subscribe::SubAction::Subscribe
                 },
                 delay: 0.0,
+                limit: 0,
                 check_auth: true,
+                progress: Default::default(),
             };
             let out = subscribe::run_subscriber(&core, &acc, &p, &log, &stop).await;
             println!("итог: {} blocked={}", out.done, out.blocked);
@@ -194,6 +212,7 @@ async fn main() {
                 delay: 0.0,
                 limit: 1,
                 check_auth: true,
+                progress: Default::default(),
             };
             let out = complain::run_complainer(&core, &acc, &p, &log, &stop).await;
             println!("итог: жалоб {} blocked={}", out.done, out.blocked);
@@ -390,9 +409,54 @@ async fn main() {
                 delay: 0.5,
                 limit,
                 check_auth: true,
+                progress: Default::default(),
             };
             let out = votes::run_votes(&core, &acc, &p, &log, &stop).await;
             println!("итог: голосов {} blocked={}", out.done, out.blocked);
+        }
+
+        // Заливка картинки в пул: проверяет весь путь multipart-запроса.
+        "upload" => {
+            let acc = account(&need(&args, 1, "имя аккаунта"));
+            let file = need(&args, 2, "путь к картинке");
+            match core.http.upload_picture(&acc, std::path::Path::new(&file), &stop).await {
+                Ok(up) => println!(
+                    "залито: url={} {}x{} размер={}
+хэш: {:?}",
+                    up.url,
+                    up.width,
+                    up.height,
+                    up.size,
+                    api::extract_cdn_hash(&up.url)
+                ),
+                Err(e) => println!("не залилось: {e}"),
+            }
+        }
+
+        // Браузер под аккаунтом: те же куки, отпечаток и прокси. Проверяет и
+        // мост до прокси с логином — окно с паролем появляться не должно.
+        "browser" => {
+            let acc = account(&need(&args, 1, "имя аккаунта"));
+            let persona = core.http.persona_for(&acc);
+            let dir = core.root.join("profiles").join(otvet_core::util::safe_name(&acc.name));
+            let cookies = acc.cookie_header().unwrap_or_default();
+            println!("прокси: {:?}", acc.active_proxy().map(|p| otvet_core::proxy::mask_proxy(&p)));
+            match otvet_core::cdp::open_as(
+                &core.root,
+                &persona,
+                acc.active_proxy().as_deref(),
+                &dir,
+                &cookies,
+                "https://otvet.mail.ru/",
+                &log,
+            )
+            .await
+            {
+                Ok(()) => println!("окно открыто"),
+                Err(e) => println!("не открылось: {e}"),
+            }
+            // Даём посмотреть на окно, потом выходим — браузер останется жить.
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
         }
 
         "notifs" => {
@@ -405,6 +469,16 @@ async fn main() {
                 page.throttled,
                 page.items.len()
             );
+            // Сводка по типам: видно, чего в колокольчике на самом деле много.
+            let mut by_type: std::collections::BTreeMap<String, i32> = Default::default();
+            for it in &page.items {
+                *by_type
+                    .entry(it.get("type").and_then(|v| v.as_str()).unwrap_or("?").to_string())
+                    .or_insert(0) += 1;
+            }
+            for (t, n) in &by_type {
+                println!("  {t}: {n}");
+            }
             for it in page.items.iter().take(8) {
                 let t = replier::to_target(it);
                 println!(

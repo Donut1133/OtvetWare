@@ -43,6 +43,7 @@ async fn total_limit_is_spread_across_rounds() {
     let (core, accounts) = core_and_accounts("total", 1);
     let calls = Arc::new(Mutex::new(Vec::new()));
     let cfg = RunnerCfg {
+        prefetch_next: false,
         concurrency: 1,
         total_limit: 5,
         round_limit: 2,
@@ -62,7 +63,7 @@ async fn total_limit_is_spread_across_rounds() {
 async fn zero_limits_mean_unlimited_for_one_pass() {
     let (core, accounts) = core_and_accounts("zero", 2);
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let cfg = RunnerCfg { concurrency: 1, ..Default::default() };
+    let cfg = RunnerCfg { prefetch_next: false, concurrency: 1, ..Default::default() };
     runner::run(core, accounts, cfg, spy(calls.clone(), 1), no_log(), Stop::new()).await;
 
     let seen = calls.lock().clone();
@@ -74,7 +75,7 @@ async fn zero_limits_mean_unlimited_for_one_pass() {
 async fn every_selected_account_runs_in_parallel_mode() {
     let (core, accounts) = core_and_accounts("par", 6);
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let cfg = RunnerCfg { concurrency: 3, ..Default::default() };
+    let cfg = RunnerCfg { prefetch_next: false, concurrency: 3, ..Default::default() };
     runner::run(core, accounts, cfg, spy(calls.clone(), 1), no_log(), Stop::new()).await;
 
     let mut names: Vec<String> = calls.lock().iter().map(|(n, _)| n.clone()).collect();
@@ -101,7 +102,7 @@ async fn stop_ends_the_run_between_accounts() {
             RunOutcome { done: 1, ..Default::default() }
         })
     });
-    let cfg = RunnerCfg { concurrency: 1, ..Default::default() };
+    let cfg = RunnerCfg { prefetch_next: false, concurrency: 1, ..Default::default() };
     let summary = runner::run(core, accounts, cfg, run_one, no_log(), stop).await;
 
     assert!(summary.stopped, "прогон должен пометиться остановленным");
@@ -113,6 +114,7 @@ async fn rounds_stop_when_nothing_left_to_do() {
     let (core, accounts) = core_and_accounts("exhaust", 2);
     let calls = Arc::new(Mutex::new(Vec::new()));
     let cfg = RunnerCfg {
+        prefetch_next: false,
         concurrency: 1,
         total_limit: 1,
         repeat_rounds: true,
@@ -132,7 +134,7 @@ async fn blocked_accounts_are_counted() {
     let run_one: RunOne = Arc::new(move |acc, _l, _lg, _s| {
         Box::pin(async move { RunOutcome { blocked: acc.name != "acc0", done: 0, ..Default::default() } })
     });
-    let cfg = RunnerCfg { concurrency: 1, ..Default::default() };
+    let cfg = RunnerCfg { prefetch_next: false, concurrency: 1, ..Default::default() };
     let summary = runner::run(core, accounts, cfg, run_one, no_log(), Stop::new()).await;
     assert_eq!(summary.blocked_accounts, 2, "два аккаунта поймали антибот");
 }
@@ -191,4 +193,36 @@ fn broken_accounts_file_is_backed_up_not_swallowed() {
     let saved = std::fs::read_to_string(backups[0].path()).unwrap();
     assert!(saved.contains("Mpop=секрет"), "в копии нет исходных данных");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Когда работа кончилась по существу — диапазон номеров пройден целиком —
+/// круги должны закончиться. Иначе бот до утра гоняет пустые проходы по тем же
+/// номерам: каждый круг перечитывает журналы, ничего не делает и уходит в паузу.
+#[tokio::test]
+async fn rounds_stop_when_there_is_nothing_left() {
+    let (core, accounts) = core_and_accounts("exhausted", 2);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let cfg =
+        RunnerCfg { prefetch_next: false, repeat_rounds: true, round_pause_min: 0.0, ..Default::default() };
+    // Первый круг что-то делает, второй сообщает «работы больше нет».
+    let round = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let one: RunOne = {
+        let calls = calls.clone();
+        let round = round.clone();
+        Arc::new(move |acc, _limit, _log, _stop| {
+            let calls = calls.clone();
+            let round = round.clone();
+            Box::pin(async move {
+                let n = round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                calls.lock().push(acc.name.clone());
+                // Два аккаунта: первые два вызова — первый круг.
+                RunOutcome { done: 1, exhausted: n >= 2, ..Default::default() }
+            })
+        })
+    };
+    let summary = runner::run(core, accounts, cfg, one, no_log(), Stop::new()).await;
+
+    assert_eq!(summary.rounds, 2, "кругов должно быть ровно два: {}", summary.rounds);
+    assert_eq!(calls.lock().len(), 4, "лишние проходы по аккаунтам");
+    assert!(!summary.stopped, "останавливались не «Стопом», а по концу работы");
 }

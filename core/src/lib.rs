@@ -21,6 +21,7 @@ pub mod replier;
 pub mod runner;
 pub mod store_io;
 pub mod subscribe;
+pub mod uniq;
 pub mod util;
 pub mod votes;
 
@@ -28,9 +29,12 @@ use accounts::{AccountsStore, Karma};
 use ai::AiClient;
 use http::Http;
 use journals::ConvoStore;
+use parking_lot::Mutex;
 use persona::PersonaStore;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Общий контекст приложения: где лежат данные и чем ходим в сеть.
 pub struct Core {
@@ -42,6 +46,9 @@ pub struct Core {
     pub ai: AiClient,
     /// Единый чат диалогового режима, общий на все аккаунты.
     pub convo: ConvoStore,
+    /// Прогретые проверки аккаунтов: раннер проверяет следующий аккаунт, пока
+    /// работает текущий, и тот стартует уже без трёх запросов на разогрев.
+    warm: Mutex<HashMap<String, (Instant, api::Validation)>>,
 }
 
 impl Core {
@@ -51,7 +58,36 @@ impl Core {
         let personas = Arc::new(PersonaStore::new(&root));
         let http = Arc::new(Http::new(personas.clone(), accounts.clone()));
         let convo = ConvoStore::open(&root);
-        Arc::new(Self { root, accounts, personas, http, ai: AiClient::new(), convo })
+        Arc::new(Self {
+            root,
+            accounts,
+            personas,
+            http,
+            ai: AiClient::new(),
+            convo,
+            warm: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Положить прогретую проверку.
+    pub fn warm_put(&self, name: &str, v: api::Validation) {
+        let mut m = self.warm.lock();
+        // Хранилище не должно расти бесконечно на прогоне из сотни аккаунтов.
+        if m.len() > 64 {
+            m.clear();
+        }
+        m.insert(name.to_string(), (Instant::now(), v));
+    }
+
+    /// Забрать прогретую проверку, если она ещё свежая. Забрать — именно
+    /// забрать: второй раз тот же результат выдавать нельзя, аккаунт мог
+    /// разлогиниться прямо в прогоне.
+    pub fn warm_take(&self, name: &str, max_age: Duration) -> Option<api::Validation> {
+        let mut m = self.warm.lock();
+        match m.remove(name) {
+            Some((at, v)) if at.elapsed() <= max_age => Some(v),
+            _ => None,
+        }
     }
 
     pub fn file(&self, name: &str) -> PathBuf {
@@ -90,6 +126,10 @@ pub struct RunOutcome {
     pub done: i64,
     /// Аккаунт пропущен (нет кук, исчерпан лимит, не залогинен).
     pub skipped: bool,
+    /// Работы больше нет и не появится: например, диапазон номеров пройден
+    /// целиком. Раннер по этому флагу заканчивает круги — в отличие от ленты,
+    /// где новые вопросы появляются сами.
+    pub exhausted: bool,
 }
 
 impl RunOutcome {

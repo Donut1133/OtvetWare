@@ -14,7 +14,9 @@ async fn main() {
     let answered = otvet_core::journals::load_answered(&core.root, &acc.name);
     println!("в журнале уже отвечено: {}", answered.len());
     let stop = Stop::new();
-    match answerer::collect_questions(&core, &acc, &answered, &HashSet::new(), 5, &stop).await {
+    match answerer::collect_questions(&core, &acc, &answered, &HashSet::new(), &HashSet::new(), 5, &stop)
+        .await
+    {
         Err(e) => println!("ошибка ленты: {e}"),
         Ok(qs) => {
             println!("свежих отвечаемых вопросов: {}", qs.len());

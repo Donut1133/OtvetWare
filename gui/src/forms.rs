@@ -8,6 +8,8 @@
 use egui::Ui;
 use otvet_core::complain::{ComplainParams, ComplainTarget, REASONS};
 use otvet_core::subscribe::{SubAction, SubParams};
+use otvet_core::uniq::UniqMode;
+use otvet_core::util::Progress;
 use otvet_core::votes::{Vote, VoteParams};
 use serde::{Deserialize, Serialize};
 
@@ -65,7 +67,10 @@ impl Default for CommonForm {
 }
 
 impl CommonForm {
-    pub fn ui(&mut self, ui: &mut Ui, selected: usize, rounds_supported: bool) {
+    /// `feed_mode` — бот сам находит себе работу (ответы, вопросы, комменты).
+    /// В режимах по ссылкам списком ссылок работа и ограничена: лимиты и круги
+    /// там показывать нечего.
+    pub fn ui(&mut self, ui: &mut Ui, selected: usize, feed_mode: bool) {
         block(ui, "Аккаунты");
         ui.horizontal(|ui| {
             ui.label("Работают одновременно");
@@ -77,21 +82,26 @@ impl CommonForm {
         });
         hint(ui, "По одному — медленно, но незаметно. Все сразу — быстро, но нагрузка видна антиботу.");
         if self.all_at_once && selected > 8 {
-            ui.colored_label(theme::WARN, format!("{selected} аккаунтов разом — это заметно"));
+            ui.colored_label(theme::WARN, format!("{selected} аккаунт(ов) разом — это заметно"));
         }
 
-        extra(ui, "Круги, лимиты, прокси", "common_extra", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Общий лимит на аккаунт");
-                ui.add(egui::DragValue::new(&mut self.total_limit).range(0..=100_000));
-                if rounds_supported {
+        let title = if feed_mode {
+            "Круги, лимиты, прокси"
+        } else {
+            "Проверки и прокси"
+        };
+        extra(ui, title, "common_extra", |ui| {
+            if feed_mode {
+                ui.horizontal(|ui| {
+                    ui.label("Общий лимит на аккаунт");
+                    ui.add(egui::DragValue::new(&mut self.total_limit).range(0..=100_000));
                     ui.label("за круг");
                     ui.add(egui::DragValue::new(&mut self.round_limit).range(0..=100_000));
-                }
-            });
-            hint(ui, "0 = не ограничивать. Действует поверх лимита самого режима — берётся меньшее.");
-
-            if rounds_supported {
+                });
+                hint(
+                    ui,
+                    "0 = не ограничивать. Общий держит весь прогон целиком, включая повторные круги; лимит самого режима — один проход. Берётся меньшее.",
+                );
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.repeat_rounds, "Повторять круги");
                     ui.add_enabled(
@@ -116,6 +126,70 @@ impl CommonForm {
             hint(ui, "Работает, если у аккаунта задано несколько прокси через | или с новой строки.");
         });
     }
+}
+
+// ─── Общие кусочки форм ─────────────────────────────────────────────────────
+
+/// Блок «Уникальность текста». Один и тот же в трёх режимах, поэтому здесь.
+pub fn uniq_block(ui: &mut Ui, mode: &mut UniqMode, latin: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.label("Уникализация");
+        seg(ui, mode, UniqMode::Off, "нет");
+        seg(ui, mode, UniqMode::Light, "лёгкая");
+        seg(ui, mode, UniqMode::Normal, "обычная");
+        seg(ui, mode, UniqMode::Hard, "сильная");
+    });
+    hint(
+        ui,
+        "Мелкие правки, какие делает живой человек: точка в конце то есть, то нет, «ещё» вместо «еще», словечко в начале. Один и тот же текст с разных аккаунтов модерация ловит, слегка разный — уже нет.",
+    );
+    if *mode != UniqMode::Off {
+        ui.checkbox(latin, "подменять похожие буквы латиницей");
+        hint(
+            ui,
+            "Сильнее размывает текст, но смешанные алфавиты внутри слова — сами по себе признак спама. Включать осознанно.",
+        );
+    }
+    if *mode == UniqMode::Hard {
+        hint(ui, "«Сильная» ещё и дописывает в конец число — без решётки и разной длины.");
+    }
+}
+
+/// Блок «Проверять, что отправилось». `what` — что именно проверяем.
+pub fn verify_block(ui: &mut Ui, on: &mut bool, delay: &mut f64, what: &str) {
+    ui.horizontal(|ui| {
+        ui.checkbox(on, format!("проверять, что {what} остался на сайте"));
+        ui.add_enabled(*on, egui::DragValue::new(delay).range(0.0..=120.0).speed(0.5).suffix(" сек"));
+    });
+    hint(
+        ui,
+        &format!("Сайт отвечает «принято» и на то, что через секунду снесёт автомодерация. Если {what}а на месте нет — бот его не засчитывает и пробует другим текстом."),
+    );
+}
+
+/// Пара «от–до»: верхняя граница не опускается ниже нижней.
+///
+/// Перевёрнутый промежуток ядро молча схлопывает в одно число: при «от 50 до 10»
+/// пауза всегда ровно 50 секунд. Молча — хуже всего, поэтому просто не даём его
+/// задать.
+pub fn range_row(ui: &mut Ui, label: &str, min: &mut f64, max: &mut f64, top: f64) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(egui::DragValue::new(min).range(0.0..=top).speed(0.5));
+        ui.label("–");
+        ui.add(egui::DragValue::new(max).range(0.0..=top).speed(0.5).suffix(" сек"));
+    });
+    if *max < *min {
+        *max = *min;
+    }
+}
+
+/// Поле для своего списка готовых фраз (по одной в строке).
+pub fn list_edit(ui: &mut Ui, id: &str, text: &mut String, title: &str, hint_text: &str, placeholder: &str) {
+    ui.label(title);
+    boxed_multiline(ui, id, text, 4, placeholder);
+    let n = split_lines(text).len();
+    hint(ui, &if n == 0 { hint_text.to_string() } else { format!("{hint_text} Своих строк: {n}.") });
 }
 
 // ─── Голоса ─────────────────────────────────────────────────────────────────
@@ -151,6 +225,7 @@ impl VotesForm {
         });
         links_edit(
             ui,
+            "votes_links",
             &mut self.links,
             match self.target_kind {
                 VoteTargetKind::Profile => "https://otvet.mail.ru/profile/id000000000/",
@@ -171,11 +246,7 @@ impl VotesForm {
             seg(ui, &mut self.plus, false, "Минусы  −");
         });
 
-        block(ui, "Темп");
-        ui.horizontal(|ui| {
-            ui.label("Пауза между голосами");
-            ui.add(egui::DragValue::new(&mut self.delay).range(0.0..=600.0).speed(0.1).suffix(" сек"));
-        });
+        block(ui, "Сколько и как часто");
         if self.target_kind == VoteTargetKind::Profile {
             ui.horizontal(|ui| {
                 ui.label("Постов с профиля");
@@ -183,7 +254,14 @@ impl VotesForm {
                 ui.label("(0 — все)");
             });
         }
-        hint(ui, "Голос уже поставленный повторно снимается, поэтому один и тот же пост бот второй раз не трогает.");
+        ui.horizontal(|ui| {
+            ui.label("Пауза между голосами");
+            ui.add(egui::DragValue::new(&mut self.delay).range(0.0..=600.0).speed(0.1).suffix(" сек"));
+        });
+        hint(
+            ui,
+            "Тот же голос второй раз ничего не меняет — сайт оставляет его как есть, так что перезапуск не страшен. А вот противоположный знак перезаписывает: минус поверх плюса сделает минус.",
+        );
     }
 
     pub fn to_params(&self, check_auth: bool) -> VoteParams {
@@ -193,6 +271,7 @@ impl VotesForm {
             delay: self.delay,
             limit: self.limit,
             check_auth,
+            progress: Progress::new(),
         }
     }
 
@@ -239,15 +318,15 @@ impl SubsForm {
         });
 
         block(ui, "На кого");
-        links_edit(ui, &mut self.links, "https://otvet.mail.ru/profile/id000000000/");
+        links_edit(ui, "subs_links", &mut self.links, "https://otvet.mail.ru/profile/id000000000/");
         hint(ui, "По одной ссылке на профиль в строке.");
 
-        block(ui, "Темп");
+        block(ui, "Как часто");
         ui.horizontal(|ui| {
-            ui.label("Пауза");
+            ui.label("Пауза между подписками");
             ui.add(egui::DragValue::new(&mut self.delay).range(0.0..=600.0).speed(0.1).suffix(" сек"));
         });
-        hint(ui, "Круги здесь не нужны: подписаться дважды нельзя.");
+        hint(ui, "Сколько подписок — столько и ссылок: подписаться на одного дважды нельзя.");
     }
 
     pub fn to_params(&self, check_auth: bool) -> SubParams {
@@ -255,7 +334,10 @@ impl SubsForm {
             profiles: split_lines(&self.links),
             action: if self.subscribe { SubAction::Subscribe } else { SubAction::Unsubscribe },
             delay: self.delay,
+            // Лимита у режима нет: сколько ссылок, столько и подписок.
+            limit: 0,
             check_auth,
+            progress: Progress::new(),
         }
     }
 
@@ -341,6 +423,7 @@ impl ComplainForm {
         block(ui, "Ссылки");
         links_edit(
             ui,
+            "complain_links",
             &mut self.links,
             match self.kind {
                 ComplainKind::Single => "https://otvet.mail.ru/question/123456789?reply=987654",
@@ -355,9 +438,9 @@ impl ComplainForm {
             },
         );
 
-        block(ui, "Темп");
+        block(ui, "Сколько и как часто");
         ui.horizontal(|ui| {
-            ui.label("Пауза");
+            ui.label("Пауза между жалобами");
             ui.add(egui::DragValue::new(&mut self.delay).range(0.0..=600.0).speed(0.1).suffix(" сек"));
             if matches!(self.kind, ComplainKind::Topics | ComplainKind::Replies) {
                 ui.label("не больше");
@@ -375,6 +458,7 @@ impl ComplainForm {
             delay: self.delay,
             limit: self.limit,
             check_auth,
+            progress: Progress::new(),
         }
     }
 
@@ -408,16 +492,217 @@ pub fn seg<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, value: T, label: &
     }
 }
 
-pub fn links_edit(ui: &mut Ui, text: &mut String, hint_text: &str) {
-    ui.add(
-        egui::TextEdit::multiline(text)
-            .desired_rows(3)
-            .desired_width(f32::INFINITY)
-            .hint_text(hint_text)
-            .font(egui::TextStyle::Monospace),
-    );
+/// Многострочное поле постоянной высоты: список внутри листается, а само поле
+/// не растёт. Иначе два десятка ссылок распирают форму, и кнопка «Старт»
+/// уезжает за нижний край окна — приходится листать всю панель, чтобы её найти.
+pub fn boxed_multiline(ui: &mut Ui, id: &str, text: &mut String, rows: usize, hint_text: &str) {
+    // Плюс половина строки: столько же строк, сколько просили, плюс краешек
+    // следующей — по нему сразу видно, что список длиннее и его можно листать.
+    let h = ui.text_style_height(&egui::TextStyle::Monospace) * (rows as f32 + 0.5);
+    // Рамку рисуем САМИ, а поле внутри делаем без своей.
+    //
+    // Иначе рамка принадлежит полю, растёт вместе с текстом и уезжает вместе с
+    // ним: при прокрутке верхний и нижний края просто пропадали из виду, и
+    // список повисал в воздухе. Наша рамка стоит на месте, а ездит только текст.
+    //
+    // Рамку задаём ДО раскладки, вместе с её толщиной: egui вычитает толщину из
+    // места под содержимое в `begin`, а прибавляет обратно в `end`. Если
+    // дорисовать рамку потом, поле займёт на 2 px больше, чем ему дали, — и
+    // левая панель, упираясь в это, начинает расширяться сама, по два пикселя
+    // за кадр, пока не упрётся в свой предел.
+    let line = ui.visuals().widgets.inactive.bg_stroke;
+    let frame = egui::Frame::default()
+        .fill(theme::BG_INPUT)
+        .stroke(line)
+        .corner_radius(egui::CornerRadius::same(2))
+        .inner_margin(egui::Margin::symmetric(6, 6));
+    let mut prepared = frame.begin(ui);
+    let inner = &mut prepared.content_ui;
+    let resp = egui::ScrollArea::vertical()
+        .id_salt(id)
+        .max_height(h)
+        // Без этого egui держит для прокручиваемой области свои 64 px: поле в
+        // три строки разъезжалось до четырёх с половиной, и нижняя оказывалась
+        // разрезанной пополам.
+        .min_scrolled_height(h)
+        .auto_shrink([false, false])
+        .show(inner, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(text)
+                    .desired_rows(rows)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(hint_text)
+                    .frame(egui::Frame::NONE)
+                    .margin(egui::Margin::ZERO)
+                    .font(egui::TextStyle::Monospace),
+            )
+        })
+        .inner;
+    // Подсветку фокуса поле больше не рисует — берём её на себя, иначе не видно,
+    // куда именно попадёт набранное.
+    // Меняем ТОЛЬКО цвет: толщина уже учтена в раскладке.
+    let v = ui.visuals();
+    prepared.frame.stroke.color = if resp.has_focus() {
+        v.widgets.active.bg_stroke.color
+    } else if resp.hovered() {
+        v.widgets.hovered.bg_stroke.color
+    } else {
+        line.color
+    };
+    prepared.end(ui);
+}
+
+pub fn links_edit(ui: &mut Ui, id: &str, text: &mut String, hint_text: &str) {
+    boxed_multiline(ui, id, text, 3, hint_text);
+}
+
+/// Длинную строку показываем с серединой в многоточии: хэш картинки или ссылка
+/// целиком не нужны, а начало и конец опознаются с одного взгляда.
+pub fn clip_middle(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max / 2).collect();
+    let tail: String = s.chars().skip(n - max / 2 + 1).collect();
+    format!("{head}…{tail}")
 }
 
 pub fn split_lines(s: &str) -> Vec<String> {
     s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::forms_ai::{AiForm, AnswersForm, CommentsForm, QuestionsForm};
+    use otvet_core::journals::Styles;
+
+    /// Ширина, на которую панель настроек имеет право рассчитывать.
+    /// Это её минимум из `Panel::left(...).size_range(...)` в app.rs.
+    const PANEL_MIN: f32 = 360.0;
+
+    /// Сколько ширины содержимое заняло на самом деле, если дать ему `PANEL_MIN`.
+    fn width_used(mut add: impl FnMut(&mut Ui)) -> f32 {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut used = 0.0;
+        // Два кадра: на первом egui ещё не знает размеров и отвечает наугад.
+        for _ in 0..2 {
+            let _ = ctx.run_ui(Default::default(), |ui| {
+                let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(PANEL_MIN, 4000.0));
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                add(&mut child);
+                used = child.min_rect().width();
+            });
+        }
+        used
+    }
+
+    /// Ни одна панель не должна просить больше ширины, чем ей дали.
+    ///
+    /// Иначе левая панель расширяется САМА: egui отдаёт ей ширину содержимого,
+    /// на следующем кадре содержимое снова просит на столько же больше — и так
+    /// до упора. Ровно это и случилось, когда у поля со ссылками появилась своя
+    /// рамка: она добавляла два пикселя, и панель ползла вправо на глазах.
+    #[test]
+    fn panels_fit_the_width_they_are_given() {
+        let styles = Styles::default();
+        type Panel = Box<dyn FnMut(&mut Ui)>;
+        let cases: Vec<(&str, Panel)> = vec![
+            (
+                "Голоса",
+                Box::new({
+                    let mut f = VotesForm {
+                        links: "https://otvet.mail.ru/profile/x
+"
+                        .repeat(5),
+                        ..Default::default()
+                    };
+                    move |ui: &mut Ui| f.ui(ui)
+                }),
+            ),
+            (
+                "Подписки",
+                Box::new({
+                    let mut f = SubsForm {
+                        links: "https://otvet.mail.ru/profile/x
+"
+                        .repeat(5),
+                        ..Default::default()
+                    };
+                    move |ui: &mut Ui| f.ui(ui)
+                }),
+            ),
+            (
+                "Жалобы",
+                Box::new({
+                    let mut f = ComplainForm::default();
+                    move |ui: &mut Ui| f.ui(ui)
+                }),
+            ),
+            (
+                "Ответы",
+                Box::new({
+                    let (mut f, mut ai, styles) = (AnswersForm::default(), AiForm::default(), styles.clone());
+                    move |ui: &mut Ui| {
+                        f.ui(ui, &mut ai, &styles);
+                    }
+                }),
+            ),
+            (
+                "Ответы по ссылкам",
+                Box::new({
+                    let (mut f, mut ai, styles) = (AnswersForm::default(), AiForm::default(), styles.clone());
+                    f.source = crate::forms_ai::Source::Links;
+                    move |ui: &mut Ui| {
+                        f.ui(ui, &mut ai, &styles);
+                    }
+                }),
+            ),
+            (
+                "Ответы по диапазону",
+                Box::new({
+                    let (mut f, mut ai, styles) = (AnswersForm::default(), AiForm::default(), styles.clone());
+                    f.source = crate::forms_ai::Source::Range;
+                    f.range_from = "https://otvet.mail.ru/question/270377181".into();
+                    f.range_to = "https://otvet.mail.ru/question/270377999".into();
+                    move |ui: &mut Ui| {
+                        f.ui(ui, &mut ai, &styles);
+                    }
+                }),
+            ),
+            (
+                "Вопросы",
+                Box::new({
+                    let (mut f, mut ai, styles) =
+                        (QuestionsForm::default(), AiForm::default(), styles.clone());
+                    move |ui: &mut Ui| {
+                        f.ui(ui, &mut ai, &styles);
+                    }
+                }),
+            ),
+            (
+                "Комменты",
+                Box::new({
+                    let (mut f, mut ai, styles) =
+                        (CommentsForm::default(), AiForm::default(), styles.clone());
+                    move |ui: &mut Ui| {
+                        f.ui(ui, &mut ai, &styles);
+                    }
+                }),
+            ),
+            (
+                "Общие настройки",
+                Box::new({
+                    let mut f = CommonForm::default();
+                    move |ui: &mut Ui| f.ui(ui, 3, true)
+                }),
+            ),
+        ];
+        for (name, add) in cases {
+            let w = width_used(add);
+            assert!(w <= PANEL_MIN + 0.5, "«{name}» просит {w:.1} px при отведённых {PANEL_MIN}");
+        }
+    }
 }

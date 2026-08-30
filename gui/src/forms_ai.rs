@@ -7,7 +7,9 @@
 //! Раскладка та же, что и в остальных панелях: сверху то, ради чего запускают
 //! прогон, ниже темп и лимиты, редкое — под сворачивающимися заголовками.
 
-use crate::forms::{block, extra, hint, links_edit, seg, split_lines};
+use crate::forms::{
+    block, extra, hint, links_edit, list_edit, range_row, seg, split_lines, uniq_block, verify_block,
+};
 use crate::theme;
 use egui::Ui;
 use otvet_core::ai::AiCfg;
@@ -15,12 +17,24 @@ use otvet_core::answerer::{AnswerMode, AnswerParams, ImageMode, TargetMode};
 use otvet_core::asker::{AskMode, AskParams};
 use otvet_core::journals::Styles;
 use otvet_core::replier::{NotifTypes, ReplyMode, ReplyParams};
+use otvet_core::uniq::UniqMode;
+use otvet_core::util::Progress;
 use serde::{Deserialize, Serialize};
 
 /// Разумный лимит по умолчанию: постить без ограничения — худшее, что может
 /// сделать бот на свежем аккаунте.
 fn default_limit() -> i64 {
     5
+}
+
+/// Значения по умолчанию для полей, которых нет в старых сохранённых
+/// настройках: без них serde не прочитает файл, оставшийся от прошлой версии.
+fn yes() -> bool {
+    true
+}
+
+fn default_verify_delay() -> f64 {
+    6.0
 }
 
 /// Общие настройки нейросети.
@@ -102,7 +116,10 @@ impl AiForm {
             let names = styles.names();
             egui::ComboBox::from_id_salt("ai_style")
                 .selected_text(if self.style.is_empty() { "Обычный чел" } else { &self.style })
-                .width(210.0)
+                // Не шире: строка «Стиль + свой промпт» — самая широкая в панели,
+                // и на крупном системном шрифте именно она упирала бы левую
+                // панель в предел, не давая её сузить.
+                .width(170.0)
                 .show_ui(ui, |ui| {
                     for n in &names {
                         if ui.selectable_label(&self.style == n, n).clicked() {
@@ -113,11 +130,12 @@ impl AiForm {
             ui.checkbox(&mut self.use_custom, "свой промпт");
         });
         if self.use_custom {
-            ui.add(
-                egui::TextEdit::multiline(&mut self.custom_prompt)
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("Опиши, как бот должен писать"),
+            crate::forms::boxed_multiline(
+                ui,
+                "ai_prompt",
+                &mut self.custom_prompt,
+                3,
+                "Опиши, как бот должен писать",
             );
         }
 
@@ -147,7 +165,7 @@ impl AiForm {
                 );
             });
             hint(ui, "Впишется в текст к месту, а не в лоб.");
-            hint(ui, "Маркеры {{ДИРЕКТИВА}} и {{ПЕЛЬМЕНИ}} в промпте подставляются заново на каждый запрос — это и даёт разброс ответов.");
+            hint(ui, "Маркеры для своего промпта. {{ДИРЕКТИВА}} — заход, длина и тон ответа, выбираются заново на каждый запрос: это и даёт разброс, иначе модель отвечает по одному шаблону. {{ПЕЛЬМЕНИ}} — фирменная фраза стиля «Смех», каждый раз написанная по-другому.");
         });
     }
 
@@ -198,33 +216,75 @@ impl ImageForm {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut Ui) {
+    /// `true` — попросили открыть окно управления пулом.
+    pub fn ui(&mut self, ui: &mut Ui) -> bool {
+        let mut open_pool = false;
         ui.horizontal(|ui| {
             seg(ui, &mut self.kind, ImageKind::Off, "без картинки");
             seg(ui, &mut self.kind, ImageKind::Pool, "из пула");
             seg(ui, &mut self.kind, ImageKind::Folder, "из папки");
             if self.kind != ImageKind::Off {
-                ui.label("по");
+                ui.label("картинок в посте");
                 ui.add(egui::DragValue::new(&mut self.count).range(1..=10));
-                ui.label("шт.");
             }
         });
         match self.kind {
             ImageKind::Folder => {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.folder)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("images"),
-                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.folder)
+                            .desired_width(ui.available_width() - 90.0)
+                            .hint_text("images"),
+                    );
+                    if ui.button("Выбрать…").clicked() {
+                        if let Some(d) = rfd::FileDialog::new().set_title("Папка с картинками").pick_folder()
+                        {
+                            self.folder = d.display().to_string();
+                        }
+                    }
+                });
                 hint(ui, "Файлы из папки заливаются на сайт при каждой отправке.");
             }
-            ImageKind::Pool => hint(ui, "Берутся из gif-pool.json — они уже на CDN, перезаливать не нужно."),
+            ImageKind::Pool => {
+                ui.horizontal(|ui| {
+                    if ui.button("Пул картинок…").clicked() {
+                        open_pool = true;
+                    }
+                    hint(ui, "Загрузить свои, посмотреть, что уже есть.");
+                });
+                hint(ui, "Картинки из пула уже лежат на CDN сайта — перезаливать их не нужно.");
+            }
             ImageKind::Off => {}
         }
+        open_pool
     }
 }
 
 // ─── Ответы ─────────────────────────────────────────────────────────────────
+
+/// Откуда бот берёт вопросы.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Source {
+    /// Свежие вопросы из ленты.
+    #[default]
+    Feed,
+    /// Готовый список ссылок.
+    Links,
+    /// Диапазон номеров — в том числе тех вопросов, которых ещё нет.
+    Range,
+}
+
+/// Номер вопроса из ссылки или просто из числа.
+fn topic_number(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    otvet_core::votes::topic_id_from_url(s)
+        .and_then(|t| t.parse::<i64>().ok())
+        .or_else(|| s.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AnswersForm {
@@ -232,7 +292,10 @@ pub struct AnswersForm {
     /// Сколько ответов на аккаунт за прогон (0 = без лимита).
     #[serde(default = "default_limit")]
     pub limit: i64,
-    pub from_links: bool,
+    /// Откуда берём вопросы. Старое поле `from_links` из прежних настроек
+    /// читается как «по ссылкам».
+    #[serde(default)]
+    pub source: Source,
     pub links: String,
     pub delay_min: f64,
     pub delay_max: f64,
@@ -246,7 +309,28 @@ pub struct AnswersForm {
     pub conversational: bool,
     pub convo_budget_k: f64,
     pub skip_others: bool,
-    pub random_tag: bool,
+    /// Не отвечать на вопросы своих же аккаунтов.
+    #[serde(default = "yes")]
+    pub skip_own_authors: bool,
+    #[serde(default)]
+    pub uniq: UniqMode,
+    #[serde(default)]
+    pub uniq_latin: bool,
+    #[serde(default = "yes")]
+    pub verify_posted: bool,
+    #[serde(default = "default_verify_delay")]
+    pub verify_delay_sec: f64,
+    /// Слова-приметы: отвечаем только на вопросы, где они встретились.
+    #[serde(default)]
+    pub keywords: String,
+    /// Границы диапазона: ссылка на вопрос или просто номер.
+    #[serde(default)]
+    pub range_from: String,
+    #[serde(default)]
+    pub range_to: String,
+    /// Свои готовые фразы (по одной в строке); пусто — встроенный набор.
+    #[serde(default)]
+    pub noai_list: String,
     pub signature: String,
     pub image: ImageForm,
 }
@@ -256,7 +340,7 @@ impl Default for AnswersForm {
         Self {
             mode: AnswerMode::Ai,
             limit: default_limit(),
-            from_links: false,
+            source: Source::default(),
             links: String::new(),
             delay_min: 20.0,
             delay_max: 45.0,
@@ -270,7 +354,15 @@ impl Default for AnswersForm {
             conversational: false,
             convo_budget_k: 60.0,
             skip_others: false,
-            random_tag: false,
+            skip_own_authors: true,
+            uniq: UniqMode::Off,
+            uniq_latin: false,
+            verify_posted: true,
+            verify_delay_sec: default_verify_delay(),
+            keywords: String::new(),
+            range_from: String::new(),
+            range_to: String::new(),
+            noai_list: String::new(),
             signature: String::new(),
             image: ImageForm::default(),
         }
@@ -278,22 +370,62 @@ impl Default for AnswersForm {
 }
 
 impl AnswersForm {
-    pub fn ui(&mut self, ui: &mut Ui, ai: &mut AiForm, styles: &Styles) {
+    /// Разобранный диапазон: меньший номер, больший. `None` — задан не полностью.
+    pub fn range(&self) -> Option<(i64, i64)> {
+        let a = topic_number(&self.range_from)?;
+        let b = topic_number(&self.range_to)?;
+        Some((a.min(b), a.max(b)))
+    }
+
+    /// `true` — форма просит открыть окно пула картинок.
+    pub fn ui(&mut self, ui: &mut Ui, ai: &mut AiForm, styles: &Styles) -> bool {
         block(ui, "Откуда берём вопросы");
         ui.horizontal(|ui| {
-            seg(ui, &mut self.from_links, false, "Из ленты");
-            seg(ui, &mut self.from_links, true, "По ссылкам");
+            seg(ui, &mut self.source, Source::Feed, "Из ленты");
+            seg(ui, &mut self.source, Source::Links, "По ссылкам");
+            seg(ui, &mut self.source, Source::Range, "По диапазону");
         });
-        if self.from_links {
-            links_edit(ui, &mut self.links, "https://otvet.mail.ru/question/123456789");
+        if self.source == Source::Links {
+            links_edit(ui, "answers_links", &mut self.links, "https://otvet.mail.ru/question/123456789");
             hint(ui, "По одной ссылке в строке. На что уже отвечали — пропустится.");
+        } else if self.source == Source::Range {
+            ui.horizontal(|ui| {
+                ui.label("От");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.range_from)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("ссылка или номер"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("До");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.range_to)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("ссылка или номер"),
+                );
+            });
+            hint(
+                ui,
+                &match self.range() {
+                    Some((a, b)) => format!(
+                        "Вопросов в диапазоне: {}. Номера идут подряд, и сайт принимает ответ даже на ещё не заданный вопрос — он дождётся автора.",
+                        b - a + 1
+                    ),
+                    None => "Вставь ссылку на первый и последний вопрос — или просто их номера.".to_string(),
+                },
+            );
+            hint(ui, "Текст здесь только готовыми фразами: вопроса ещё нет, нейросети не о чем писать. Проверка отправки по той же причине не работает.");
         } else {
             ui.horizontal(|ui| {
                 ui.label("Смотреть последних");
-                ui.add(egui::DragValue::new(&mut self.recent_scan).range(1..=50));
+                ui.add(egui::DragValue::new(&mut self.recent_scan).range(1..=20));
                 ui.label("вопросов");
             });
-            hint(ui, "Бот берёт только самые свежие вопросы: в старые не лезет, а ждёт новых.");
+            hint(
+                ui,
+                "Бот берёт только самые свежие вопросы: в старые не лезет, а ждёт новых. Больше 20 сайт за раз не отдаёт.",
+            );
         }
 
         block(ui, "Чем отвечаем");
@@ -313,6 +445,16 @@ impl AnswersForm {
         if self.mode == AnswerMode::Ai {
             ai.ui(ui, styles);
         }
+        if self.mode == AnswerMode::NoAi {
+            list_edit(
+                ui,
+                "answers_noai",
+                &mut self.noai_list,
+                "Свои фразы",
+                "Пусто — берётся встроенный набор коротких реплик.",
+                "согласен\nну такое\nжиза",
+            );
+        }
 
         block(ui, "Сколько и как часто");
         ui.horizontal(|ui| {
@@ -320,40 +462,61 @@ impl AnswersForm {
             ui.add(egui::DragValue::new(&mut self.limit).range(0..=100_000));
             ui.label("(0 — без лимита)");
         });
-        ui.horizontal(|ui| {
-            ui.label("Пауза между ответами");
-            ui.add(egui::DragValue::new(&mut self.delay_min).range(0.0..=3600.0).speed(0.5));
-            ui.label("–");
-            ui.add(egui::DragValue::new(&mut self.delay_max).range(0.0..=3600.0).speed(0.5).suffix(" сек"));
-        });
+        range_row(ui, "Пауза между ответами", &mut self.delay_min, &mut self.delay_max, 3600.0);
         hint(ui, "Случайное значение из промежутка — ровные паузы выглядят машинно.");
 
-        extra(ui, "Лента и пачки", "ans_feed", |ui| {
-            if !self.from_links {
-                ui.horizontal(|ui| {
-                    ui.label("Обновлять ленту через");
-                    ui.add(egui::DragValue::new(&mut self.feed_min).range(0.0..=600.0).speed(0.5));
-                    ui.label("–");
-                    ui.add(
-                        egui::DragValue::new(&mut self.feed_max).range(0.0..=600.0).speed(0.5).suffix(" сек"),
-                    );
-                });
-                hint(ui, "Пауза, когда отвечать не на что — все свежие вопросы уже разобраны.");
-            }
-            ui.horizontal(|ui| {
-                ui.label("Брать за проход");
-                ui.add(egui::DragValue::new(&mut self.batch_size).range(1..=50));
-                ui.label("вопрос(ов)");
-            });
-            ui.checkbox(&mut self.parallel, "отправлять пачку разом");
-            hint(ui, "Быстро, но несколько ответов в одну секунду с одного аккаунта — заметный след.");
-            ui.checkbox(&mut self.continuous_feed, "не ждать конца пачки");
-            hint(ui, "Новые вопросы уходят в работу сразу, как появились в ленте.");
+        // Пачки и лента — только когда вопросы бот берёт сам. По ссылкам он идёт
+        // строго по списку, одну цель за другой: эти настройки там ни на что не
+        // влияли, но стояли на виду и обещали обратное.
+        if self.source != Source::Feed {
             ui.horizontal(|ui| {
                 ui.label("Ответов на один вопрос");
                 ui.add(egui::DragValue::new(&mut self.repeat_per_question).range(1..=20));
             });
-        });
+            hint(ui, "Сайт разрешает отвечать на один вопрос несколько раз подряд. Больше одного — заметно.");
+        } else {
+            extra(ui, "Лента и пачки", "ans_feed", |ui| {
+                range_row(ui, "Обновлять ленту через", &mut self.feed_min, &mut self.feed_max, 600.0);
+                hint(ui, "Пауза, когда отвечать не на что — все свежие вопросы уже разобраны.");
+                ui.horizontal(|ui| {
+                    ui.label("Брать за проход");
+                    ui.add(egui::DragValue::new(&mut self.batch_size).range(1..=50));
+                    ui.label("вопрос(ов)");
+                });
+                ui.checkbox(&mut self.continuous_feed, "не ждать конца пачки");
+                hint(
+                    ui,
+                    "Новые вопросы уходят в работу сразу, как появились в ленте; одновременно — не больше размера пачки.",
+                );
+                // «Разом» имеет смысл только для настоящей пачки и только там,
+                // где ядро действительно распараллеливает. Иначе галочка стояла
+                // бы включённой и не делала ничего.
+                let can_parallel = self.batch_size > 1 && !self.continuous_feed && !self.conversational;
+                ui.add_enabled_ui(can_parallel, |ui| {
+                    ui.checkbox(&mut self.parallel, "отправлять пачку разом");
+                });
+                hint(
+                    ui,
+                    if self.conversational {
+                        "Не работает с единым чатом: история одна на всех, ответы идут по очереди."
+                    } else if self.continuous_feed {
+                        "Не нужно: «не ждать конца пачки» и так работает в несколько потоков."
+                    } else if self.batch_size <= 1 {
+                        "Нужна пачка больше одного вопроса."
+                    } else {
+                        "Быстро, но несколько ответов в одну секунду с одного аккаунта — заметный след."
+                    },
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Ответов на один вопрос");
+                    ui.add(egui::DragValue::new(&mut self.repeat_per_question).range(1..=20));
+                });
+                hint(
+                    ui,
+                    "Сайт разрешает отвечать на один вопрос несколько раз подряд. Больше одного — заметно.",
+                );
+            });
+        }
 
         extra(ui, "Единый чат с памятью", "ans_convo", |ui| {
             ui.checkbox(&mut self.conversational, "помнить прошлые вопросы и ответы");
@@ -373,8 +536,9 @@ impl AnswersForm {
 
         extra(ui, "Уникальность и подпись", "ans_uniq", |ui| {
             ui.checkbox(&mut self.skip_others, "не отвечать туда, где уже был другой мой аккаунт");
-            ui.checkbox(&mut self.random_tag, "дописывать в конец #случайные-цифры");
-            hint(ui, "Спасает от «такой ответ уже есть», но виден в тексте.");
+            ui.checkbox(&mut self.skip_own_authors, "не отвечать на вопросы своих аккаунтов");
+            hint(ui, "Свой аккаунт под своим же вопросом — готовая связка для модерации.");
+            uniq_block(ui, &mut self.uniq, &mut self.uniq_latin);
             ui.label("Подпись в конце");
             ui.add(
                 egui::TextEdit::singleline(&mut self.signature)
@@ -383,13 +547,51 @@ impl AnswersForm {
             );
         });
 
-        extra(ui, "Картинка к ответу", "ans_img", |ui| self.image.ui(ui));
+        extra(ui, "Только вопросы со словами", "ans_words", |ui| {
+            crate::forms::boxed_multiline(
+                ui,
+                "ans_words_edit",
+                &mut self.keywords,
+                2,
+                "vpn, впн, обход блокировок",
+            );
+            let words = otvet_core::answerer::parse_keywords(&self.keywords);
+            hint(
+                ui,
+                "Через запятую или с новой строки. Регистр не важен, слово ищется внутри заголовка и текста вопроса: «vpn» найдётся и в «VPN-сервис».",
+            );
+            hint(
+                ui,
+                &match words.len() {
+                    0 => "Пусто — бот отвечает на всё подряд.".to_string(),
+                    n => format!(
+                        "Слов: {n}. Остальные вопросы бот из ленты даже не возьмёт — ни лимита, ни запроса к нейросети на них не потратит."
+                    ),
+                },
+            );
+        });
+
+        extra(ui, "Проверка отправки", "ans_verify", |ui| {
+            verify_block(ui, &mut self.verify_posted, &mut self.verify_delay_sec, "ответ");
+        });
+
+        let mut open_pool = false;
+        extra(ui, "Картинка к ответу", "ans_img", |ui| {
+            open_pool = self.image.ui(ui);
+        });
+        open_pool
     }
 
     pub fn to_params(&self, ai: &AiForm, check_auth: bool) -> AnswerParams {
         AnswerParams {
             mode: self.mode,
-            target: if self.from_links { TargetMode::Links } else { TargetMode::Feed },
+            target: match self.source {
+                Source::Feed => TargetMode::Feed,
+                Source::Links => TargetMode::Links,
+                Source::Range => TargetMode::Range,
+            },
+            range_from: self.range().map(|(a, _)| a).unwrap_or(0),
+            range_to: self.range().map(|(_, b)| b).unwrap_or(0),
             links: split_lines(&self.links),
             limit: self.limit,
             delay_min: self.delay_min,
@@ -404,9 +606,14 @@ impl AnswersForm {
             conversational: self.conversational,
             convo_budget_k: self.convo_budget_k,
             skip_others: self.skip_others,
-            random_tag: self.random_tag,
+            skip_own_authors: self.skip_own_authors,
+            keywords: otvet_core::answerer::parse_keywords(&self.keywords),
+            uniq: self.uniq,
+            uniq_latin: self.uniq_latin,
+            verify_posted: self.verify_posted,
+            verify_delay_sec: self.verify_delay_sec,
             signature: self.signature.clone(),
-            noai_answers: vec![],
+            noai_answers: split_lines(&self.noai_list),
             image: self.image.to_core(),
             image_count: self.image.count,
             ai: ai.cfg(),
@@ -414,6 +621,7 @@ impl AnswersForm {
             custom_prompt: ai.prompt(),
             mention: ai.mention.clone(),
             check_auth,
+            progress: Progress::new(),
         }
     }
 
@@ -423,10 +631,11 @@ impl AnswersForm {
             AnswerMode::NoAi => "готовыми фразами",
             AnswerMode::Mangle => "коверканьем",
         };
-        let src = if self.from_links {
-            format!("по {} ссылк(ам)", split_lines(&self.links).len())
-        } else {
-            "из ленты".to_string()
+        let src = match (self.source, self.range()) {
+            (Source::Links, _) => format!("по {} ссылк(ам)", split_lines(&self.links).len()),
+            (Source::Range, Some((a, b))) => format!("в диапазон {a}–{b} ({} шт.)", b - a + 1),
+            (Source::Range, None) => "в диапазон (не задан)".to_string(),
+            _ => "из ленты".to_string(),
         };
         format!(
             "{} {how} {src}, пауза {:.0}–{:.0} с",
@@ -442,8 +651,11 @@ impl AnswersForm {
 
     pub fn problems(&self, ai: &AiForm) -> Vec<String> {
         let mut v = Vec::new();
-        if self.from_links && split_lines(&self.links).is_empty() {
+        if self.source == Source::Links && split_lines(&self.links).is_empty() {
             v.push("Не вставлены ссылки на вопросы".into());
+        }
+        if self.source == Source::Range && self.range().is_none() {
+            v.push("Не задан диапазон: нужны номера первого и последнего вопроса".into());
         }
         if self.mode == AnswerMode::Ai {
             v.extend(ai.problems());
@@ -461,8 +673,21 @@ pub struct QuestionsForm {
     pub limit: i64,
     pub delay_min: f64,
     pub delay_max: f64,
-    pub topic: String,
-    pub random_tag: bool,
+    /// Свои темы, по одной в строке. В файле настроек ключ остался прежним —
+    /// однострочная тема из старой версии читается как список из одной строки.
+    #[serde(rename = "topic", default)]
+    pub topics: String,
+    #[serde(default)]
+    pub uniq: UniqMode,
+    #[serde(default)]
+    pub uniq_latin: bool,
+    #[serde(default = "yes")]
+    pub verify_posted: bool,
+    #[serde(default = "default_verify_delay")]
+    pub verify_delay_sec: f64,
+    /// Свои готовые вопросы (по одной строке; «Заголовок | тело»).
+    #[serde(default)]
+    pub noai_list: String,
     pub image: ImageForm,
 }
 
@@ -473,32 +698,56 @@ impl Default for QuestionsForm {
             limit: default_limit(),
             delay_min: 30.0,
             delay_max: 90.0,
-            topic: String::new(),
-            random_tag: false,
+            topics: String::new(),
+            uniq: UniqMode::Off,
+            uniq_latin: false,
+            verify_posted: true,
+            verify_delay_sec: default_verify_delay(),
+            noai_list: String::new(),
             image: ImageForm::default(),
         }
     }
 }
 
 impl QuestionsForm {
-    pub fn ui(&mut self, ui: &mut Ui, ai: &mut AiForm, styles: &Styles) {
+    /// `true` — форма просит открыть окно пула картинок.
+    pub fn ui(&mut self, ui: &mut Ui, ai: &mut AiForm, styles: &Styles) -> bool {
         block(ui, "Откуда берём вопросы");
         ui.horizontal(|ui| {
             seg(ui, &mut self.mode, AskMode::Ai, "Придумывает нейросеть");
             seg(ui, &mut self.mode, AskMode::NoAi, "Из готового списка");
         });
         if self.mode == AskMode::Ai {
-            ui.horizontal(|ui| {
-                ui.label("Тема");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.topic)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("пусто — случайная тема из styles.json"),
-                );
-            });
+            ui.label("Темы");
+            crate::forms::boxed_multiline(
+                ui,
+                "q_topics",
+                &mut self.topics,
+                2,
+                "пусто — случайные темы из styles.json",
+            );
+            let n = split_lines(&self.topics).len();
+            hint(
+                ui,
+                &match n {
+                    0 => "Пусто — тема берётся случайной из styles.json.".to_string(),
+                    1 => "Все вопросы будут на эту тему.".to_string(),
+                    n => format!(
+                        "По одной теме в строке. Своих тем: {n} — для каждого вопроса берётся случайная."
+                    ),
+                },
+            );
             ai.ui(ui, styles);
         } else {
-            hint(ui, "Простые бытовые вопросы из встроенного списка; уже заданные не повторяются.");
+            hint(ui, "Уже заданные этим аккаунтом не повторяются — журнал ведётся сам.");
+            list_edit(
+                ui,
+                "asks_noai",
+                &mut self.noai_list,
+                "Свои вопросы",
+                "Пусто — берётся встроенный список бытовых вопросов. Можно «Заголовок | текст вопроса».",
+                "как дела у всех?\nчто посмотреть вечером? | сериал или фильм, без разницы",
+            );
         }
 
         block(ui, "Сколько и как часто");
@@ -507,18 +756,20 @@ impl QuestionsForm {
             ui.add(egui::DragValue::new(&mut self.limit).range(0..=100_000));
             ui.label("(0 — без лимита)");
         });
-        ui.horizontal(|ui| {
-            ui.label("Пауза");
-            ui.add(egui::DragValue::new(&mut self.delay_min).range(0.0..=3600.0).speed(0.5));
-            ui.label("–");
-            ui.add(egui::DragValue::new(&mut self.delay_max).range(0.0..=3600.0).speed(0.5).suffix(" сек"));
-        });
+        range_row(ui, "Пауза", &mut self.delay_min, &mut self.delay_max, 3600.0);
         hint(ui, "Заголовок длиннее 120 знаков сайт не принимает — хвост уедет в тело вопроса сам.");
 
         extra(ui, "Уникальность", "q_uniq", |ui| {
-            ui.checkbox(&mut self.random_tag, "дописывать #случайные-цифры");
+            uniq_block(ui, &mut self.uniq, &mut self.uniq_latin);
         });
-        extra(ui, "Картинка к вопросу", "q_img", |ui| self.image.ui(ui));
+        extra(ui, "Проверка публикации", "q_verify", |ui| {
+            verify_block(ui, &mut self.verify_posted, &mut self.verify_delay_sec, "вопрос");
+        });
+        let mut open_pool = false;
+        extra(ui, "Картинка к вопросу", "q_img", |ui| {
+            open_pool = self.image.ui(ui);
+        });
+        open_pool
     }
 
     pub fn to_params(&self, ai: &AiForm, check_auth: bool) -> AskParams {
@@ -531,12 +782,16 @@ impl QuestionsForm {
             style: ai.style.clone(),
             custom_prompt: ai.prompt(),
             mention: ai.mention.clone(),
-            topic: self.topic.clone(),
-            noai_questions: vec![],
-            random_tag: self.random_tag,
+            topics: split_lines(&self.topics),
+            noai_questions: split_lines(&self.noai_list),
+            uniq: self.uniq,
+            uniq_latin: self.uniq_latin,
             image: self.image.to_core(),
             image_count: self.image.count,
+            verify_posted: self.verify_posted,
+            verify_delay_sec: self.verify_delay_sec,
             check_auth,
+            progress: Progress::new(),
         }
     }
 
@@ -581,7 +836,17 @@ pub struct CommentsForm {
     pub max_chain: usize,
     pub skip_own: bool,
     pub mark_read: bool,
-    pub random_tag: bool,
+    #[serde(default)]
+    pub uniq: UniqMode,
+    #[serde(default)]
+    pub uniq_latin: bool,
+    #[serde(default = "yes")]
+    pub verify_posted: bool,
+    #[serde(default = "default_verify_delay")]
+    pub verify_delay_sec: f64,
+    /// Свои готовые реплики (по одной в строке).
+    #[serde(default)]
+    pub noai_list: String,
     pub signature: String,
 }
 
@@ -601,7 +866,11 @@ impl Default for CommentsForm {
             max_chain: 6,
             skip_own: true,
             mark_read: false,
-            random_tag: false,
+            uniq: UniqMode::Off,
+            uniq_latin: false,
+            verify_posted: true,
+            verify_delay_sec: default_verify_delay(),
+            noai_list: String::new(),
             signature: String::new(),
         }
     }
@@ -622,6 +891,15 @@ impl CommentsForm {
         });
         if self.mode == ReplyMode::Ai {
             ai.ui(ui, styles);
+        } else {
+            list_edit(
+                ui,
+                "replies_noai",
+                &mut self.noai_list,
+                "Свои реплики",
+                "Пусто — берётся встроенный набор коротких ответов.",
+                "согласен\nну хз\nда ладно тебе",
+            );
         }
 
         block(ui, "Сколько и как часто");
@@ -630,12 +908,7 @@ impl CommentsForm {
             ui.add(egui::DragValue::new(&mut self.limit).range(0..=100_000));
             ui.label("(0 — без лимита)");
         });
-        ui.horizontal(|ui| {
-            ui.label("Пауза");
-            ui.add(egui::DragValue::new(&mut self.delay_min).range(0.0..=3600.0).speed(0.5));
-            ui.label("–");
-            ui.add(egui::DragValue::new(&mut self.delay_max).range(0.0..=3600.0).speed(0.5).suffix(" сек"));
-        });
+        range_row(ui, "Пауза", &mut self.delay_min, &mut self.delay_max, 3600.0);
 
         extra(ui, "Кого пропускать", "cm_filter", |ui| {
             ui.checkbox(&mut self.skip_own, "не отвечать своим же аккаунтам");
@@ -668,7 +941,7 @@ impl CommentsForm {
         });
 
         extra(ui, "Уникальность и подпись", "cm_uniq", |ui| {
-            ui.checkbox(&mut self.random_tag, "дописывать #случайные-цифры");
+            uniq_block(ui, &mut self.uniq, &mut self.uniq_latin);
             ui.label("Подпись в конце");
             ui.add(
                 egui::TextEdit::singleline(&mut self.signature)
@@ -682,6 +955,10 @@ impl CommentsForm {
                     "Сайт помечает прочитанным ВСЁ разом — не только то, на что ответили.",
                 );
             }
+        });
+
+        extra(ui, "Проверка отправки", "cm_verify", |ui| {
+            verify_block(ui, &mut self.verify_posted, &mut self.verify_delay_sec, "ответ");
         });
     }
 
@@ -703,11 +980,15 @@ impl CommentsForm {
             style: ai.style.clone(),
             custom_prompt: ai.prompt(),
             mention: ai.mention.clone(),
-            noai_replies: vec![],
-            random_tag: self.random_tag,
+            noai_replies: split_lines(&self.noai_list),
+            uniq: self.uniq,
+            uniq_latin: self.uniq_latin,
+            verify_posted: self.verify_posted,
+            verify_delay_sec: self.verify_delay_sec,
             signature: self.signature.clone(),
             mark_read: self.mark_read,
             check_auth,
+            progress: Progress::new(),
         }
     }
 
