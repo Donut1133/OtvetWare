@@ -105,7 +105,10 @@ impl AiForm {
             );
         });
         if self.api_key.trim().is_empty() {
-            hint(ui, "Ключ берётся у провайдера (например, openrouter.ai). Без него нейросеть не ответит.");
+            hint(
+                ui,
+                "Ключ берётся у провайдера — по умолчанию тут DeepSeek. Без ключа нейросеть не ответит.",
+            );
         }
         ui.horizontal(|ui| {
             ui.label("Модель");
