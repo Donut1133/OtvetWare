@@ -1,9 +1,6 @@
 # OtvetWare
 
-<!-- Перед публикацией замени OWNER на свой ник на GitHub: в бейдже ниже и в
-     команде git clone. Больше нигде адрес репозитория не зашит. -->
-
-[![CI](https://github.com/OWNER/OtvetWare/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/OtvetWare/actions/workflows/ci.yml)
+[![CI](https://github.com/Donut1133/OtvetWare/actions/workflows/ci.yml/badge.svg)](https://github.com/Donut1133/OtvetWare/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-informational)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](https://www.rust-lang.org/)
 
@@ -73,7 +70,7 @@ Node.js, ни веб-панели, ни локального сервера — 
 **Из исходников** (нужен [Rust](https://rustup.rs/) 1.85+):
 
 ```bash
-git clone https://github.com/OWNER/OtvetWare.git
+git clone https://github.com/Donut1133/OtvetWare.git
 cd OtvetWare
 cargo run --release -p otvet-gui
 ```
