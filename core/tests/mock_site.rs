@@ -12,7 +12,7 @@ use otvet_core::accounts::Account;
 use otvet_core::util::{no_log, Stop};
 use otvet_core::votes::{self, Vote};
 use otvet_core::Core;
-use otvet_core::{answerer, asker, replier};
+use otvet_core::{answerer, asker, complain, replier};
 use parking_lot::Mutex;
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -966,6 +966,85 @@ async fn ai_answer_goes_through_the_whole_path() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Картинки вопроса показываются нейросети.
+///
+/// Половина вопросов на сайте — это фото с подписью «как вам?»: без картинки
+/// текст пустой, и модель отвечала вслепую. Проверяем, что картинка скачивается
+/// и уезжает в запрос, а без галки не скачивается вовсе.
+#[tokio::test]
+async fn question_images_are_shown_to_the_ai() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("aisee");
+    let acc = account("see-acc");
+
+    route_ai(m, "симпатичная");
+    m.route(|r| {
+        if r.path.starts_with("/api/topic/question/") {
+            // Текста нет — только картинка, как в живом вопросе-фотографии.
+            return Some(Res::json(
+                r#"{"result":{"title":"Ну как вам такое фото?","content":{"type":"doc","content":[
+                    {"type":"imageGallery","attrs":{"gallery":[{"src":"pic.jpg?size=origin"}]}},
+                    {"type":"paragraph"}]},"author":{"username":"vasya"}}}"#,
+            ));
+        }
+        if r.path.starts_with("/api/pictures/images/") {
+            return Some(Res::json("FAKEJPEG").with_header("content-type", "image/jpeg"));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":777}}"#));
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::Ai,
+        target: answerer::TargetMode::Links,
+        links: vec![format!("{}/question/900001", m.base)],
+        limit: 1,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        check_auth: false,
+        see_images: true,
+        // Проверка отправки тут ни при чём, а ждёт она секундами.
+        verify_posted: false,
+        ai: ai_cfg(&m.base),
+        style: "Обычный чел".into(),
+        ..Default::default()
+    };
+    let out = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out.done, 1, "ответ должен уйти");
+
+    // Картинку скачали с сайта — по адресу из галереи.
+    assert!(m.hits_matching("/api/pictures/images/pic.jpg").len() == 1, "картинку вопроса не скачали");
+
+    // И вложили в запрос к модели рядом с текстом.
+    let body = m.last_body("/v1/chat/completions").expect("запрос к нейросети записан");
+    let user = body["messages"].as_array().and_then(|a| a.last()).cloned().expect("сообщение пользователя");
+    let parts = user["content"].as_array().expect("содержимое должно быть частями: {user}");
+    assert!(
+        parts.iter().any(|x| x["text"].as_str().unwrap_or("").contains("Ну как вам такое фото")),
+        "текст вопроса пропал: {user}"
+    );
+    let img = parts
+        .iter()
+        .find_map(|x| x.pointer("/image_url/url").and_then(|u| u.as_str()))
+        .expect("картинки в запросе нет");
+    // «FAKEJPEG» в base64 — ровно это и должно доехать до модели.
+    assert_eq!(img, "data:image/jpeg;base64,RkFLRUpQRUc=", "картинка доехала не той");
+
+    // А без галки её не должно быть вовсе — ни запроса за файлом, ни частей.
+    let (core2, dir2) = temp_core("aisee-off");
+    let p2 = answerer::AnswerParams { see_images: false, ..p.clone() };
+    answerer::run_answerer(&core2, &account("see-off"), &p2, &no_log(), &Stop::new()).await;
+    assert_eq!(m.hits_matching("/api/pictures/images/pic.jpg").len(), 1, "картинку скачали зря");
+    let body = m.last_body("/v1/chat/completions").expect("запрос к нейросети записан");
+    let user = body["messages"].as_array().and_then(|a| a.last()).cloned().unwrap();
+    assert!(user["content"].is_string(), "без галки содержимое должно остаться строкой: {user}");
+
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(dir2);
+}
+
 /// Нейросеть молчит (кончился баланс — 402): аккаунт обязан остановиться, а не
 /// крутить ленту вечно, оплачивая каждый отказ.
 #[tokio::test]
@@ -1328,6 +1407,81 @@ async fn duplicate_notification_is_answered_once() {
 
     assert_eq!(out.done, 1, "на одну реплику ушло больше одного ответа");
     assert_eq!(m.hits_matching("POST /api/topic/answers").len(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// В комментах картинка из реплики собеседника тоже показывается нейросети.
+///
+/// Мемом отвечают не реже, чем словами: у такой реплики текста нет вовсе, и без
+/// картинки модель отвечала вслепую. Уведомление картинок не содержит — они
+/// видны только в самой реплике, которую бот дочитывает живьём.
+#[tokio::test]
+async fn reply_images_are_shown_to_the_ai() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("cmsee");
+    let acc = account("cmsee-acc");
+
+    route_ai(m, "ну ты даёшь");
+    m.route(|r| {
+        if r.path.starts_with("/api/notificator/notifications") {
+            return Some(Res::json(
+                r#"{"result":{"unread":[{"id":42,"type":"new_reply_reply","entity_type":"reply",
+                    "entity_id":777,"page_uri":"/question/500","title":"мой ответ","body":"",
+                    "created_at":"2026-08-01T10:00:00Z","authors":[{"id":5,"username":"vasya"}]}]}}"#,
+            ));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":9001}}"#));
+        }
+        if r.path.starts_with("/api/topic/answers/") {
+            // Реплика собеседника — одна картинка без единого слова.
+            return Some(Res::json(
+                r#"{"result":{"replies":[
+                    {"id":777,"content":{"type":"doc","content":[
+                        {"type":"imageGallery","attrs":{"gallery":[{"src":"mem.png?size=origin"}]}},
+                        {"type":"paragraph"}]},"author":{"id":5,"username":"vasya"}},
+                    {"id":9001,"content":{"type":"doc","content":[]},"author":{"id":1000,"username":"me"}}
+                ]}}"#,
+            ));
+        }
+        if r.path.starts_with("/api/pictures/images/") {
+            return Some(Res::json("FAKEPNG").with_header("content-type", "image/png"));
+        }
+        None
+    });
+
+    let p = replier::ReplyParams {
+        mode: replier::ReplyMode::Ai,
+        limit: 0,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        max_age_hours: 0.0,
+        max_per_thread: 2,
+        pages: 1,
+        skip_own: false,
+        use_question: false,
+        use_chain: false,
+        see_images: true,
+        check_auth: false,
+        verify_posted: false,
+        verify_delay_sec: 0.0,
+        ai: ai_cfg(&m.base),
+        style: "Обычный чел".into(),
+        ..Default::default()
+    };
+    let out = replier::run_replier(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out.done, 1, "реплика должна уйти");
+
+    assert_eq!(m.hits_matching("/api/pictures/images/mem.png").len(), 1, "картинку реплики не скачали");
+    let body = m.last_body("/v1/chat/completions").expect("запрос к нейросети записан");
+    let user = body["messages"].as_array().and_then(|a| a.last()).cloned().expect("сообщение");
+    let parts = user["content"].as_array().expect("содержимое должно быть частями");
+    let img = parts
+        .iter()
+        .find_map(|x| x.pointer("/image_url/url").and_then(|u| u.as_str()))
+        .expect("картинки в запросе нет");
+    // Тип берётся из имени файла, а не угадывается: .png так .png.
+    assert_eq!(img, "data:image/png;base64,RkFLRVBORw==", "картинка доехала не той");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -2206,12 +2360,233 @@ async fn range_answers_go_in_order_and_respect_the_journal() {
     assert!(m.hits_matching("GET /api/topic/question/").is_empty(), "лишний запрос за текстом вопроса");
 
     // Второй запуск того же диапазона продолжает с того места, где остановились.
+    // Очередь номеров берём чистую — как при новом нажатии «Запустить»: тогда
+    // повтор ловится журналом, а не тем, что очередь уже прокручена.
+    let p = answerer::AnswerParams { range_queue: Default::default(), ..p.clone() };
     let out2 = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
     assert_eq!(out2.done, 2, "повторный запуск не дошёл до хвоста диапазона");
     assert!(out2.exhausted, "диапазон пройден целиком — прогон должен об этом сказать");
     let ids: Vec<i64> =
         m.bodies_matching("/api/topic/answers").iter().filter_map(|b| b["topic_id"].as_i64()).collect();
     assert_eq!(ids, vec![100, 101, 102, 103, 104], "по одному из вопросов ответили дважды");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Диапазон делится между аккаунтами, а не проходится каждым целиком.
+///
+/// Очередь номеров одна на прогон, поэтому десять тысяч номеров разбираются во
+/// столько раз быстрее, сколько аккаунтов работает. Раньше каждый аккаунт шёл
+/// по всему диапазону сам, и под одним будущим вопросом оказывалось столько
+/// ответов, сколько аккаунтов запустили.
+#[tokio::test]
+async fn range_is_shared_between_accounts() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("range-share");
+
+    m.route(|r| {
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            static N: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+            let id = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Some(Res::json(format!(r#"{{"result":{{"id":{id}}}}}"#)));
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        target: answerer::TargetMode::Range,
+        range_from: 100,
+        range_to: 109,
+        limit: 0,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        check_auth: false,
+        ..Default::default()
+    };
+
+    // Три аккаунта с ОДНИМИ параметрами — так их и раздаёт интерфейс: параметры
+    // собираются один раз на прогон и клонируются под каждый аккаунт.
+    let mut done = Vec::new();
+    for name in ["share-1", "share-2", "share-3"] {
+        let out = answerer::run_answerer(&core, &account(name), &p.clone(), &no_log(), &Stop::new()).await;
+        done.push(out.done);
+    }
+
+    let mut ids: Vec<i64> =
+        m.bodies_matching("/api/topic/answers").iter().filter_map(|b| b["topic_id"].as_i64()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, (100..=109).collect::<Vec<_>>(), "диапазон разобран не ровно по разу");
+    assert_eq!(done.iter().sum::<i64>(), 10, "сумма по аккаунтам разошлась с числом ответов");
+    // Первый забрал всё, потому что шёл без лимита и без пауз, — но остальным
+    // очередь уже ничего не выдала, и второго ответа под теми же номерами нет.
+    assert_eq!(done[0], 10, "первый аккаунт не разобрал очередь: {done:?}");
+    assert_eq!(&done[1..], &[0, 0], "очередь выдала номера повторно: {done:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Номер, взятый аккаунтом, но не отработанный, возвращается в очередь.
+///
+/// Выдаётся он ровно один раз, поэтому без возврата антибот посреди диапазона
+/// оставлял бы дыру: аккаунт умер, а под номером так и нет ответа, и никто
+/// больше его не возьмёт.
+#[tokio::test]
+async fn a_blocked_account_returns_its_numbers() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("range-return");
+
+    // Четвёртый ответ отбиваем антиботом, дальше снова пускаем.
+    m.route(|r| {
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            static N: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 3 {
+                return Some(Res { status: 429, ..Res::json(r#"{"error":"antibot"}"#) });
+            }
+            return Some(Res::json(format!(r#"{{"result":{{"id":{}}}}}"#, 500 + n)));
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        target: answerer::TargetMode::Range,
+        range_from: 100,
+        range_to: 104,
+        limit: 0,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        check_auth: false,
+        ..Default::default()
+    };
+
+    let first = answerer::run_answerer(&core, &account("ret-1"), &p.clone(), &no_log(), &Stop::new()).await;
+    assert!(first.blocked, "антибот не остановил аккаунт");
+    assert_eq!(first.done, 3, "до антибота должно было уйти три ответа");
+
+    // Второй аккаунт добирает и возвращённый номер, и остаток диапазона.
+    let second = answerer::run_answerer(&core, &account("ret-2"), &p.clone(), &no_log(), &Stop::new()).await;
+    assert_eq!(second.done, 2, "второй аккаунт не добрал остаток: {second:?}");
+
+    let mut ok: Vec<i64> =
+        m.bodies_matching("/api/topic/answers").iter().filter_map(|b| b["topic_id"].as_i64()).collect();
+    ok.sort_unstable();
+    ok.dedup();
+    assert_eq!(ok, (100..=104).collect::<Vec<_>>(), "в диапазоне осталась дыра: {ok:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// По ссылкам работа кончается вместе со списком.
+///
+/// Иначе «Ответы по ссылке» с включёнными кругами крутились впустую до «Стоп»:
+/// журнал отбрасывал все ссылки, круг делал ноль ответов, и следующий начинался
+/// снова. Прогон обязан сказать «отвечать больше не на что».
+#[tokio::test]
+async fn links_are_exhausted_when_the_list_is_done() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("linksdone");
+    let acc = account("links-acc");
+
+    m.route(|r| {
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":42}}"#));
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::NoAi,
+        target: answerer::TargetMode::Links,
+        links: vec![format!("{}/question/111", m.base), format!("{}/question/222", m.base)],
+        limit: 0,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        check_auth: false,
+        verify_posted: false,
+        ..Default::default()
+    };
+
+    let first = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(first.done, 2, "обе ссылки должны быть отвечены");
+    assert!(first.exhausted, "список пройден целиком — работы больше нет");
+
+    // Второй круг: журнал отбрасывает обе ссылки, отвечать не на что.
+    let second = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(second.done, 0, "по журналу второй раз отвечать нельзя");
+    assert!(second.exhausted, "пустой круг обязан сказать, что работы нет");
+    assert_eq!(m.hits_matching("POST /api/topic/answers").len(), 2, "на ссылку ушло больше одного ответа");
+
+    // А вот прерванный лимитом проход работой не считается: остаток списка
+    // ждёт следующего круга.
+    let (core2, dir2) = temp_core("linkscut");
+    let p2 = answerer::AnswerParams { limit: 1, ..p.clone() };
+    let cut = answerer::run_answerer(&core2, &account("links-cut"), &p2, &no_log(), &Stop::new()).await;
+    assert_eq!(cut.done, 1);
+    assert!(!cut.exhausted, "упёрлись в лимит — список не дошли, круги нужны");
+
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(dir2);
+}
+
+/// Жалобы: тела запросов и лимит.
+///
+/// Единственный режим, который нельзя проверить живьём — жалоба летит в чужой
+/// аккаунт. Поэтому контракт проверяем на заглушке: id должен уходить ЧИСЛОМ и
+/// в свой эндпоинт для профиля и для поста, а лимит — считать отправленные.
+#[tokio::test]
+async fn complaints_hit_the_right_endpoints() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("complain");
+    let acc = account("cmp-acc");
+
+    m.route(|r| {
+        if r.path.starts_with("/api/antispam/report_") {
+            return Some(Res::json(r#"{"result":{}}"#));
+        }
+        if r.path.starts_with("/api/topic/profile/") {
+            // Две страницы постов профиля: курсор инклюзивный, как у сайта.
+            let pos = r.path.split("pos=").nth(1).and_then(|t| t.split('&').next()).unwrap_or("0");
+            if pos == "0" {
+                return Some(Res::json(r#"{"result":{"feed":[{"id":11},{"id":12},{"id":13}]}}"#));
+            }
+            return Some(Res::json(r#"{"result":{"feed":[]}}"#));
+        }
+        None
+    });
+
+    // 1) Жалоба на сам профиль.
+    let p = complain::ComplainParams {
+        targets: vec![format!("{}/profile/id777/", m.base)],
+        target: complain::ComplainTarget::User,
+        reason: "spam".into(),
+        delay: 0.0,
+        limit: 0,
+        check_auth: false,
+        ..Default::default()
+    };
+    let out = complain::run_complainer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out.done, 1, "жалоба на профиль не ушла");
+    let body = m.last_body("/api/antispam/report_user").expect("запрос на профиль");
+    assert_eq!(body["id"].as_i64(), Some(777), "id профиля ушёл не числом: {body}");
+    assert_eq!(body["report_type"].as_str(), Some("spam"));
+
+    // 2) Перебор постов профиля — со своим эндпоинтом и своим лимитом.
+    let p = complain::ComplainParams {
+        targets: vec![format!("{}/profile/id777/", m.base)],
+        target: complain::ComplainTarget::Topics,
+        reason: "flood".into(),
+        delay: 0.0,
+        limit: 2,
+        check_auth: false,
+        ..Default::default()
+    };
+    let out = complain::run_complainer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out.done, 2, "лимит жалоб не сработал");
+    let ids: Vec<i64> =
+        m.bodies_matching("/api/antispam/report_topic").iter().filter_map(|b| b["id"].as_i64()).collect();
+    assert_eq!(ids, vec![11, 12], "посты обошли не по порядку или не остановились на лимите");
+    assert_eq!(
+        m.last_body("/api/antispam/report_topic").unwrap()["report_type"].as_str(),
+        Some("flood"),
+        "причина жалобы потерялась"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -6,7 +6,7 @@ use otvet_core::{cdp, persona::PersonaOpts, util::Stop, Core};
 
 #[tokio::main]
 async fn main() {
-    let root = std::env::var("OTVET_ROOT").unwrap_or_else(|_| ".".into());
+    let root = Core::find_root();
     let core = Core::open(&root);
     println!("папка данных: {}", core.root.display());
     match cdp::chrome_path(&core.root) {

@@ -106,6 +106,46 @@ pub fn doc_to_text(doc: &Value) -> String {
     out.join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Картинки, вложенные в пост. `doc_to_text` видит только текстовые узлы, а у
+/// картинок текста нет — вопрос вроде «как вам?» с одной фотографией приходил
+/// пустым. Возвращаем `src` как есть: это «хэш.jpg?size=origin» без адреса.
+pub fn doc_images(doc: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    fn walk(n: &Value, out: &mut Vec<String>) {
+        if n.get("type").and_then(|t| t.as_str()) == Some("imageGallery") {
+            if let Some(g) = n.pointer("/attrs/gallery").and_then(|g| g.as_array()) {
+                for it in g {
+                    if let Some(src) = it.get("src").and_then(|s| s.as_str()) {
+                        // Одна и та же картинка встречается и в галерее, и
+                        // отдельной нодой — второй раз показывать её незачем.
+                        if !src.is_empty() && !out.iter().any(|x| x == src) {
+                            out.push(src.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(arr) = n.get("content").and_then(|c| c.as_array()) {
+            for c in arr {
+                walk(c, out);
+            }
+        }
+    }
+    walk(doc, &mut out);
+    out
+}
+
+/// Полный адрес картинки поста по её `src` из галереи.
+pub fn image_url(src: &str) -> String {
+    if src.starts_with("http://") || src.starts_with("https://") {
+        src.to_string()
+    } else if src.starts_with('/') {
+        format!("{}{src}", crate::http::base_url())
+    } else {
+        format!("{}/api/pictures/images/{src}", crate::http::base_url())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +168,40 @@ mod tests {
         assert_eq!(c[1]["type"], "imageGallery");
         assert_eq!(c[1]["attrs"]["gallery"][0]["src"], "abc.jpg?size=origin");
         assert_eq!(c[2]["type"], "paragraph");
+    }
+
+    /// Вопрос из одной картинки без текста — обычное дело на сайте, и раньше
+    /// он приезжал к нейросети пустым.
+    #[test]
+    fn images_are_pulled_out_of_the_post() {
+        let doc = serde_json::json!({
+            "type": "doc",
+            "content": [
+                { "type": "paragraph", "content": [{ "type": "text", "text": "к кому лучше?" }] },
+                { "type": "imageGallery", "attrs": { "gallery": [
+                    { "src": "aaa.jpg?size=origin", "dimensions": { "width": 113, "height": 69 } },
+                    { "src": "bbb.jpg?size=origin" }
+                ] } },
+                { "type": "imageGallery", "attrs": { "gallery": [{ "src": "aaa.jpg?size=origin" }] } },
+                { "type": "paragraph" }
+            ]
+        });
+        assert_eq!(doc_images(&doc), vec!["aaa.jpg?size=origin", "bbb.jpg?size=origin"]);
+        // Текст при этом читается по-прежнему.
+        assert_eq!(doc_to_text(&doc), "к кому лучше?");
+        // А у поста без картинок список пуст.
+        assert!(doc_images(&text_to_doc("просто текст")).is_empty());
+    }
+
+    #[test]
+    fn image_url_is_built_from_the_gallery_src() {
+        let base = crate::http::base_url();
+        assert_eq!(
+            image_url("aaa.jpg?size=origin"),
+            format!("{base}/api/pictures/images/aaa.jpg?size=origin")
+        );
+        assert_eq!(image_url("/api/pictures/images/b.jpg"), format!("{base}/api/pictures/images/b.jpg"));
+        assert_eq!(image_url("https://example.com/c.jpg"), "https://example.com/c.jpg");
     }
 
     #[test]

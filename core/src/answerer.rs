@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
 
 /// Короткие «живые» реплики для режима без нейросети.
 pub const NOAI_ANSWERS: &[&str] = &[
@@ -123,6 +124,47 @@ pub fn has_keyword(words: &[String], q: &Question) -> bool {
     words.iter().any(|w| hay.contains(w))
 }
 
+/// Общая на весь прогон очередь номеров диапазона.
+///
+/// Раньше каждый аккаунт шёл по диапазону сам, и десять аккаунтов клали десять
+/// ответов под один и тот же будущий вопрос: работа не делилась, а множилась.
+/// Здесь номер выдаётся ровно один раз — сколько аккаунтов, во столько раз
+/// быстрее разбирается диапазон, хоть по очереди, хоть всеми сразу.
+#[derive(Debug, Default)]
+pub struct RangeQueue {
+    /// Следующий невыданный номер. Ноль — очередь ещё не начата: первый
+    /// пришедший ставит начало диапазона.
+    next: AtomicI64,
+    /// Номера, взятые, но не отработанные: аккаунт словил антибот или уткнулся
+    /// в лимит посреди пачки. Без возврата такой номер пропал бы навсегда —
+    /// выдан он ровно один раз, а ответа под ним нет.
+    back: Mutex<Vec<i64>>,
+}
+
+impl RangeQueue {
+    /// Занять следующий номер. `None` — диапазон разобран до конца.
+    pub fn take(&self, from: i64, to: i64) -> Option<i64> {
+        // Возвращённые разбираем первыми: они старше и ждут дольше.
+        if let Some(id) = self.back.lock().pop() {
+            return Some(id);
+        }
+        let _ = self.next.compare_exchange(0, from, Ordering::SeqCst, Ordering::SeqCst);
+        let id = self.next.fetch_add(1, Ordering::SeqCst);
+        (id <= to).then_some(id)
+    }
+
+    /// Вернуть номер в очередь: этот аккаунт до него не добрался.
+    pub fn give_back(&self, id: i64) {
+        self.back.lock().push(id);
+    }
+
+    /// Сколько номеров ещё ждёт работы — для лога на старте аккаунта.
+    pub fn left(&self, from: i64, to: i64) -> i64 {
+        let next = self.next.load(Ordering::SeqCst).max(from);
+        (to - next + 1).max(0) + self.back.lock().len() as i64
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnswerParams {
     pub mode: AnswerMode,
@@ -156,6 +198,10 @@ pub struct AnswerParams {
     pub skip_others: bool,
     /// Не отвечать на вопросы, заданные своими же аккаунтами.
     pub skip_own_authors: bool,
+    /// Показывать нейросети картинки из вопроса. Нужна модель, которая умеет
+    /// смотреть; текстовая на такой запрос ответит ошибкой.
+    #[serde(default)]
+    pub see_images: bool,
     /// Слова-приметы: если список не пуст, бот берёт только те вопросы, где
     /// встретилось хотя бы одно. Текст ответа при этом обычный — нейросетью или
     /// готовыми фразами, как выбрано в режиме.
@@ -180,6 +226,10 @@ pub struct AnswerParams {
     /// Живой счётчик для интерфейса. В файл не пишется.
     #[serde(skip)]
     pub progress: Progress,
+    /// Общая очередь номеров диапазона: одна на прогон, у всех аккаунтов та же.
+    /// В файл не пишется — живёт только пока идёт работа.
+    #[serde(skip)]
+    pub range_queue: Arc<RangeQueue>,
 }
 
 impl Default for AnswerParams {
@@ -204,6 +254,7 @@ impl Default for AnswerParams {
             convo_budget_k: 60.0,
             skip_others: false,
             skip_own_authors: true,
+            see_images: false,
             keywords: vec![],
             uniq: UniqMode::Off,
             uniq_latin: false,
@@ -219,6 +270,7 @@ impl Default for AnswerParams {
             mention: String::new(),
             check_auth: true,
             progress: Progress::new(),
+            range_queue: Arc::new(RangeQueue::default()),
         }
     }
 }
@@ -230,6 +282,9 @@ pub struct Question {
     pub norm: String,
     pub title: String,
     pub body: String,
+    /// Картинки вопроса — `src` из галерей, без адреса CDN. Половина вопросов
+    /// на сайте это фото с подписью «как вам?», и без них текст бессмысленный.
+    pub images: Vec<String>,
     pub author: String,
     pub author_user: String,
     pub date: String,
@@ -281,6 +336,7 @@ pub async fn collect_questions(
             norm,
             title,
             body: it.get("content").map(doc_to_text).unwrap_or_default(),
+            images: it.get("content").map(crate::content::doc_images).unwrap_or_default(),
             author: a
                 .get("nick")
                 .and_then(|v| v.as_str())
@@ -340,6 +396,7 @@ pub async fn fetch_question(core: &Core, acc: &Account, topic_id: &str, stop: &S
         norm: format!("https://otvet.mail.ru/question/{topic_id}"),
         title: obj.get("title").and_then(|v| v.as_str()).unwrap_or("").trim().to_string(),
         body: obj.get("content").map(doc_to_text).unwrap_or_default(),
+        images: obj.get("content").map(crate::content::doc_images).unwrap_or_default(),
         author: a
             .get("nick")
             .and_then(|v| v.as_str())
@@ -886,7 +943,7 @@ pub async fn run_answerer(
 
     match p.target {
         TargetMode::Links => answer_links(&ctx).await,
-        TargetMode::Range => answer_range(&ctx).await,
+        TargetMode::Range => answer_range(&ctx, batch_per, go_parallel).await,
         TargetMode::Feed => {
             if p.continuous_feed {
                 answer_feed_continuous(&ctx, recent, batch_per, f_min, f_max).await;
@@ -1040,6 +1097,14 @@ impl RunCtx<'_> {
         has_keyword(&self.p.keywords, q)
     }
 
+    /// Картинки вопроса, готовые к показу модели.
+    async fn question_images(&self, q: &Question) -> Vec<String> {
+        if !self.p.see_images {
+            return Vec::new();
+        }
+        api::fetch_images(self.core, self.acc, &q.images, self.log, self.stop).await
+    }
+
     /// Одна попытка ответить: текст → картинка → отправка → проверка.
     async fn answer_once(&self, q: &Question, rep: i64, attempt: i64) -> Step {
         // 1) текст
@@ -1052,6 +1117,7 @@ impl RunCtx<'_> {
                     (true, _) => format!("   [>] Генерирую ответ {}/{}...", rep + 1, self.repeat_per),
                     _ => "   [>] Генерирую ответ...".to_string(),
                 });
+                let pics = self.question_images(q).await;
                 let msgs = if self.convo_mode {
                     let m = build_ask_msg(q);
                     let convo = self.core.convo.snapshot();
@@ -1063,7 +1129,7 @@ impl RunCtx<'_> {
                         )));
                     }
                     msgs.extend(convo.turns.clone());
-                    msgs.push(Msg::user(m.clone()));
+                    msgs.push(Msg::user(m.clone()).with_images(pics));
                     ask_msg = Some(m);
                     msgs
                 } else {
@@ -1083,7 +1149,7 @@ impl RunCtx<'_> {
                         ));
                     }
                     sys.push_str(NO_MARKDOWN);
-                    vec![Msg::system(sys), Msg::user(prompt)]
+                    vec![Msg::system(sys), Msg::user(prompt).with_images(pics)]
                 };
                 match self.core.ai.generate(self.ai, &msgs, self.log, self.stop).await {
                     Ok(a) if !a.is_empty() => {
@@ -1369,39 +1435,118 @@ impl RunCtx<'_> {
 ///
 /// Журнал уважаем как везде: перезапуск того же диапазона не наделает вторых
 /// ответов под теми же вопросами.
-async fn answer_range(ctx: &RunCtx<'_>) {
+async fn answer_range(ctx: &RunCtx<'_>, batch_per: i64, go_parallel: bool) {
     let (from, to) = (ctx.p.range_from.min(ctx.p.range_to), ctx.p.range_from.max(ctx.p.range_to));
     if from <= 0 || to <= 0 {
         (ctx.log)("[-] Не задан диапазон номеров.");
         return;
     }
     (ctx.log)(&format!("[>] Диапазон: {from}–{to} ({} шт.), текст готовыми фразами.", to - from + 1));
+    (ctx.log)(&format!(
+        "[>] Номера общие на прогон: каждый достаётся одному аккаунту. Ждут работы: {}",
+        ctx.p.range_queue.left(from, to)
+    ));
 
-    // Дошли ли до конца диапазона или ушли раньше — по лимиту, «Стопу» или
-    // паузе. От этого зависит, есть ли смысл в следующем круге.
+    // Один номер = одна попытка на весь прогон, поэтому взятое, но не
+    // отработанное надо вернуть — иначе под ним так и не будет ответа.
+    let queue = &ctx.p.range_queue;
+    let give_back = |ids: &[i64]| ids.iter().for_each(|id| queue.give_back(*id));
+
+    // Ушли ли раньше конца — по лимиту, «Стопу» или паузе. От этого зависит,
+    // есть ли смысл в следующем круге.
     let mut left = false;
-    for id in from..=to {
+    loop {
         if ctx.done() {
             left = true;
             break;
         }
-        let norm = format!("https://otvet.mail.ru/question/{id}");
-        if ctx.sh.exclude.lock().contains(&norm) {
-            continue;
-        }
-        let q = Question { id: id.to_string(), norm: norm.clone(), ..Default::default() };
-        (ctx.log)(&format!("\n→ Вопрос #{id}"));
-        let posted = ctx.handle_one(&q).await;
-        ctx.after_one(&q, posted);
-        if !ctx.done() && ctx.pause_between().await {
+        // Берём пачку номеров сразу, но не больше, чем осталось места под
+        // лимитом: лишнее пришлось бы возвращать.
+        let room = ctx.sh.remaining(ctx.p.limit).min(if go_parallel { batch_per } else { 1 });
+        if room <= 0 {
             left = true;
             break;
         }
+        let mut batch: Vec<i64> = Vec::new();
+        while (batch.len() as i64) < room {
+            let Some(id) = queue.take(from, to) else { break };
+            // Уже отвечено — в журнале аккаунта или (если включено) чужом.
+            // Такой номер не возвращаем: работа по нему сделана.
+            if ctx.sh.exclude.lock().contains(&format!("https://otvet.mail.ru/question/{id}")) {
+                continue;
+            }
+            batch.push(id);
+        }
+        if batch.is_empty() {
+            // Очередь пуста: диапазон разобран до конца, и следующий круг по
+            // тем же номерам не сделает ничего.
+            break;
+        }
+
+        if go_parallel && batch.len() > 1 {
+            (ctx.log)(&format!("\n[>] Отвечаю на {} номер(ов) ПАРАЛЛЕЛЬНО (разом)...", batch.len()));
+            let mut tasks = FuturesUnordered::new();
+            for id in &batch {
+                let id = *id;
+                tasks.push(async move {
+                    if ctx.done() {
+                        queue.give_back(id);
+                        return;
+                    }
+                    (ctx.log)(&format!("\n→ Вопрос #{id}"));
+                    let q = one_range_question(id);
+                    let posted = ctx.handle_one(&q).await;
+                    ctx.after_one(&q, posted);
+                    // Антибот убил аккаунт — номер тут ни при чём, пусть его
+                    // возьмёт другой.
+                    if !posted && ctx.sh.blocked() {
+                        queue.give_back(id);
+                    }
+                });
+            }
+            while tasks.next().await.is_some() {}
+            // Пауза действует МЕЖДУ пачками, а не между ответами.
+            if !ctx.done() && ctx.pause_between().await {
+                left = true;
+                break;
+            }
+        } else {
+            for (k, id) in batch.iter().enumerate() {
+                let id = *id;
+                if ctx.done() {
+                    give_back(&batch[k..]);
+                    left = true;
+                    break;
+                }
+                (ctx.log)(&format!("\n→ Вопрос #{id}"));
+                let q = one_range_question(id);
+                let posted = ctx.handle_one(&q).await;
+                ctx.after_one(&q, posted);
+                if !posted && ctx.sh.blocked() {
+                    queue.give_back(id);
+                }
+                if !ctx.done() && ctx.pause_between().await {
+                    give_back(&batch[k + 1..]);
+                    left = true;
+                    break;
+                }
+            }
+            if left {
+                break;
+            }
+        }
     }
     if !left {
-        // Диапазон пройден целиком: все номера либо отвечены сейчас, либо уже
-        // были в журнале. Следующий круг по тем же номерам не сделает ничего.
         ctx.sh.exhausted.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Вопрос-заглушка под номер диапазона: текста у него ещё нет и быть не может.
+fn one_range_question(id: i64) -> Question {
+    Question {
+        id: id.to_string(),
+        norm: format!("https://otvet.mail.ru/question/{id}"),
+        ..Default::default()
     }
 }
 
@@ -1423,8 +1568,13 @@ async fn answer_links(ctx: &RunCtx<'_>) {
     }
     (ctx.log)(&format!("[>] Режим по ссылкам: целей {} (по {} на каждую).", targets.len(), ctx.repeat_per));
 
+    // Ушли ли раньше конца списка. Если прошли его целиком, следующий круг по
+    // тем же ссылкам не сделает ничего: журнал отбросит их все. Без этого
+    // «Ответы по ссылке» с включёнными кругами крутились впустую до «Стоп».
+    let mut left = false;
     for (topic_id, reply_id) in targets {
         if ctx.done() {
+            left = true;
             break;
         }
         let norm = format!("https://otvet.mail.ru/question/{topic_id}");
@@ -1445,6 +1595,7 @@ async fn answer_links(ctx: &RunCtx<'_>) {
                 }
                 None => {
                     if ctx.stop.is_stopped() {
+                        left = true;
                         break;
                     }
                     (ctx.log)(&format!("   [!] Не удалось прочитать вопрос #{topic_id} — пропускаю"));
@@ -1467,8 +1618,12 @@ async fn answer_links(ctx: &RunCtx<'_>) {
         let posted = ctx.handle_one(&q).await;
         ctx.after_one(&q, posted);
         if !ctx.done() && ctx.pause_between().await {
+            left = true;
             break;
         }
+    }
+    if !left {
+        ctx.sh.exhausted.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1761,5 +1916,48 @@ mod tests {
         assert_eq!(t, "123");
         assert!(r.is_none());
         assert!(parse_answer_target("мусор").is_none());
+    }
+
+    /// Очередь номеров: каждый выдаётся один раз, возвращённый идёт первым.
+    #[test]
+    fn range_queue_hands_out_each_number_once() {
+        let q = RangeQueue::default();
+        assert_eq!(q.left(10, 12), 3);
+        assert_eq!(q.take(10, 12), Some(10));
+        assert_eq!(q.take(10, 12), Some(11));
+        assert_eq!(q.left(10, 12), 1, "два номера уже разобраны");
+
+        // Аккаунт не справился с 11 — вернул его в общую кучу.
+        q.give_back(11);
+        assert_eq!(q.left(10, 12), 2);
+        assert_eq!(q.take(10, 12), Some(11), "возвращённый должен уйти первым, он ждёт дольше");
+
+        assert_eq!(q.take(10, 12), Some(12));
+        assert_eq!(q.take(10, 12), None, "за концом диапазона номеров нет");
+        assert_eq!(q.left(10, 12), 0);
+    }
+
+    /// Отмеченные картинки — это «бери только их». Пустой список означает
+    /// «любая из пула», а отметки на давно удалённые хэши не должны оставлять
+    /// пост вовсе без картинки: тогда лучше взять любую.
+    #[test]
+    fn chosen_images_narrow_the_pool() {
+        let pool: Vec<PoolImage> = ["a", "b", "c"]
+            .iter()
+            .map(|h| PoolImage { hash: (*h).into(), width: 0, height: 0, tag: String::new() })
+            .collect();
+
+        let any = pick_n_gifs(&pool, &[], 3);
+        assert_eq!(any.len(), 3, "без отметок годится любая");
+
+        let only_b = pick_n_gifs(&pool, &["b".to_string()], 3);
+        assert_eq!(only_b.iter().map(|g| g.hash.as_str()).collect::<Vec<_>>(), vec!["b"]);
+
+        let two = pick_n_gifs(&pool, &["a".to_string(), "c".to_string()], 1);
+        assert_eq!(two.len(), 1, "просили одну");
+        assert!(matches!(two[0].hash.as_str(), "a" | "c"), "взяли не из отмеченных: {}", two[0].hash);
+
+        let stale = pick_n_gifs(&pool, &["нет-такого".to_string()], 1);
+        assert_eq!(stale.len(), 1, "отметка на удалённую картинку оставила пост без картинки");
     }
 }

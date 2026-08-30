@@ -323,6 +323,58 @@ pub async fn change_name(
     Err(format!("API не принял: {}", api_err_text(&r)))
 }
 
+/// Сколько картинок поста максимум показывать нейросети. Больше — это уже не
+/// «посмотреть, о чём речь», а деньги на ветер: каждая стоит токенов.
+pub const MAX_SEEN_IMAGES: usize = 4;
+/// Потолок на одну картинку. Что тяжелее — пропускаем: тащить в запрос к модели
+/// такое незачем, а на сайте фото обычно в пределах сотни килобайт.
+pub const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Тип картинки по её имени — для `data:`-ссылки.
+fn mime_of(src: &str) -> &'static str {
+    let low = src.to_lowercase();
+    let name = low.split('?').next().unwrap_or("");
+    if name.ends_with(".png") {
+        "image/png"
+    } else if name.ends_with(".gif") {
+        "image/gif"
+    } else if name.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/jpeg"
+    }
+}
+
+/// Картинки поста, готовые к показу нейросети.
+///
+/// Качаем сами и вкладываем в запрос: ссылку на CDN mail.ru провайдер может и не
+/// суметь открыть, а вложенная картинка работает с любым OpenAI-совместимым API,
+/// вплоть до локального. Не скачалась — пишем строку в лог и идём дальше: ответ
+/// по одному тексту лучше, чем вставший прогон.
+pub async fn fetch_images(
+    core: &Core,
+    acc: &Account,
+    srcs: &[String],
+    log: &crate::util::Log,
+    stop: &Stop,
+) -> Vec<String> {
+    if srcs.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for src in srcs.iter().take(MAX_SEEN_IMAGES) {
+        let url = crate::content::image_url(src);
+        match core.http.fetch_image(acc, &url, MAX_IMAGE_BYTES, stop).await {
+            Ok(bytes) => out.push(crate::ai::data_url(&bytes, mime_of(src))),
+            Err(e) => log(&format!("   [!] Картинку не посмотреть ({e})")),
+        }
+    }
+    if !out.is_empty() {
+        log(&format!("   [>] Показываю нейросети картинок: {}", out.len()));
+    }
+    out
+}
+
 /// Хэш картинки из чего угодно, что похоже на ссылку с CDN.
 ///
 /// Форм несколько, и это выяснилось живой заливкой: сама заливка возвращает

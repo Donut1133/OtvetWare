@@ -26,7 +26,6 @@ pub struct PoolWindow {
     account: Option<Account>,
     accounts: Vec<Account>,
     items: Vec<PoolImage>,
-    selected: std::collections::HashSet<String>,
     paste: String,
     tag: String,
     busy: Arc<Mutex<Option<String>>>,
@@ -47,10 +46,12 @@ impl PoolWindow {
 
     fn reload(&mut self, bg: &Arc<Bg>) {
         self.items = journals::load_gif_pool(&bg.core.root);
-        self.selected.retain(|h| self.items.iter().any(|i| &i.hash == h));
     }
 
-    pub fn ui(&mut self, ctx: &egui::Context, bg: &Arc<Bg>) {
+    /// `chosen` — хэши, отмеченные к использованию в текущем режиме. Окно их
+    /// же и правит: выбор картинок принадлежит режиму, а не окну, поэтому у
+    /// ответов и у вопросов он свой.
+    pub fn ui(&mut self, ctx: &egui::Context, bg: &Arc<Bg>, chosen: &mut Vec<String>) {
         if !self.open {
             return;
         }
@@ -63,7 +64,7 @@ impl PoolWindow {
             .default_size([620.0, 460.0])
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                reload = self.body(ui, bg);
+                reload = self.body(ui, bg, chosen);
             });
         self.open = open;
         if reload {
@@ -71,7 +72,7 @@ impl PoolWindow {
         }
     }
 
-    fn body(&mut self, ui: &mut Ui, bg: &Arc<Bg>) -> bool {
+    fn body(&mut self, ui: &mut Ui, bg: &Arc<Bg>, chosen: &mut Vec<String>) -> bool {
         let mut reload = false;
         ui.label(
             RichText::new("Картинки из пула прикладываются к постам без заливки — они уже на CDN сайта.")
@@ -170,19 +171,23 @@ impl PoolWindow {
 
         ui.add_space(6.0);
         ui.separator();
+        // Отметки на картинки, которых в пуле уже нет, только путают счётчик.
+        // Чистим их, но не когда пул пуст: пустой файл — это ещё и «не
+        // прочитался», и стирать по нему чужой выбор нельзя.
+        if !self.items.is_empty() {
+            chosen.retain(|h| self.items.iter().any(|i| &i.hash == h));
+        }
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("В пуле: {}", self.items.len())).color(theme::FG_STRONG));
-            if !self.selected.is_empty() {
-                ui.label(RichText::new(format!("выбрано {}", self.selected.len())).color(theme::FG_DIM));
-                if ui.button("Удалить выбранные").clicked() {
-                    // Тоже от файла, а не от показанного списка.
-                    let mut items = journals::load_gif_pool(&bg.core.root);
-                    let before = items.len();
-                    items.retain(|i| !self.selected.contains(&i.hash));
-                    save(bg, &items, &self.log);
-                    self.log.push(&format!("[+] Убрано из пула: {}", before - items.len()));
-                    self.selected.clear();
-                    reload = true;
+            if chosen.is_empty() {
+                ui.label(RichText::new("прикладывается любая").color(theme::FG_DIM));
+            } else {
+                ui.label(
+                    RichText::new(format!("прикладываются только отмеченные: {}", chosen.len()))
+                        .color(theme::FG_STRONG),
+                );
+                if ui.small_button("снять отметки").clicked() {
+                    chosen.clear();
                 }
             }
         });
@@ -202,12 +207,12 @@ impl PoolWindow {
             }
             for it in self.items.clone() {
                 ui.horizontal(|ui| {
-                    let mut on = self.selected.contains(&it.hash);
-                    if ui.checkbox(&mut on, "").changed() {
+                    let mut on = chosen.contains(&it.hash);
+                    if ui.checkbox(&mut on, "").on_hover_text("прикладывать эту").changed() {
                         if on {
-                            self.selected.insert(it.hash.clone());
+                            chosen.push(it.hash.clone());
                         } else {
-                            self.selected.remove(&it.hash);
+                            chosen.retain(|h| h != &it.hash);
                         }
                     }
                     ui.label(
@@ -225,6 +230,16 @@ impl PoolWindow {
                         ui.label(RichText::new(&it.tag).color(theme::FG_DIM).small());
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("убрать").on_hover_text("удалить из пула").clicked()
+                        {
+                            // Читаем файл заново, а не правим показанный список:
+                            // пул могла пополнить фоновая заливка.
+                            let mut items = journals::load_gif_pool(&bg.core.root);
+                            items.retain(|i| i.hash != it.hash);
+                            save(bg, &items, &self.log);
+                            self.log.push("[+] Картинка убрана из пула");
+                            reload = true;
+                        }
                         if ui.small_button("копировать хэш").clicked() {
                             ui.ctx().copy_text(it.hash.clone());
                         }

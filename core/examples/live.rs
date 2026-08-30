@@ -40,7 +40,7 @@ fn need(args: &[String], i: usize, what: &str) -> String {
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().cloned().unwrap_or_default();
-    let root = std::env::var("OTVET_ROOT").unwrap_or_else(|_| ".".into());
+    let root = Core::find_root();
     let core = Core::open(&root);
     let stop = Stop::new();
     let log = logger();

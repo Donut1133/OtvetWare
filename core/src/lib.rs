@@ -51,7 +51,50 @@ pub struct Core {
     warm: Mutex<HashMap<String, (Instant, api::Validation)>>,
 }
 
+/// Выбор папки данных по трём подсказкам. Вынесено из [`Core::find_root`]
+/// отдельно: переменные окружения и текущая папка — состояние всего процесса,
+/// а так порядок поиска можно проверить тестом.
+fn root_from(
+    env: Option<String>,
+    exe_dir: Option<std::path::PathBuf>,
+    cwd: std::path::PathBuf,
+) -> std::path::PathBuf {
+    if let Some(r) = env.filter(|r| !r.trim().is_empty()) {
+        return std::path::PathBuf::from(r);
+    }
+    if let Some(portable) = exe_dir.map(|d| d.join("accounts")) {
+        if portable.join("accounts.json").exists() {
+            return portable;
+        }
+    }
+    let mut at = cwd.as_path();
+    loop {
+        if at.join("accounts.json").exists() {
+            return at.to_path_buf();
+        }
+        match at.parent() {
+            Some(p) => at = p,
+            None => return cwd.clone(),
+        }
+    }
+}
+
 impl Core {
+    /// Где лежат данные, если никто не сказал явно.
+    ///
+    /// Порядок: `OTVET_ROOT` → папка `accounts` рядом с программой → первая
+    /// папка вверх от текущей, где лежит `accounts.json` → сама текущая. Нужен
+    /// примерам и скриптам: интерфейс ищет богаче (он умеет ещё и собирать
+    /// портативную папку), но «запустил из клона и получил пустой список
+    /// аккаунтов» не должно случаться нигде.
+    pub fn find_root() -> std::path::PathBuf {
+        root_from(
+            std::env::var("OTVET_ROOT").ok(),
+            std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)),
+            std::env::current_dir().unwrap_or_else(|_| ".".into()),
+        )
+    }
+
     pub fn open(root: impl AsRef<Path>) -> Arc<Self> {
         let root = root.as_ref().to_path_buf();
         let accounts = Arc::new(AccountsStore::open(&root));
@@ -138,5 +181,46 @@ impl RunOutcome {
     }
     pub fn blocked() -> Self {
         Self { blocked: true, ..Default::default() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::root_from;
+
+    /// Порядок поиска папки данных: переменная, портативная папка рядом с
+    /// программой, потом первая папка вверх от текущей с `accounts.json`.
+    /// Ошибка тут выглядит как «запустил из клона — аккаунтов нет».
+    #[test]
+    fn data_folder_is_found_in_the_right_order() {
+        let dir = std::env::temp_dir().join(format!("otvetware-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let deep = dir.join("проект").join("rust");
+        std::fs::create_dir_all(&deep).unwrap();
+        let exe = dir.join("рядом");
+        std::fs::create_dir_all(exe.join("accounts")).unwrap();
+
+        // Переменная важнее всего остального, даже если по ней ничего нет.
+        assert_eq!(
+            root_from(Some("C:/явно".into()), Some(exe.clone()), deep.clone()),
+            std::path::PathBuf::from("C:/явно")
+        );
+        // Пустая переменная — это «не задано», а не «искать в пустоте».
+        assert_eq!(root_from(Some("  ".into()), None, dir.clone()), dir);
+
+        // Портативная папка считается только когда в ней есть accounts.json.
+        assert_eq!(root_from(None, Some(exe.clone()), dir.clone()), dir);
+        std::fs::write(exe.join("accounts").join("accounts.json"), "[]").unwrap();
+        assert_eq!(root_from(None, Some(exe.clone()), dir.clone()), exe.join("accounts"));
+
+        // Иначе — вверх от текущей папки до первой с файлом аккаунтов.
+        std::fs::write(dir.join("проект").join("accounts.json"), "[]").unwrap();
+        assert_eq!(root_from(None, None, deep.clone()), dir.join("проект"));
+        // Не нашли вообще ничего — работаем там, где стоим.
+        let lonely = dir.join("пусто");
+        std::fs::create_dir_all(&lonely).unwrap();
+        assert_eq!(root_from(None, None, lonely.clone()), lonely);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
