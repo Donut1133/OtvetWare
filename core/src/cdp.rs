@@ -33,7 +33,18 @@ pub struct Harvest {
     pub ua: String,
 }
 
+/// Страница входа в почту — с неё начинается добыча кук.
+const LOGIN_URL: &str = "https://account.mail.ru/login";
+
 pub fn chrome_path(root: &Path) -> Option<PathBuf> {
+    // Явный путь важнее всего: так подключают портативную сборку или браузер,
+    // установленный не туда, куда принято.
+    if let Ok(p) = std::env::var("OTVET_BROWSER") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
     // Сначала — сборка, лежащая рядом (та же, чью версию обещает персона).
     // Смотрим и в папку данных, и рядом с самой программой: при портативной
     // раскладке данные лежат в `accounts`, а тяжёлые `browsers` обычно остаются
@@ -55,7 +66,9 @@ pub fn chrome_path(root: &Path) -> Option<PathBuf> {
             }
         }
     }
-    // Затем — системный Chrome.
+    // Затем — системный Chrome. Edge сюда намеренно НЕ добавлен: персона
+    // представляется Chrome, а client hints у Edge свои, и запуск под ним даёт
+    // расхождение UA с брендами — сигнал заметнее, чем отсутствие браузера.
     for p in [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -345,6 +358,10 @@ async fn browser_proxy_arg(proxy: Option<&str>, stop: &Stop, log: &Log) -> Optio
 
 // ─── CDP ────────────────────────────────────────────────────────────────────
 
+/// Сколько ждём ответа на управляющую команду. Столько браузер не думает
+/// никогда — потолок нужен ровно на случай, когда он не ответит вовсе.
+const CDP_WAIT: Duration = Duration::from_secs(10);
+
 struct Cdp {
     ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
     next_id: i64,
@@ -372,30 +389,197 @@ impl Cdp {
     }
 
     async fn call(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.send(method, params, None, CDP_WAIT).await
+    }
+
+    /// Команда в конкретную вкладку. Домены `Page` и `Emulation` живут не в
+    /// браузере целиком, а в сессии страницы — без `sessionId` они просто не
+    /// адресуются, и подмена отпечатка молча никуда не применяется.
+    async fn call_in(&mut self, session: &str, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.send(method, params, Some(session), CDP_WAIT).await
+    }
+
+    /// Перейти на страницу. Ответ приходит, когда переход НАЧАЛСЯ, а не когда
+    /// страница догрузилась, — но по медленному прокси и это небыстро, поэтому
+    /// ждём дольше обычного, а молчание считаем «идёт, просто медленно»: окно
+    /// уже открыто, и убивать его из-за неответа нечестно.
+    async fn navigate(&mut self, session: &str, url: &str) -> anyhow::Result<()> {
+        let params = serde_json::json!({ "url": url });
+        match self.send("Page.navigate", params, Some(session), Duration::from_secs(45)).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("не ответил") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn send(
+        &mut self,
+        method: &str,
+        params: Value,
+        session: Option<&str>,
+        wait_for: Duration,
+    ) -> anyhow::Result<Value> {
         use futures::{SinkExt, StreamExt};
         let id = self.next_id;
         self.next_id += 1;
-        let msg = serde_json::json!({ "id": id, "method": method, "params": params });
-        self.ws.send(tokio_tungstenite::tungstenite::Message::Text(msg.to_string())).await?;
-        // Ответы перемешаны с событиями — ждём свой id.
-        while let Some(m) = self.ws.next().await {
-            let m = m?;
-            let Ok(txt) = m.into_text() else { continue };
-            let Ok(v) = serde_json::from_str::<Value>(&txt) else { continue };
-            if v.get("id").and_then(|x| x.as_i64()) == Some(id) {
-                if let Some(err) = v.get("error") {
-                    anyhow::bail!("CDP {method}: {err}");
-                }
-                return Ok(v.get("result").cloned().unwrap_or(Value::Null));
-            }
+        let mut msg = serde_json::json!({ "id": id, "method": method, "params": params });
+        if let Some(sid) = session {
+            msg["sessionId"] = Value::String(sid.to_string());
         }
-        anyhow::bail!("CDP: соединение закрылось до ответа")
+        self.ws.send(tokio_tungstenite::tungstenite::Message::Text(msg.to_string())).await?;
+        // Ответы перемешаны с событиями — ждём свой id. С потолком по времени:
+        // на некоторые команды сборка браузера может не ответить вовсе, и без
+        // него вход зависал бы навсегда вместо того, чтобы пойти дальше.
+        let wait = async {
+            while let Some(m) = self.ws.next().await {
+                let m = m?;
+                let Ok(txt) = m.into_text() else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(&txt) else { continue };
+                if v.get("id").and_then(|x| x.as_i64()) == Some(id) {
+                    if let Some(err) = v.get("error") {
+                        anyhow::bail!("CDP {method}: {err}");
+                    }
+                    return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+                }
+            }
+            anyhow::bail!("CDP: соединение закрылось до ответа")
+        };
+        match tokio::time::timeout(wait_for, wait).await {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!("CDP {method}: браузер не ответил"),
+        }
+    }
+
+    /// Подключиться к первой вкладке-странице. Возвращает `sessionId`, которым
+    /// дальше адресуются команды страницы.
+    async fn attach_page(&mut self) -> anyhow::Result<String> {
+        let list = self.call("Target.getTargets", serde_json::json!({})).await?;
+        let target = list
+            .get("targetInfos")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.iter().find(|t| t.get("type").and_then(|v| v.as_str()) == Some("page")))
+            .and_then(|t| t.get("targetId").and_then(|v| v.as_str()).map(String::from))
+            .ok_or_else(|| anyhow::anyhow!("браузер не открыл ни одной вкладки"))?;
+        // flatten — сессия поверх того же сокета, отдельное соединение не нужно.
+        let r = self
+            .call("Target.attachToTarget", serde_json::json!({ "targetId": target, "flatten": true }))
+            .await?;
+        r.get("sessionId")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("CDP не выдал сессию вкладки"))
     }
 
     /// Все куки браузера (не только текущей вкладки).
     async fn cookies(&mut self) -> anyhow::Result<Vec<Value>> {
         let r = self.call("Storage.getCookies", serde_json::json!({})).await?;
         Ok(r.get("cookies").and_then(|c| c.as_array()).cloned().unwrap_or_default())
+    }
+}
+
+/// Инжект отпечатка, дословно перенесённый из JS-версии — см. `stealth.js`.
+const STEALTH_JS: &str = include_str!("stealth.js");
+
+/// Конфиг для инжекта: ровно те поля, которые читает `stealth.js`, и под теми же
+/// именами. Персона у двух версий общая, поэтому имена трогать нельзя.
+fn payload_config(p: &Persona) -> Value {
+    serde_json::json!({
+        "screen": p.screen,
+        "hardwareConcurrency": p.hardware_concurrency,
+        "deviceMemory": p.device_memory,
+        "maxTouchPoints": p.max_touch_points,
+        "languages": p.languages,
+        "gpu": p.gpu,
+        "connection": p.connection,
+        "noise": p.noise,
+    })
+}
+
+/// Исходник инжекта с зашитым конфигом — в той форме, которую ждёт
+/// `Page.addScriptToEvaluateOnNewDocument`.
+fn stealth_source(p: &Persona) -> String {
+    format!("({STEALTH_JS})({});", payload_config(p))
+}
+
+/// Надеть на вкладку отпечаток персоны.
+///
+/// До этого браузеру доставались только UA, язык и размер окна, а таймзона,
+/// экран, ядра, память, GPU и шум canvas вычислялись на каждый аккаунт и
+/// выбрасывались. Тридцать входов с одной машины отдавали один и тот же canvas
+/// и одно железо — то есть для антифрода это был один человек с тридцатью
+/// аккаунтами, и прокси тут не помогали.
+///
+/// Порядок важен: инжект регистрируется ДО перехода на страницу, иначе первый
+/// же документ успевает прочитать настоящие значения.
+async fn wear_persona(cdp: &mut Cdp, session: &str, p: &Persona, log: &Log) -> anyhow::Result<()> {
+    cdp.call_in(session, "Page.enable", serde_json::json!({})).await?;
+    // Инжект регистрируется РОВНО один раз: он ставит шум canvas, и второй
+    // проход положил бы шум поверх шума — отпечаток аккаунта перестал бы быть
+    // постоянным и зависел бы от того, сколько раз мы его навесили.
+    cdp.call_in(
+        session,
+        "Page.addScriptToEvaluateOnNewDocument",
+        serde_json::json!({ "source": stealth_source(p) }),
+    )
+    .await?;
+    apply_emulation(cdp, session, p, log).await;
+    log(&format!(
+        "[>] Отпечаток аккаунта: экран {}x{}, ядер {}, {}, {}",
+        p.screen.width,
+        p.screen.height,
+        p.hardware_concurrency,
+        p.timezone_id,
+        crate::util::clip(&p.gpu.renderer, 40)
+    ));
+    Ok(())
+}
+
+/// Подмены уровня браузера. Вынесены отдельно, потому что их приходится
+/// применять ПОВТОРНО: при переходе на другой сайт Chrome может сменить процесс
+/// отрисовки, а вместе с ним теряются и оверрайды. Замерено живьём — до этой
+/// правки страница видела настоящую таймзону и настоящее число ядер, хотя
+/// команды уходили без ошибок. Инжект так не теряется: он регистрируется на
+/// страницу и переживает переходы, поэтому и вызывается один раз.
+async fn apply_emulation(cdp: &mut Cdp, session: &str, p: &Persona, log: &Log) {
+    // Метаданные UA — ключевая часть: из них Chrome сам собирает и
+    // navigator.userAgentData, и заголовки Sec-CH-UA. Без них UA скажет одно, а
+    // client hints другое, и противоречие ловится одним сравнением.
+    let m = &p.ua_metadata;
+    let ua = cdp
+        .call_in(
+            session,
+            "Emulation.setUserAgentOverride",
+            serde_json::json!({
+                "userAgent": p.ua,
+                "acceptLanguage": p.accept_language,
+                "platform": p.platform,
+                "userAgentMetadata": m,
+            }),
+        )
+        .await;
+    if let Err(e) = ua {
+        log(&format!("[!] Отпечаток: не встали метаданные UA ({e})"));
+    }
+
+    // Дальше — по одной необязательной подмене. Каждая может отсутствовать в
+    // конкретной сборке браузера, и терять из-за этого всё остальное незачем.
+    for (method, params) in [
+        ("Emulation.setTimezoneOverride", serde_json::json!({ "timezoneId": p.timezone_id })),
+        ("Emulation.setLocaleOverride", serde_json::json!({ "locale": p.locale })),
+        (
+            "Emulation.setHardwareConcurrencyOverride",
+            serde_json::json!({ "hardwareConcurrency": p.hardware_concurrency }),
+        ),
+        (
+            "Emulation.setEmulatedMedia",
+            serde_json::json!({
+                "features": [{ "name": "prefers-color-scheme", "value": p.color_scheme }]
+            }),
+        ),
+    ] {
+        if let Err(e) = cdp.call_in(session, method, params).await {
+            log(&format!("[!] Отпечаток: {method} не применился ({e})"));
+        }
     }
 }
 
@@ -440,7 +624,9 @@ pub async fn open_as(
     log: &Log,
 ) -> anyhow::Result<()> {
     let chrome = chrome_path(root).ok_or_else(|| {
-        anyhow::anyhow!("не найден Chromium: положи сборку в browsers/ или установи Google Chrome")
+        anyhow::anyhow!(
+            "не найден браузер. Нужен Chrome или Edge — обычно Edge уже стоит в Windows. Если браузер портативный, положи его папку в browsers/ рядом с программой"
+        )
     })?;
     let port = free_port().await?;
     std::fs::create_dir_all(profile_dir).ok();
@@ -455,13 +641,24 @@ pub async fn open_as(
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-blink-features=AutomationControlled")
+        // WebRTC умеет ходить по UDP мимо HTTP-прокси и через STUN отдать
+        // настоящий IP. Для аккаунта на прокси это мгновенный деанон.
+        .arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+        // UA ставим ещё и флагом: первый сетевой запрос успевает уйти раньше,
+        // чем применится подмена по CDP, и на нём светился бы настоящий.
         .arg(format!("--user-agent={}", persona.ua))
         .arg(format!("--lang={}", persona.locale))
+        .arg(format!("--accept-lang={}", persona.accept_language))
         .arg(format!("--window-size={},{}", persona.window.width, persona.window.height))
         .arg("about:blank");
     if let Some(p) = browser_proxy_arg(proxy, &alive, log).await {
         log(&format!("[>] Браузер через прокси: {}", crate::proxy::mask_proxy(&p)));
         cmd.arg(format!("--proxy-server={p}"));
+    }
+    // DPR флагом = настоящий DPR. Подменять его из JS нельзя: разойдутся
+    // window.devicePixelRatio и matchMedia('(resolution: Ndppx)') — дешёвая проверка.
+    if (persona.dpr - 1.0).abs() > f64::EPSILON {
+        cmd.arg(format!("--force-device-scale-factor={}", persona.dpr));
     }
     cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("не запустить браузер: {e}"))?;
@@ -499,31 +696,27 @@ pub async fn open_as(
         alive.stop();
         return Err(anyhow::anyhow!("не удалось поставить куки: {e}"));
     }
-    if let Err(e) = cdp.call("Target.createTarget", serde_json::json!({ "url": url })).await {
+    // Дальше работаем в ТОЙ ЖЕ пустой вкладке, а не открываем новую: отпечаток
+    // надо надеть до первого документа, а `Target.createTarget` с адресом
+    // навигирует сразу — инжект уже не успел бы.
+    let session = match cdp.attach_page().await {
+        Ok(sid) => sid,
+        Err(e) => {
+            let _ = child.kill().await;
+            alive.stop();
+            return Err(e);
+        }
+    };
+    if let Err(e) = wear_persona(&mut cdp, &session, persona, log).await {
+        log(&format!("[!] Отпечаток не встал целиком ({e}) — открываю как есть."));
+    }
+    if let Err(e) = cdp.navigate(&session, url).await {
         let _ = child.kill().await;
         alive.stop();
-        return Err(anyhow::anyhow!("не удалось открыть вкладку: {e}"));
+        return Err(anyhow::anyhow!("не удалось открыть страницу: {e}"));
     }
-    // Стартовую пустую вкладку закрываем: она нужна была только чтобы куки
-    // легли ДО первой загрузки страницы.
-    if let Ok(list) = cdp.call("Target.getTargets", serde_json::json!({})).await {
-        let blanks: Vec<String> = list
-            .get("targetInfos")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter(|t| {
-                        t.get("type").and_then(|v| v.as_str()) == Some("page")
-                            && t.get("url").and_then(|v| v.as_str()) == Some("about:blank")
-                    })
-                    .filter_map(|t| t.get("targetId").and_then(|v| v.as_str()).map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for id in blanks {
-            let _ = cdp.call("Target.closeTarget", serde_json::json!({ "targetId": id })).await;
-        }
-    }
+    // Переход мог сменить процесс отрисовки — навешиваем подмены заново.
+    apply_emulation(&mut cdp, &session, persona, log).await;
     log(&format!("[+] Браузер открыт, кук перенесено: {n}"));
 
     // Ждём, пока человек закроет окно, — только чтобы прибрать мост и не
@@ -547,7 +740,9 @@ pub async fn login_and_harvest(
     stop: &Stop,
 ) -> anyhow::Result<Harvest> {
     let chrome = chrome_path(root).ok_or_else(|| {
-        anyhow::anyhow!("не найден Chromium: положи сборку в browsers/ или установи Google Chrome")
+        anyhow::anyhow!(
+            "не найден браузер. Нужен Chrome или Edge — обычно Edge уже стоит в Windows. Если браузер портативный, положи его папку в browsers/ рядом с программой"
+        )
     })?;
     let port = free_port().await?;
     std::fs::create_dir_all(profile_dir).ok();
@@ -559,11 +754,19 @@ pub async fn login_and_harvest(
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-blink-features=AutomationControlled")
+        // WebRTC умеет ходить по UDP мимо HTTP-прокси и через STUN отдать
+        // настоящий IP. Для аккаунта на прокси это мгновенный деанон.
+        .arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+        // UA ставим ещё и флагом: первый сетевой запрос успевает уйти раньше,
+        // чем применится подмена по CDP, и на нём светился бы настоящий.
         .arg(format!("--user-agent={}", persona.ua))
         .arg(format!("--lang={}", persona.locale))
+        .arg(format!("--accept-lang={}", persona.accept_language))
         .arg(format!("--window-size={},{}", persona.window.width, persona.window.height))
         .arg(format!("--window-position={},{}", persona.window.left, persona.window.top))
-        .arg("https://account.mail.ru/login");
+        // Стартуем с пустой вкладки: отпечаток надо надеть ДО первого документа,
+        // а страница входа, открытая флагом, начала бы грузиться раньше.
+        .arg("about:blank");
     if let Some(p) = browser_proxy_arg(proxy, stop, log).await {
         log(&format!("[>] Браузер через прокси: {}", crate::proxy::mask_proxy(&p)));
         cmd.arg(format!("--proxy-server={p}"));
@@ -571,6 +774,11 @@ pub async fn login_and_harvest(
 
     // Chromium щедро сыплет в stderr предупреждениями про песочницу и GCM.
     // Пользователю это не нужно, а в GUI консоли и нет — глушим.
+    // DPR флагом = настоящий DPR. Подменять его из JS нельзя: разойдутся
+    // window.devicePixelRatio и matchMedia('(resolution: Ndppx)') — дешёвая проверка.
+    if (persona.dpr - 1.0).abs() > f64::EPSILON {
+        cmd.arg(format!("--force-device-scale-factor={}", persona.dpr));
+    }
     cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
 
     log("[>] Открываю браузер — войди в аккаунт вручную. Окно закроется само.");
@@ -583,6 +791,26 @@ pub async fn login_and_harvest(
             return Err(e);
         }
     };
+
+    // Персона на вкладку — и только потом переход на страницу входа. Именно
+    // здесь мы и показываемся сайту живым браузером: тридцать входов с одной
+    // машины должны выглядеть как тридцать разных машин.
+    match cdp.attach_page().await {
+        Ok(session) => {
+            if let Err(e) = wear_persona(&mut cdp, &session, persona, log).await {
+                log(&format!("[!] Отпечаток не встал целиком ({e}) — вход как есть."));
+            }
+            if let Err(e) = cdp.navigate(&session, LOGIN_URL).await {
+                let _ = child.kill().await;
+                return Err(anyhow::anyhow!("не открылась страница входа: {e}"));
+            }
+            apply_emulation(&mut cdp, &session, persona, log).await;
+        }
+        Err(e) => {
+            let _ = child.kill().await;
+            return Err(e);
+        }
+    }
 
     // Ждём появления авторизационных кук. Гостевой визит ставит десяток кук,
     // поэтому смотрим именно на Mpop/Auth-Token, а не на их количество.
@@ -632,6 +860,59 @@ pub async fn login_and_harvest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// В инжект должны уезжать значения ИМЕННО этой персоны. Если конфиг
+    /// разъедется с тем, что читает `stealth.js`, подмена молча не сработает:
+    /// ошибки не будет, просто у всех аккаунтов снова одно железо.
+    #[test]
+    fn the_injected_fingerprint_belongs_to_the_persona() {
+        let root = std::path::Path::new(".");
+        let a = crate::persona::build_persona("Аккаунт 1", &crate::persona::PersonaOpts::default(), root);
+        let b = crate::persona::build_persona("Аккаунт 2", &crate::persona::PersonaOpts::default(), root);
+
+        let cfg = payload_config(&a);
+        // Ровно те восемь полей, которые читает stealth.js, и под теми же именами.
+        let mut keys: Vec<&str> = cfg.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "connection",
+                "deviceMemory",
+                "gpu",
+                "hardwareConcurrency",
+                "languages",
+                "maxTouchPoints",
+                "noise",
+                "screen"
+            ],
+            "состав конфига разошёлся с тем, что ждёт stealth.js"
+        );
+        assert_eq!(cfg["hardwareConcurrency"], a.hardware_concurrency);
+        assert_eq!(cfg["deviceMemory"], a.device_memory);
+        assert_eq!(cfg["screen"]["width"], a.screen.width);
+        assert_eq!(cfg["gpu"]["renderer"], a.gpu.renderer);
+
+        // Исходник — самовызывающаяся функция с зашитым конфигом, и в ней видны
+        // значения аккаунта, а не заглушки.
+        let src = stealth_source(&a);
+        assert!(
+            src.starts_with("(//")
+                || src.starts_with("(function")
+                || src.starts_with(
+                    "(
+"
+                ),
+            "{}",
+            &src[..40]
+        );
+        assert!(src.trim_end().ends_with(");"), "инжект не самовызывающийся");
+        assert!(src.contains(&a.gpu.renderer), "GPU персоны не попал в инжект");
+        assert!(src.contains(&a.screen.width.to_string()), "экран персоны не попал в инжект");
+
+        // И у другого аккаунта отпечаток другой — иначе весь слой бессмыслен.
+        assert_ne!(payload_config(&a), payload_config(&b), "две персоны дали один отпечаток");
+    }
 
     #[test]
     fn picks_only_mailru_cookies() {
