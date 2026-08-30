@@ -13,7 +13,8 @@ use crate::api;
 use crate::content::{doc_to_text, doc_with_image, gallery_from_pool, image_gallery_node};
 use crate::http::{HttpError, ReqOpts};
 use crate::journals::{self, PoolImage};
-use crate::util::{clip, pick_one, rand_range, shuffle, Log, Stop};
+use crate::uniq::{uniquify, UniqMode};
+use crate::util::{clip, pick_one, rand_range, shuffle, Log, Progress, Stop};
 use crate::{Core, RunOutcome};
 use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
@@ -79,6 +80,13 @@ pub enum TargetMode {
     Feed,
     /// Конкретные ссылки.
     Links,
+    /// Диапазон номеров вопросов — в том числе ещё не заданных.
+    ///
+    /// Номера у mail.ru идут подряд, а ответ принимается и на тот вопрос,
+    /// которого пока нет: он «дождётся» автора. Текст берётся только готовый —
+    /// вопроса ещё не существует, нейросети не о чем писать, а проверять
+    /// «остался ли ответ на месте» бессмысленно по той же причине.
+    Range,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -91,11 +99,38 @@ pub enum ImageMode {
     Upload { dir: String },
 }
 
+/// Разбор списка слов: по строкам, запятым и точкам с запятой, в нижний
+/// регистр, без повторов. Пустые куски выбрасываем — список набирают на ходу.
+pub fn parse_keywords(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in text.split([',', '\n', ';']) {
+        let w = w.trim().to_lowercase();
+        if !w.is_empty() && !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// Есть ли в вопросе хоть одно слово из списка. Ищем подстрокой и в заголовке,
+/// и в теле: «vpn» найдётся и в «VPN-сервис», и в «нужен впн». Пустой список
+/// пропускает всё.
+pub fn has_keyword(words: &[String], q: &Question) -> bool {
+    if words.is_empty() {
+        return true;
+    }
+    let hay = format!("{} {}", q.title, q.body).to_lowercase();
+    words.iter().any(|w| hay.contains(w))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnswerParams {
     pub mode: AnswerMode,
     pub target: TargetMode,
     pub links: Vec<String>,
+    /// Границы диапазона номеров (включительно) для `TargetMode::Range`.
+    pub range_from: i64,
+    pub range_to: i64,
     /// Лимит ответов на аккаунт за проход (0 = без лимита).
     pub limit: i64,
     pub delay_min: f64,
@@ -119,8 +154,20 @@ pub struct AnswerParams {
     pub convo_budget_k: f64,
     /// Не отвечать на то, что уже отвечали ДРУГИЕ аккаунты.
     pub skip_others: bool,
-    /// Дописывать «#123456» для уникальности.
-    pub random_tag: bool,
+    /// Не отвечать на вопросы, заданные своими же аккаунтами.
+    pub skip_own_authors: bool,
+    /// Слова-приметы: если список не пуст, бот берёт только те вопросы, где
+    /// встретилось хотя бы одно. Текст ответа при этом обычный — нейросетью или
+    /// готовыми фразами, как выбрано в режиме.
+    pub keywords: Vec<String>,
+    /// Уникализация текста вместо старого «#123456».
+    pub uniq: UniqMode,
+    /// Подменять похожие буквы латиницей (по умолчанию нет — см. uniq.rs).
+    pub uniq_latin: bool,
+    /// Проверять, что ответ реально появился на сайте.
+    pub verify_posted: bool,
+    /// Сколько ждать перед проверкой, сек.
+    pub verify_delay_sec: f64,
     pub signature: String,
     pub noai_answers: Vec<String>,
     pub image: ImageMode,
@@ -130,6 +177,9 @@ pub struct AnswerParams {
     pub custom_prompt: String,
     pub mention: String,
     pub check_auth: bool,
+    /// Живой счётчик для интерфейса. В файл не пишется.
+    #[serde(skip)]
+    pub progress: Progress,
 }
 
 impl Default for AnswerParams {
@@ -138,6 +188,8 @@ impl Default for AnswerParams {
             mode: AnswerMode::Ai,
             target: TargetMode::Feed,
             links: vec![],
+            range_from: 0,
+            range_to: 0,
             limit: 5,
             delay_min: 20.0,
             delay_max: 45.0,
@@ -151,7 +203,12 @@ impl Default for AnswerParams {
             conversational: false,
             convo_budget_k: 60.0,
             skip_others: false,
-            random_tag: false,
+            skip_own_authors: true,
+            keywords: vec![],
+            uniq: UniqMode::Off,
+            uniq_latin: false,
+            verify_posted: true,
+            verify_delay_sec: 6.0,
             signature: String::new(),
             noai_answers: vec![],
             image: ImageMode::Off,
@@ -161,6 +218,7 @@ impl Default for AnswerParams {
             custom_prompt: String::new(),
             mention: String::new(),
             check_auth: true,
+            progress: Progress::new(),
         }
     }
 }
@@ -189,11 +247,14 @@ pub async fn collect_questions(
     acc: &Account,
     exclude: &HashSet<String>,
     tried: &HashSet<String>,
+    mine: &HashSet<String>,
     recent: i64,
     stop: &Stop,
 ) -> Result<Vec<Question>, HttpError> {
     let r = core
         .http
+        // Больше 20 сайт за раз не отдаёт, сколько ни проси (проверено живьём):
+        // `limit=50` возвращает те же 20. Интерфейс поэтому и не даёт больше.
         .request(acc, &format!("/api/topic/feed?limit={recent}&pos=0&dir=0&sort=id"), ReqOpts::get(), stop)
         .await?;
     let feed =
@@ -210,6 +271,11 @@ pub async fn collect_questions(
             continue;
         }
         let a = it.get("author").cloned().unwrap_or(Value::Null);
+        // Свой же вопрос отвечать незачем: два своих аккаунта в одной ветке —
+        // готовая связка для модерации, да и карма от этого не растёт.
+        if is_mine(&a, mine) {
+            continue;
+        }
         out.push(Question {
             id: id.to_string(),
             norm,
@@ -227,6 +293,33 @@ pub async fn collect_questions(
         });
     }
     Ok(out)
+}
+
+/// Автор вопроса — один из наших аккаунтов? Сверяем и по id, и по нику:
+/// в ленте приходит то одно, то другое.
+pub fn is_mine(author: &Value, mine: &HashSet<String>) -> bool {
+    if mine.is_empty() {
+        return false;
+    }
+    let id = author.get("id").and_then(|v| v.as_i64()).map(|i| i.to_string());
+    let user = author.get("username").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
+    id.map(|i| mine.contains(&i)).unwrap_or(false) || user.map(|u| mine.contains(&u)).unwrap_or(false)
+}
+
+/// Ключи своих аккаунтов: id и ники в нижнем регистре.
+pub fn my_keys(core: &Core) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for a in core.accounts.all() {
+        if let Some(id) = a.user_id {
+            out.insert(id.to_string());
+        }
+        if let Some(u) = a.username.as_deref() {
+            if !u.is_empty() {
+                out.insert(u.to_lowercase());
+            }
+        }
+    }
+    out
 }
 
 /// Один вопрос по id — нужен, когда отвечаем по прямой ссылке.
@@ -264,7 +357,9 @@ pub async fn fetch_question(core: &Core, acc: &Account, topic_id: &str, stop: &S
 pub fn parse_answer_target(raw: &str) -> Option<(String, Option<String>)> {
     let s = raw.trim();
     let q = crate::votes::parse_target_id(s)?;
-    let topic = regex_capture(s, r"/question/(\d+)")?;
+    // Регулярка одна на процесс: собирать её на каждую ссылку — это заметные
+    // сотни микросекунд там, где ссылок тысячи.
+    let topic = crate::votes::topic_id_from_url(s)?;
     let reply = match q.kind {
         crate::votes::Kind::Reply => Some(q.id),
         crate::votes::Kind::Topic => None,
@@ -272,16 +367,47 @@ pub fn parse_answer_target(raw: &str) -> Option<(String, Option<String>)> {
     Some((topic, reply))
 }
 
-fn regex_capture(s: &str, pat: &str) -> Option<String> {
-    regex::Regex::new(pat).ok()?.captures(s)?.get(1).map(|m| m.as_str().to_string())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Чем кончилась попытка отправить.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PostRes {
     Ok(i64),
     /// Антибот mail.ru: дальше по этому аккаунту идти нельзя.
     Blocked,
+    /// Сайт отказался принимать ИМЕННО ЭТОТ текст: 4xx, но не антибот. Ответ
+    /// при этом не создан, поэтому можно спокойно пробовать другим текстом —
+    /// в отличие от сетевого сбоя, где неизвестно, дошло или нет.
+    Rejected(String),
+    /// Прочая неудача: сеть, 5xx, непонятный ответ. Дошло или нет — неизвестно,
+    /// поэтому повторять тот же шаг нельзя.
     Failed,
+}
+
+/// Короткая причина отказа: в логе должно быть видно, ЧЕМ текст не понравился,
+/// а не только «HTTP 400».
+pub fn refusal_reason(r: &crate::http::Resp) -> String {
+    let from_json = r.json.as_ref().and_then(|j| {
+        for key in ["error", "message", "detail", "description", "reason"] {
+            match j.get(key) {
+                Some(Value::String(s)) if !s.trim().is_empty() => return Some(s.trim().to_string()),
+                Some(Value::Object(o)) => {
+                    for inner in ["message", "description", "text"] {
+                        if let Some(Value::String(s)) = o.get(inner) {
+                            if !s.trim().is_empty() {
+                                return Some(s.trim().to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    });
+    match from_json {
+        Some(m) => format!("HTTP {}: {}", r.status, crate::util::clip(&m, 90)),
+        None if r.text.trim().is_empty() => format!("HTTP {}", r.status),
+        None => format!("HTTP {}: {}", r.status, r.snippet(90)),
+    }
 }
 
 /// Отправка ответа: POST /api/topic/answers.
@@ -322,7 +448,7 @@ pub async fn post_answer(
         Err(e) => {
             // Транзитная сеть/прокси не должна валить весь аккаунт: считаем
             // ответ неотправленным и идём дальше.
-            log(&format!("   ⚠️  Сеть/прокси при отправке ({e}) — не отправлено, продолжаю."));
+            log(&format!("   [!] Сеть/прокси при отправке ({e}) — не отправлено, продолжаю."));
             return Ok(PostRes::Failed);
         }
     };
@@ -332,17 +458,74 @@ pub async fn post_answer(
     if let Some(id) = r.result().and_then(|res| res.get("id")).and_then(|v| v.as_i64()) {
         return Ok(PostRes::Ok(id));
     }
+    // 4xx (кроме антибота) — отказ по содержимому: сайт ничего не создал, и
+    // повторять с ДРУГИМ текстом безопасно.
+    if (400..500).contains(&r.status) {
+        return Ok(PostRes::Rejected(refusal_reason(&r)));
+    }
     if !r.ok {
-        log(&format!("   ⚠️  Ответ не прошёл: HTTP {} {}", r.status, r.snippet(120)));
+        log(&format!("   [!] Ответ не прошёл: HTTP {} {}", r.status, r.snippet(120)));
     }
     Ok(PostRes::Failed)
 }
 
-// ─── Текст ответа ───────────────────────────────────────────────────────────
+/// Сколько ответов сайт отдаёт одной страницей. Точное число неважно: важно не
+/// принять «страница кончилась» за «ответа нет».
+const PAGE_GUESS: usize = 20;
 
-pub fn with_random_tag(text: &str) -> String {
-    format!("{text} #{}", rand_range(100_000, 999_999))
+/// Виден ли отправленный ответ на сайте.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verify {
+    /// Ответ на месте.
+    Present,
+    /// Ответа нет — снесла автомодерация.
+    Missing,
+    /// Проверить не вышло (сеть, антибот) — наказывать не за что.
+    Unknown,
 }
+
+/// Проверить, что ответ действительно опубликован.
+///
+/// mail.ru отвечает «принято» и на то, что через несколько секунд удалит
+/// автомодерация: id в ответе есть, а самого ответа под вопросом нет. Без этой
+/// проверки бот считает такие ответы отправленными и идёт дальше, а вопрос
+/// остаётся без ответа — и в журнале записан как отвеченный.
+pub async fn verify_answer(core: &Core, acc: &Account, topic_id: &str, reply_id: i64, stop: &Stop) -> Verify {
+    let Ok(r) = core.http.request(acc, &format!("/api/topic/answers/{topic_id}"), ReqOpts::get(), stop).await
+    else {
+        return Verify::Unknown;
+    };
+    if r.blocked || !r.ok {
+        return Verify::Unknown;
+    }
+    let Some(res) = r.result() else { return Verify::Unknown };
+    let mut all: Vec<&Value> =
+        res.get("replies").and_then(|v| v.as_array()).map(|a| a.iter().collect()).unwrap_or_default();
+    match res.get("best_replies") {
+        Some(Value::Array(a)) => all.extend(a.iter()),
+        Some(v) if !v.is_null() => all.push(v),
+        _ => {}
+    }
+    // Пустой список ответов на только что отвеченный вопрос — это не «нет
+    // ответа», а подозрительный ответ сервера: считаем неизвестным.
+    if all.is_empty() {
+        return Verify::Unknown;
+    }
+    // Ответы приходят страницей. Если страница выглядит полной, нашего ответа
+    // могло просто не хватить места — и «не нашли» тут НЕ значит «снесли».
+    // Ошибиться в эту сторону дорого: бот отправит второй ответ, и под вопросом
+    // окажутся два от одного аккаунта.
+    if all.len() >= PAGE_GUESS {
+        return Verify::Unknown;
+    }
+    if all.iter().any(|x| x.get("id").and_then(|v| v.as_i64()) == Some(reply_id)) {
+        Verify::Present
+    } else {
+        Verify::Missing
+    }
+}
+
+// ─── Текст ответа ───────────────────────────────────────────────────────────
 
 /// Подпись отделяем пустой строкой, тройные переводы схлопываем.
 pub fn with_signature(text: &str, signature: &str) -> String {
@@ -443,9 +626,16 @@ const MAX_FAILS: i64 = 5;
 
 struct Shared {
     count: AtomicI64,
+    /// Занятые места под лимитом: отправленные ответы ПЛЮС те, что прямо сейчас
+    /// уходят на сайт. Без этого счётчика параллельная пачка пробивает лимит:
+    /// все задачи успевают увидеть `count == 0` до первой отправки и постят
+    /// разом — при лимите 5 и пачке 10 уходит десять ответов.
+    reserved: AtomicI64,
     blocked: AtomicBool,
     /// Отказов подряд при отправке.
     fails: AtomicI64,
+    /// Диапазон пройден до конца, и отвечать в нём больше не на что.
+    exhausted: AtomicBool,
     /// Подряд неудачных обращений к нейросети. Ключ может умереть посреди
     /// прогона (кончился баланс), и без счётчика бот крутил бы ленту вечно,
     /// каждый раз получая отказ.
@@ -464,7 +654,36 @@ impl Shared {
         self.blocked.load(Ordering::SeqCst)
     }
     fn limit_hit(&self, limit: i64) -> bool {
-        limit > 0 && self.count() >= limit
+        limit > 0 && self.reserved.load(Ordering::SeqCst) >= limit
+    }
+    /// Занять место под лимитом перед отправкой. `false` — мест не осталось.
+    fn reserve(&self, limit: i64) -> bool {
+        if limit <= 0 {
+            return true;
+        }
+        let mut cur = self.reserved.load(Ordering::SeqCst);
+        loop {
+            if cur >= limit {
+                return false;
+            }
+            match self.reserved.compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(now) => cur = now,
+            }
+        }
+    }
+    /// Сколько ответов ещё можно отправить (при лимите 0 — сколько угодно).
+    fn remaining(&self, limit: i64) -> i64 {
+        if limit <= 0 {
+            return i64::MAX;
+        }
+        (limit - self.reserved.load(Ordering::SeqCst)).max(0)
+    }
+    /// Ответ не ушёл — место возвращаем, иначе неудачные попытки съедали бы лимит.
+    fn release(&self, limit: i64) {
+        if limit > 0 {
+            self.reserved.fetch_sub(1, Ordering::SeqCst);
+        }
     }
     fn too_many_fails(&self) -> bool {
         self.fails.load(Ordering::SeqCst) >= MAX_FAILS || self.ai_fails.load(Ordering::SeqCst) >= MAX_FAILS
@@ -480,6 +699,17 @@ pub async fn run_answerer(
     log: &Log,
     stop: &Stop,
 ) -> RunOutcome {
+    // В диапазоне вопросов ещё нет. Нейросети не о чем писать, а проверка
+    // «остался ли ответ на месте» упирается в несуществующую страницу и всегда
+    // отвечает «не знаю». Поэтому и текст, и проверку задаём здесь сами — что бы
+    // ни стояло в настройках.
+    let patched: AnswerParams;
+    let p = if p.target == TargetMode::Range {
+        patched = AnswerParams { mode: AnswerMode::NoAi, verify_posted: false, ..p.clone() };
+        &patched
+    } else {
+        p
+    };
     let mut out = RunOutcome::default();
 
     let repeat_per = p.repeat_per_question.clamp(1, 20);
@@ -503,22 +733,25 @@ pub async fn run_answerer(
         let custom = p.custom_prompt.trim();
         system_prompt =
             if custom.is_empty() { styles.prompt(&p.style, "answer") } else { custom.to_string() };
-        if ai.temperature <= 0.0 {
+        // Отрицательная температура = «взять из стиля». Ноль — это НОЛЬ:
+        // сухие предсказуемые ответы, а не «значение не задано». Раньше 0 молча
+        // превращался в 0.7, и настройка «живость 0» просто не работала.
+        if ai.temperature < 0.0 {
             ai.temperature = styles.temperature(&p.style).unwrap_or(0.7);
         }
-        log("🔌 Проверяю API...");
+        log("[>] Проверяю нейросеть...");
         match core.ai.check(&ai, stop).await {
-            Ok(msg) => log(&format!("✅ {msg}")),
+            Ok(msg) => log(&format!("[+] {msg}")),
             Err(e) => {
                 if stop.is_stopped() {
                     return out;
                 }
-                log(&format!("❌ {e}"));
+                log(&format!("[-] {e}"));
                 return out;
             }
         }
         log(&format!(
-            "🎨 Стиль: {} | 🌡 {} | 🎟 токенов: {} | ⏱ таймаут: {}с | 🔁 повторов при ошибке: {}",
+            "[>] Стиль: {} | {} | токенов: {} | таймаут: {}с | повторов при ошибке: {}",
             if custom.is_empty() { p.style.as_str() } else { "свой промпт" },
             ai.temperature,
             ai.max_tokens,
@@ -528,7 +761,7 @@ pub async fn run_answerer(
         if convo_mode {
             convo_system = build_convo_system(&system_prompt, &p.mention);
             log(&format!(
-                "🧠 Диалоговый режим: единый чат с памятью. {}. Ответы — последовательно.",
+                "[>] Диалоговый режим: единый чат с памятью. {}. Ответы — последовательно.",
                 if p.convo_budget_k > 0.0 {
                     format!("Сжатие контекста после ~{}k символов", p.convo_budget_k)
                 } else {
@@ -537,15 +770,15 @@ pub async fn run_answerer(
             ));
         }
     } else if p.mode == AnswerMode::Mangle {
-        log("🤪 Режим коверканья — перемешиваю слова вопроса");
+        log("[>] Режим коверканья — перемешиваю слова вопроса");
     } else {
-        log("💬 Режим без AI — короткие готовые реплики");
+        log("[>] Режим без AI — короткие готовые реплики");
     }
 
     // Диалоговый режим = ОБЩАЯ история на все аккаунты → работает один за раз.
     if convo_mode {
         if let Err(owner) = core.convo.try_acquire(&acc.name) {
-            log(&format!("⏭️  Диалоговый режим занят аккаунтом «{owner}» — пропускаю"));
+            log(&format!("[!] Диалоговый режим занят аккаунтом «{owner}» — пропускаю"));
             out.skipped = true;
             return out;
         }
@@ -555,31 +788,42 @@ pub async fn run_answerer(
         ImageMode::Gif { .. } => {
             let n = journals::load_gif_pool(&core.root).len();
             log(&format!(
-                "🎞  Картинка из пула в каждый ответ (в пуле: {n}){}",
-                if n == 0 { " — ⚠️ пул пуст" } else { "" }
+                "[>] Картинка из пула в каждый ответ (в пуле: {n}){}",
+                if n == 0 { " — пул пуст" } else { "" }
             ));
         }
         ImageMode::Upload { dir } => {
-            let n = list_images(dir).len();
+            let n = list_images(crate::util::images_dir(&core.root, dir)).len();
             log(&format!(
-                "🖼  Картинка из {dir} в каждый ответ (файлов: {n}){}",
-                if n == 0 { " — ⚠️ папка пуста" } else { "" }
+                "[>] Картинка из {dir} в каждый ответ (файлов: {n}){}",
+                if n == 0 { " — папка пуста" } else { "" }
             ));
         }
         ImageMode::Off => {}
     }
 
+    if !p.keywords.is_empty() {
+        log(&format!("[>] Беру только вопросы со словами: {}", p.keywords.join(", ")));
+    }
+
     if p.check_auth {
-        let v = api::validate_account(core, acc, stop).await;
+        let v = api::validate_cached(core, acc, stop).await;
         api::persist_validation(core, &acc.name, &v);
         out.karma = v.karma.clone();
         if v.blocked {
-            log("🛑 Антибот (418/429) при проверке — статус не меняю.");
+            log("[x] Антибот (418/429) при проверке — статус не меняю.");
             out.blocked = true;
+        } else if v.banned {
+            log("[x] Аккаунт заблокирован сайтом — пропускаю. Сессия жива, но действия молча не проходят.");
+            if convo_mode {
+                core.convo.release(&acc.name);
+            }
+            out.skipped = true;
+            return out;
         } else if v.alive {
-            log("✅ Авторизован");
+            log("[+] Авторизован");
         } else if v.auth_bad {
-            log("🔒 НЕ авторизован");
+            log("[x] НЕ авторизован");
             log("Пропускаю аккаунт — не залогинен.");
             if convo_mode {
                 core.convo.release(&acc.name);
@@ -587,14 +831,14 @@ pub async fn run_answerer(
             out.skipped = true;
             return out;
         } else {
-            log("⚠️  Не удалось проверить авторизацию (ошибка/сеть) — продолжаю, статус не трогаю.");
+            log("[!] Не удалось проверить авторизацию (ошибка/сеть) — продолжаю, статус не трогаю.");
         }
     }
 
     let answered = journals::load_answered(&core.root, &acc.name);
     let exclude: HashSet<String> = if p.skip_others {
         let all = journals::load_all_answered(&core.root);
-        log(&format!("🚫 Пропускаю вопросы, отвеченные другими аккаунтами (в базе: {})", all.len()));
+        log(&format!("[>] Пропускаю вопросы, отвеченные другими аккаунтами (в базе: {})", all.len()));
         all
     } else {
         answered
@@ -602,17 +846,31 @@ pub async fn run_answerer(
 
     let sh = Shared {
         count: AtomicI64::new(0),
+        reserved: AtomicI64::new(0),
         blocked: AtomicBool::new(out.blocked),
         fails: AtomicI64::new(0),
+        exhausted: AtomicBool::new(false),
         ai_fails: AtomicI64::new(0),
         exclude: Mutex::new(exclude),
         tried: Mutex::new(HashSet::new()),
+    };
+
+    let mine = if p.skip_own_authors { my_keys(core) } else { HashSet::new() };
+    if !mine.is_empty() {
+        log(&format!("[>] Вопросы своих аккаунтов пропускаю (своих в базе: {})", core.accounts.len()));
+    }
+    // Пул картинок читаем один раз на прогон, а не на каждый ответ.
+    let pool = match &p.image {
+        ImageMode::Gif { .. } => journals::load_gif_pool(&core.root),
+        _ => Vec::new(),
     };
 
     let ctx = RunCtx {
         core,
         acc,
         p,
+        mine: &mine,
+        pool: &pool,
         ai: &ai,
         system_prompt: &system_prompt,
         convo_system: &convo_system,
@@ -628,6 +886,7 @@ pub async fn run_answerer(
 
     match p.target {
         TargetMode::Links => answer_links(&ctx).await,
+        TargetMode::Range => answer_range(&ctx).await,
         TargetMode::Feed => {
             if p.continuous_feed {
                 answer_feed_continuous(&ctx, recent, batch_per, f_min, f_max).await;
@@ -643,11 +902,12 @@ pub async fn run_answerer(
 
     out.done = sh.count();
     out.blocked = sh.blocked();
+    out.exhausted = sh.exhausted.load(Ordering::SeqCst);
     let line = "=".repeat(50);
     if stop.is_stopped() {
-        log(&format!("\n{line}\n⛔ Остановлено пользователем. Ответов отправлено: {}\n{line}", out.done));
+        log(&format!("\n{line}\n[x] Остановлено пользователем. Ответов отправлено: {}\n{line}", out.done));
     } else {
-        log(&format!("\n{line}\n✅ Готово!  Ответов отправлено: {}\n{line}", out.done));
+        log(&format!("\n{line}\n[+] Готово! Ответов отправлено: {}\n{line}", out.done));
     }
     out
 }
@@ -669,12 +929,28 @@ fn build_convo_system(style_prompt: &str, mention: &str) -> String {
     s
 }
 
+/// Чем закончилась одна попытка ответить.
+enum Step {
+    /// Ответ ушёл и виден на сайте.
+    Posted,
+    /// Отправился, но на сайте его нет — можно попробовать другим текстом.
+    Vanished,
+    /// Сайт не принял текст. Тоже повод перегенерировать: ответа не появилось.
+    Rejected,
+    /// Дальше по этому вопросу (а иногда и по аккаунту) не идём.
+    Stop,
+}
+
 /// Всё, что нужно обработчику одного вопроса. Ссылками, чтобы не копировать
 /// параметры на каждый ответ.
 struct RunCtx<'a> {
     core: &'a Core,
     acc: &'a Account,
     p: &'a AnswerParams,
+    /// id и ники своих аккаунтов — их вопросы пропускаем.
+    mine: &'a HashSet<String>,
+    /// Пул картинок, прочитанный один раз на прогон.
+    pool: &'a [PoolImage],
     ai: &'a AiCfg,
     system_prompt: &'a str,
     convo_system: &'a str,
@@ -707,7 +983,7 @@ impl RunCtx<'_> {
     async fn pause_between(&self) -> bool {
         let d = rand_f(self.d_min, self.d_max);
         if d > 0.0 {
-            (self.log)(&format!("   ⏳ Пауза {d:.1} сек..."));
+            (self.log)(&format!("   [>] Пауза {d:.1} сек..."));
         }
         self.stop.sleep_ms((d * 1000.0) as u64).await
     }
@@ -719,172 +995,39 @@ impl RunCtx<'_> {
         let n = self.sh.ai_fails.fetch_add(1, Ordering::SeqCst) + 1;
         if n >= MAX_FAILS {
             (self.log)(&format!(
-                "🛑 Нейросеть не отвечает {MAX_FAILS} раз подряд — останавливаю аккаунт (проверь ключ и баланс)."
+                "[x] Нейросеть не отвечает {MAX_FAILS} раз подряд — останавливаю аккаунт (проверь ключ и баланс)."
             ));
         }
     }
 
-    /// Обработка одного вопроса: текст → картинка → постинг (repeat_per раз).
+    /// Обработка одного вопроса: `repeat_per` ответов, каждый — с проверкой,
+    /// что он действительно появился на сайте.
     async fn handle_one(&self, q: &Question) -> bool {
         let mut posted_any = false;
         for rep in 0..self.repeat_per {
             if self.done() {
                 break;
             }
-
-            // 1) текст
-            let mut ask_msg = None;
-            let mut ai_raw = String::new();
-            let mut answer = match self.p.mode {
-                AnswerMode::Ai => {
-                    (self.log)(&if self.repeat_per > 1 {
-                        format!("   🤖 Генерирую ответ {}/{}...", rep + 1, self.repeat_per)
-                    } else {
-                        "   🤖 Генерирую ответ...".to_string()
-                    });
-                    let msgs = if self.convo_mode {
-                        let m = build_ask_msg(q);
-                        let convo = self.core.convo.snapshot();
-                        let mut msgs = vec![Msg::system(self.convo_system)];
-                        if !convo.summary.is_empty() {
-                            msgs.push(Msg::system(format!(
-                                "Что было раньше в этом разговоре (сжато): {}",
-                                convo.summary
-                            )));
-                        }
-                        msgs.extend(convo.turns.clone());
-                        msgs.push(Msg::user(m.clone()));
-                        ask_msg = Some(m);
-                        msgs
-                    } else {
-                        let mut prompt = q.title.clone();
-                        if !q.body.is_empty() {
-                            prompt.push_str(&format!("\n\nДополнение: {}", q.body));
-                        }
-                        let mut sys = if self.system_prompt.trim().is_empty() {
-                            "Отвечай как обычный человек, коротко и по-простому.".to_string()
-                        } else {
-                            self.system_prompt.to_string()
-                        };
-                        if !self.p.mention.trim().is_empty() {
-                            sys.push_str(&format!(
-                                "\n\nОБЯЗАТЕЛЬНО: естественно упомяни «{}» в ответе (не в лоб, а к месту).",
-                                self.p.mention.trim()
-                            ));
-                        }
-                        sys.push_str(NO_MARKDOWN);
-                        vec![Msg::system(sys), Msg::user(prompt)]
-                    };
-                    match self.core.ai.generate(self.ai, &msgs, self.log, self.stop).await {
-                        Ok(a) if !a.is_empty() => {
-                            self.sh.ai_fails.store(0, Ordering::SeqCst);
-                            ai_raw = a.clone();
-                            a
-                        }
-                        Ok(_) => {
-                            self.note_ai_fail("   ❌ Пустой ответ от нейросети");
-                            self.stop.sleep_ms(3000).await;
-                            break;
-                        }
-                        Err(crate::ai::AiError::Aborted) => break,
-                        Err(e) => {
-                            self.note_ai_fail(&format!("   ❌ Нейросеть не ответила: {e}"));
-                            self.stop.sleep_ms(3000).await;
-                            break;
-                        }
-                    }
-                }
-                AnswerMode::Mangle => {
-                    let a = scramble_question(&q.title);
-                    if a.is_empty() {
-                        (self.log)("   ⚠️  Вопрос слишком короткий для коверканья — пропускаю");
+            // Две попытки на ответ. Вторая нужна, когда сайт не принял текст
+            // или снёс его автомодерацией: и то и другое лечится НОВЫМ текстом,
+            // тот же самый отклонят снова. Когда всё хорошо, вторая попытка не
+            // тратится вовсе.
+            const TRIES: i64 = 2;
+            let mut ok = false;
+            for attempt in 0..TRIES {
+                match self.answer_once(q, rep, attempt).await {
+                    Step::Posted => {
+                        ok = true;
+                        posted_any = true;
                         break;
                     }
-                    a
+                    Step::Vanished | Step::Rejected => continue,
+                    Step::Stop => return posted_any,
                 }
-                AnswerMode::NoAi => {
-                    let list: Vec<&str> = if self.p.noai_answers.is_empty() {
-                        NOAI_ANSWERS.to_vec()
-                    } else {
-                        self.p.noai_answers.iter().map(|s| s.as_str()).collect()
-                    };
-                    pick_one(&list).map(|s| s.to_string()).unwrap_or_default()
-                }
-            };
-
-            if self.stop.is_stopped() {
+            }
+            if !ok {
                 break;
             }
-            if self.p.random_tag {
-                answer = with_random_tag(&answer);
-            }
-            answer = with_signature(&answer, &self.p.signature);
-            (self.log)(&format!("   💬 {}", clip(&answer, 90)));
-
-            // 2) картинка
-            let image = self.build_image().await;
-            if self.stop.is_stopped() {
-                break;
-            }
-            if self.sh.blocked() {
-                (self.log)("   🛑 Пропускаю постинг (блокировка).");
-                break;
-            }
-
-            // 3) постинг
-            match post_answer(self.core, self.acc, &q.id, &answer, image.as_ref(), self.log, self.stop).await
-            {
-                Err(_) => break,
-                Ok(PostRes::Blocked) => {
-                    // Антибот: без этого флага бот продолжал бы долбиться в
-                    // закрытую дверь и получал бы 418 на каждый следующий ответ.
-                    self.sh.blocked.store(true, Ordering::SeqCst);
-                    (self.log)("   🛑 Антибот mail.ru при отправке (418/429) — стоп аккаунта.");
-                    break;
-                }
-                Ok(PostRes::Ok(_id)) => {
-                    posted_any = true;
-                    self.sh.fails.store(0, Ordering::SeqCst);
-                    let n = self.sh.count.fetch_add(1, Ordering::SeqCst) + 1;
-                    if self.convo_mode {
-                        if let Some(m) = &ask_msg {
-                            self.core.convo.push_turn(
-                                Msg::user(m.clone()),
-                                Msg::assistant(if ai_raw.is_empty() {
-                                    answer.clone()
-                                } else {
-                                    ai_raw.clone()
-                                }),
-                            );
-                            self.compress_convo().await;
-                        }
-                    }
-                    (self.log)(&format!(
-                        "   ✅ Отправлено [{n}/{}]{}",
-                        self.limit_label(),
-                        if self.repeat_per > 1 {
-                            format!(" (на этот вопрос {}/{})", rep + 1, self.repeat_per)
-                        } else {
-                            String::new()
-                        }
-                    ));
-                }
-                Ok(PostRes::Failed) => {
-                    // Не антибот, а разовый сбой: ждём подольше, чтобы не
-                    // молотить сайт без передышки.
-                    let fails = self.sh.fails.fetch_add(1, Ordering::SeqCst) + 1;
-                    if fails >= MAX_FAILS {
-                        (self.log)(&format!(
-                            "🛑 Подряд {MAX_FAILS} отказов при отправке — останавливаю аккаунт (обычно это дневной лимит ответов)."
-                        ));
-                        break;
-                    }
-                    (self.log)("   ⏳ Не отправлено — пауза 10 сек перед следующей попыткой...");
-                    self.stop.sleep_ms(10_000).await;
-                    break;
-                }
-            }
-
             if rep + 1 < self.repeat_per && !self.done() && self.pause_between().await {
                 break;
             }
@@ -892,27 +1035,254 @@ impl RunCtx<'_> {
         posted_any
     }
 
+    /// Подходит ли вопрос под список слов. Пустой список пропускает любой.
+    fn passes_keywords(&self, q: &Question) -> bool {
+        has_keyword(&self.p.keywords, q)
+    }
+
+    /// Одна попытка ответить: текст → картинка → отправка → проверка.
+    async fn answer_once(&self, q: &Question, rep: i64, attempt: i64) -> Step {
+        // 1) текст
+        let mut ask_msg = None;
+        let mut ai_raw = String::new();
+        let mut answer = match self.p.mode {
+            AnswerMode::Ai => {
+                (self.log)(&match (self.repeat_per > 1, attempt > 0) {
+                    (_, true) => "   [>] Прежний ответ не прошёл — генерирую другой...".to_string(),
+                    (true, _) => format!("   [>] Генерирую ответ {}/{}...", rep + 1, self.repeat_per),
+                    _ => "   [>] Генерирую ответ...".to_string(),
+                });
+                let msgs = if self.convo_mode {
+                    let m = build_ask_msg(q);
+                    let convo = self.core.convo.snapshot();
+                    let mut msgs = vec![Msg::system(self.convo_system)];
+                    if !convo.summary.is_empty() {
+                        msgs.push(Msg::system(format!(
+                            "Что было раньше в этом разговоре (сжато): {}",
+                            convo.summary
+                        )));
+                    }
+                    msgs.extend(convo.turns.clone());
+                    msgs.push(Msg::user(m.clone()));
+                    ask_msg = Some(m);
+                    msgs
+                } else {
+                    let mut prompt = q.title.clone();
+                    if !q.body.is_empty() {
+                        prompt.push_str(&format!("\n\nДополнение: {}", q.body));
+                    }
+                    let mut sys = if self.system_prompt.trim().is_empty() {
+                        "Отвечай как обычный человек, коротко и по-простому.".to_string()
+                    } else {
+                        self.system_prompt.to_string()
+                    };
+                    if !self.p.mention.trim().is_empty() {
+                        sys.push_str(&format!(
+                            "\n\nОБЯЗАТЕЛЬНО: естественно упомяни «{}» в ответе (не в лоб, а к месту).",
+                            self.p.mention.trim()
+                        ));
+                    }
+                    sys.push_str(NO_MARKDOWN);
+                    vec![Msg::system(sys), Msg::user(prompt)]
+                };
+                match self.core.ai.generate(self.ai, &msgs, self.log, self.stop).await {
+                    Ok(a) if !a.is_empty() => {
+                        self.sh.ai_fails.store(0, Ordering::SeqCst);
+                        ai_raw = a.clone();
+                        a
+                    }
+                    Ok(_) => {
+                        self.note_ai_fail("   [-] Пустой ответ от нейросети");
+                        self.stop.sleep_ms(3000).await;
+                        return Step::Stop;
+                    }
+                    Err(crate::ai::AiError::Aborted) => return Step::Stop,
+                    Err(e) => {
+                        self.note_ai_fail(&format!("   [-] Нейросеть не ответила: {e}"));
+                        self.stop.sleep_ms(3000).await;
+                        return Step::Stop;
+                    }
+                }
+            }
+            AnswerMode::Mangle => {
+                let a = scramble_question(&q.title);
+                if a.is_empty() {
+                    (self.log)("   [!] Вопрос слишком короткий для коверканья — пропускаю");
+                    return Step::Stop;
+                }
+                a
+            }
+            AnswerMode::NoAi => {
+                let list: Vec<&str> = if self.p.noai_answers.is_empty() {
+                    NOAI_ANSWERS.to_vec()
+                } else {
+                    self.p.noai_answers.iter().map(|s| s.as_str()).collect()
+                };
+                pick_one(&list).map(|s| s.to_string()).unwrap_or_default()
+            }
+        };
+
+        if self.stop.is_stopped() {
+            return Step::Stop;
+        }
+        // Уникализация — до подписи: подпись у всех ответов и так одинаковая,
+        // трогать её незачем.
+        answer = uniquify(&answer, self.p.uniq, self.p.uniq_latin);
+        answer = with_signature(&answer, &self.p.signature);
+        (self.log)(&format!("   [>] {}", clip(&answer, 90)));
+
+        // 2) картинка
+        let image = self.build_image().await;
+        if self.stop.is_stopped() {
+            return Step::Stop;
+        }
+        if self.sh.blocked() {
+            (self.log)("   [x] Пропускаю постинг (блокировка).");
+            return Step::Stop;
+        }
+
+        // 3) постинг
+        //
+        // Место под лимитом занимаем ПЕРЕД отправкой: при параллельной пачке
+        // соседи уже готовы постить, и проверка счётчика в начале круга
+        // ничего не гарантирует.
+        if !self.sh.reserve(self.p.limit) {
+            return Step::Stop;
+        }
+        let posted_id = match post_answer(
+            self.core,
+            self.acc,
+            &q.id,
+            &answer,
+            image.as_ref(),
+            self.log,
+            self.stop,
+        )
+        .await
+        {
+            Err(_) => {
+                self.sh.release(self.p.limit);
+                return Step::Stop;
+            }
+            Ok(PostRes::Blocked) => {
+                self.sh.release(self.p.limit);
+                // Антибот: без этого флага бот продолжал бы долбиться в
+                // закрытую дверь и получал бы 418 на каждый следующий ответ.
+                self.sh.blocked.store(true, Ordering::SeqCst);
+                (self.log)("   [x] Антибот mail.ru при отправке (418/429) — стоп аккаунта.");
+                return Step::Stop;
+            }
+            Ok(PostRes::Rejected(why)) => {
+                // Отказали по тексту, а не по аккаунту: место под лимитом
+                // возвращаем и пробуем другим текстом. Счётчик отказов при этом
+                // ведём общий — если сайт отказывает подряд (дневной лимит), с
+                // перегенерацией это стоило бы денег за нейросеть на пустом месте.
+                self.sh.release(self.p.limit);
+                let fails = self.sh.fails.fetch_add(1, Ordering::SeqCst) + 1;
+                if fails >= MAX_FAILS {
+                    (self.log)(&format!(
+                        "[x] Подряд {MAX_FAILS} отказов при отправке — останавливаю аккаунт (обычно это дневной лимит ответов)."
+                    ));
+                    return Step::Stop;
+                }
+                (self.log)(&format!("   [!] Сайт не принял ответ ({why})"));
+                return Step::Rejected;
+            }
+            Ok(PostRes::Failed) => {
+                // Не антибот, а разовый сбой: ждём подольше, чтобы не
+                // молотить сайт без передышки.
+                self.sh.release(self.p.limit);
+                let fails = self.sh.fails.fetch_add(1, Ordering::SeqCst) + 1;
+                if fails >= MAX_FAILS {
+                    (self.log)(&format!(
+                            "[x] Подряд {MAX_FAILS} отказов при отправке — останавливаю аккаунт (обычно это дневной лимит ответов)."
+                        ));
+                    return Step::Stop;
+                }
+                (self.log)("   [!] Не отправлено — пауза 10 сек, дальше следующий вопрос.");
+                self.stop.sleep_ms(10_000).await;
+                return Step::Stop;
+            }
+            Ok(PostRes::Ok(id)) => id,
+        };
+
+        // 4) проверка, что ответ реально виден
+        //
+        // Сайт отвечает «принято» и на то, что через секунду снесёт
+        // автомодерация. Без проверки бот считал такие ответы отправленными,
+        // а на деле их не было.
+        if self.p.verify_posted {
+            let wait = self.p.verify_delay_sec.clamp(0.0, 120.0);
+            if wait > 0.0 && self.stop.sleep_ms((wait * 1000.0) as u64).await {
+                return Step::Stop;
+            }
+            match verify_answer(self.core, self.acc, &q.id, posted_id, self.stop).await {
+                Verify::Missing => {
+                    self.sh.release(self.p.limit);
+                    (self.log)(&format!(
+                        "   [!] Ответ #{posted_id} на сайте не появился (снесла автомодерация){}",
+                        if attempt == 0 {
+                            " — пробую другим текстом"
+                        } else {
+                            " и со второго раза"
+                        }
+                    ));
+                    self.sh.fails.fetch_add(1, Ordering::SeqCst);
+                    return Step::Vanished;
+                }
+                Verify::Unknown => {
+                    (self.log)("   [!] Проверить ответ не вышло (сеть) — считаю отправленным");
+                }
+                Verify::Present => {}
+            }
+        }
+
+        // 5) засчитываем
+        self.sh.fails.store(0, Ordering::SeqCst);
+        let n = self.sh.count.fetch_add(1, Ordering::SeqCst) + 1;
+        self.p.progress.inc();
+        if self.convo_mode {
+            if let Some(m) = &ask_msg {
+                self.core.convo.push_turn(
+                    Msg::user(m.clone()),
+                    Msg::assistant(if ai_raw.is_empty() { answer.clone() } else { ai_raw.clone() }),
+                );
+                self.compress_convo().await;
+            }
+        }
+        (self.log)(&format!(
+            "   [+] Отправлено [{n}/{}]{}",
+            self.limit_label(),
+            if self.repeat_per > 1 {
+                format!(" (на этот вопрос {}/{})", rep + 1, self.repeat_per)
+            } else {
+                String::new()
+            }
+        ));
+        Step::Posted
+    }
+
     /// Картинка к ответу: из пула (хэш уже на CDN) либо заливкой файлов.
     async fn build_image(&self) -> Option<Value> {
         match &self.p.image {
             ImageMode::Off => None,
             ImageMode::Gif { selected } => {
-                let pool = journals::load_gif_pool(&self.core.root);
-                let gifs = pick_n_gifs(&pool, selected, self.img_count as usize);
+                let gifs = pick_n_gifs(self.pool, selected, self.img_count as usize);
                 if gifs.is_empty() {
-                    (self.log)("   ⚠️  Пул пуст — без картинки");
+                    (self.log)("   [!] Пул пуст — без картинки");
                     return None;
                 }
-                (self.log)(&format!("   🎞  Картинка из пула ×{}", gifs.len()));
+                (self.log)(&format!("   [>] Картинка из пула ×{}", gifs.len()));
                 gallery_from_pool(&gifs)
             }
             ImageMode::Upload { dir } => {
-                let paths = pick_n_images(dir, self.img_count as usize);
+                let paths =
+                    pick_n_images(crate::util::images_dir(&self.core.root, dir), self.img_count as usize);
                 if paths.is_empty() {
-                    (self.log)("   ⚠️  Нет картинок в папке — без картинки");
+                    (self.log)("   [!] Нет картинок в папке — без картинки");
                     return None;
                 }
-                (self.log)(&format!("   🖼  Заливаю картинку ({} шт.)...", paths.len()));
+                (self.log)(&format!("   [>] Заливаю картинку ({} шт.)...", paths.len()));
                 let mut uploaded: Vec<(String, i64, i64)> = Vec::new();
                 for path in paths {
                     match self
@@ -924,21 +1294,21 @@ impl RunCtx<'_> {
                         Ok(up) => uploaded.push((up.url, up.width, up.height)),
                         Err(e) if e == "blocked" => {
                             self.sh.blocked.store(true, Ordering::SeqCst);
-                            (self.log)("   🛑 Антибот при заливке картинки (418/429).");
+                            (self.log)("   [x] Антибот при заливке картинки (418/429).");
                             break;
                         }
                         Err(e) => {
                             if self.stop.is_stopped() {
                                 break;
                             }
-                            (self.log)(&format!("   ⚠️  Картинка не залилась: {e}"));
+                            (self.log)(&format!("   [!] Картинка не залилась: {e}"));
                         }
                     }
                 }
                 if uploaded.is_empty() {
                     return None;
                 }
-                (self.log)(&format!("   🖼  Залито {} шт.", uploaded.len()));
+                (self.log)(&format!("   [>] Залито {} шт.", uploaded.len()));
                 image_gallery_node(&uploaded)
             }
         }
@@ -973,11 +1343,11 @@ impl RunCtx<'_> {
         match self.core.ai.generate_with(self.ai, &msgs, 0.3, 400, self.log, self.stop).await {
             Ok(sum) if !sum.trim().is_empty() => {
                 self.core.convo.set_compressed(sum.trim().to_string(), keep);
-                (self.log)("   ♻️ Контекст разговора сжат (обновил summary).");
+                (self.log)("   [>] Контекст разговора сжат (обновил summary).");
             }
             _ => {
                 self.core.convo.set_compressed(convo.summary.clone(), keep);
-                (self.log)("   ♻️ Контекст урезан (старые сообщения отброшены).");
+                (self.log)("   [>] Контекст урезан (старые сообщения отброшены).");
             }
         }
     }
@@ -995,23 +1365,63 @@ impl RunCtx<'_> {
 
 // ─── Сценарии ───────────────────────────────────────────────────────────────
 
+/// Ответы по диапазону номеров: от и до включительно.
+///
+/// Журнал уважаем как везде: перезапуск того же диапазона не наделает вторых
+/// ответов под теми же вопросами.
+async fn answer_range(ctx: &RunCtx<'_>) {
+    let (from, to) = (ctx.p.range_from.min(ctx.p.range_to), ctx.p.range_from.max(ctx.p.range_to));
+    if from <= 0 || to <= 0 {
+        (ctx.log)("[-] Не задан диапазон номеров.");
+        return;
+    }
+    (ctx.log)(&format!("[>] Диапазон: {from}–{to} ({} шт.), текст готовыми фразами.", to - from + 1));
+
+    // Дошли ли до конца диапазона или ушли раньше — по лимиту, «Стопу» или
+    // паузе. От этого зависит, есть ли смысл в следующем круге.
+    let mut left = false;
+    for id in from..=to {
+        if ctx.done() {
+            left = true;
+            break;
+        }
+        let norm = format!("https://otvet.mail.ru/question/{id}");
+        if ctx.sh.exclude.lock().contains(&norm) {
+            continue;
+        }
+        let q = Question { id: id.to_string(), norm: norm.clone(), ..Default::default() };
+        (ctx.log)(&format!("\n→ Вопрос #{id}"));
+        let posted = ctx.handle_one(&q).await;
+        ctx.after_one(&q, posted);
+        if !ctx.done() && ctx.pause_between().await {
+            left = true;
+            break;
+        }
+    }
+    if !left {
+        // Диапазон пройден целиком: все номера либо отвечены сейчас, либо уже
+        // были в журнале. Следующий круг по тем же номерам не сделает ничего.
+        ctx.sh.exhausted.store(true, Ordering::SeqCst);
+    }
+}
+
 async fn answer_links(ctx: &RunCtx<'_>) {
     let mut targets: Vec<(String, Option<String>)> = Vec::new();
     for u in &ctx.p.links {
         match parse_answer_target(u) {
             Some(t) => targets.push(t),
             None if !u.trim().is_empty() => (ctx.log)(&format!(
-                "⚠️  Не похоже на ссылку вопроса/ответа — пропускаю: {}",
+                "[!] Не похоже на ссылку вопроса/ответа — пропускаю: {}",
                 clip(u.trim(), 80)
             )),
             None => {}
         }
     }
     if targets.is_empty() {
-        (ctx.log)("❌ Нет распознанных ссылок — нечего отвечать.");
+        (ctx.log)("[-] Нет распознанных ссылок — нечего отвечать.");
         return;
     }
-    (ctx.log)(&format!("🔗 Режим по ссылкам: целей {} (по {} на каждую).", targets.len(), ctx.repeat_per));
+    (ctx.log)(&format!("[>] Режим по ссылкам: целей {} (по {} на каждую).", targets.len(), ctx.repeat_per));
 
     for (topic_id, reply_id) in targets {
         if ctx.done() {
@@ -1019,14 +1429,15 @@ async fn answer_links(ctx: &RunCtx<'_>) {
         }
         let norm = format!("https://otvet.mail.ru/question/{topic_id}");
         if ctx.sh.exclude.lock().contains(&norm) {
-            (ctx.log)(&format!("⏭️  Уже отвечал на {norm} — пропускаю"));
+            (ctx.log)(&format!("[!] Уже отвечал на {norm} — пропускаю"));
             continue;
         }
-        let q = if ctx.p.mode == AnswerMode::NoAi {
-            // текст вопроса не нужен — реплика берётся из набора
+        // Текст вопроса не нужен только если и реплика из набора, и правил нет:
+        // правилам как раз нужно, по чему искать слова.
+        let q = if ctx.p.mode == AnswerMode::NoAi && ctx.p.keywords.is_empty() {
             Question { id: topic_id.clone(), norm: norm.clone(), ..Default::default() }
         } else {
-            (ctx.log)(&format!("   🔎 Читаю вопрос #{topic_id}..."));
+            (ctx.log)(&format!("   [>] Читаю вопрос #{topic_id}..."));
             match fetch_question(ctx.core, ctx.acc, &topic_id, ctx.stop).await {
                 Some(mut q) => {
                     q.norm = norm.clone();
@@ -1036,12 +1447,17 @@ async fn answer_links(ctx: &RunCtx<'_>) {
                     if ctx.stop.is_stopped() {
                         break;
                     }
-                    (ctx.log)(&format!("   ⚠️  Не удалось прочитать вопрос #{topic_id} — пропускаю"));
+                    (ctx.log)(&format!("   [!] Не удалось прочитать вопрос #{topic_id} — пропускаю"));
                     ctx.sh.tried.lock().insert(norm);
                     continue;
                 }
             }
         };
+        if !ctx.passes_keywords(&q) {
+            (ctx.log)(&format!("[!] #{topic_id} — нужных слов в вопросе нет, пропускаю"));
+            ctx.sh.tried.lock().insert(norm);
+            continue;
+        }
         let title = if q.title.is_empty() { format!("Вопрос #{topic_id}") } else { q.title.clone() };
         (ctx.log)(&format!(
             "\n→ {}{}",
@@ -1066,7 +1482,7 @@ async fn answer_feed(
 ) {
     if batch_per > 1 {
         (ctx.log)(&format!(
-            "📦 Беру по {batch_per} вопрос(ов) за один проход ленты{}.",
+            "[>] Беру по {batch_per} вопрос(ов) за один проход ленты{}.",
             if go_parallel {
                 " и отвечаю на них ПАРАЛЛЕЛЬНО (риск антибота!)"
             } else {
@@ -1076,11 +1492,11 @@ async fn answer_feed(
     }
     loop {
         if ctx.stop.is_stopped() {
-            (ctx.log)("\n⛔ Остановлено пользователем");
+            (ctx.log)("\n[x] Остановлено пользователем");
             break;
         }
         if ctx.sh.blocked() {
-            (ctx.log)("\n🛑 Блокировка mail.ru (418/429). Останавливаю аккаунт.");
+            (ctx.log)("\n[x] Блокировка mail.ru (418/429). Останавливаю аккаунт.");
             break;
         }
         if ctx.sh.limit_hit(ctx.p.limit) || ctx.sh.too_many_fails() {
@@ -1090,13 +1506,13 @@ async fn answer_feed(
         let questions = {
             let exclude = ctx.sh.exclude.lock().clone();
             let tried = ctx.sh.tried.lock().clone();
-            match collect_questions(ctx.core, ctx.acc, &exclude, &tried, recent, ctx.stop).await {
+            match collect_questions(ctx.core, ctx.acc, &exclude, &tried, ctx.mine, recent, ctx.stop).await {
                 Ok(q) => q,
                 Err(HttpError::Aborted) => break,
                 Err(e) => {
                     let wait = rand_f(f_min.max(8.0), f_max.max(8.0));
                     (ctx.log)(&format!(
-                        "   ⚠️  Сеть/прокси при загрузке ленты ({e}) — повторю через {wait:.0} сек."
+                        "   [!] Сеть/прокси при загрузке ленты ({e}) — повторю через {wait:.0} сек."
                     ));
                     if ctx.stop.sleep_ms((wait * 1000.0) as u64).await {
                         break;
@@ -1105,6 +1521,9 @@ async fn answer_feed(
                 }
             }
         };
+        // При «только по триггерам» всё остальное в ленте нам неинтересно:
+        // отсеиваем сразу, чтобы не тратить на них ни пачку, ни лимит.
+        let questions: Vec<Question> = questions.into_iter().filter(|q| ctx.passes_keywords(q)).collect();
         if questions.is_empty() {
             let wait = rand_f(f_min, f_max);
             (ctx.log)(&format!(
@@ -1116,13 +1535,20 @@ async fn answer_feed(
             continue;
         }
 
-        let batch: Vec<Question> = questions.into_iter().take(batch_per as usize).collect();
+        // Пачку урезаем по ОСТАТКУ лимита. Иначе бот с лимитом 20, ответив на
+        // 12, брал ещё 15 вопросов, генерировал на них текст и упирался в
+        // дневной лимит сайта — платили за генерацию, получали отказы.
+        let room = ctx.sh.remaining(ctx.p.limit).min(batch_per);
+        if room <= 0 {
+            break;
+        }
+        let batch: Vec<Question> = questions.into_iter().take(room as usize).collect();
         if batch_per > 1 && !go_parallel {
-            (ctx.log)(&format!("\n📥 За этот проход беру {} вопрос(ов) из ленты", batch.len()));
+            (ctx.log)(&format!("\n[>] За этот проход беру {} вопрос(ов) из ленты", batch.len()));
         }
 
         if go_parallel {
-            (ctx.log)(&format!("\n⚡ Отвечаю на {} вопрос(ов) ПАРАЛЛЕЛЬНО (разом)...", batch.len()));
+            (ctx.log)(&format!("\n[>] Отвечаю на {} вопрос(ов) ПАРАЛЛЕЛЬНО (разом)...", batch.len()));
             let mut tasks = FuturesUnordered::new();
             for q in &batch {
                 tasks.push(async move {
@@ -1160,7 +1586,7 @@ async fn answer_feed(
 async fn answer_feed_continuous(ctx: &RunCtx<'_>, recent: i64, batch_per: i64, f_min: f64, f_max: f64) {
     let max_active = batch_per.max(1) as usize;
     (ctx.log)(&format!(
-        "♻️  Непрерывное обновление ленты: каждый новый вопрос — сразу в обработку (макс. {max_active} одновременно)."
+        "[>] Непрерывное обновление ленты: каждый новый вопрос — сразу в обработку (макс. {max_active} одновременно)."
     ));
     let mut queued: HashSet<String> = HashSet::new();
     let mut tasks = FuturesUnordered::new();
@@ -1170,22 +1596,29 @@ async fn answer_feed_continuous(ctx: &RunCtx<'_>, recent: i64, batch_per: i64, f
             break;
         }
 
-        // Подливаем новые вопросы, пока есть свободные слоты.
-        if !ctx.done() && tasks.len() < max_active {
+        // Подливаем новые вопросы, пока есть свободные слоты И место под лимитом:
+        // брать вопрос, на который уже нельзя ответить, — потраченный запрос.
+        let room = ctx.sh.remaining(ctx.p.limit) - tasks.len() as i64;
+        if !ctx.done() && tasks.len() < max_active && room > 0 {
             let fresh = {
                 let exclude = ctx.sh.exclude.lock().clone();
                 let tried = ctx.sh.tried.lock().clone();
-                collect_questions(ctx.core, ctx.acc, &exclude, &tried, recent, ctx.stop)
+                collect_questions(ctx.core, ctx.acc, &exclude, &tried, ctx.mine, recent, ctx.stop)
                     .await
                     .unwrap_or_default()
             };
+            let mut room = room;
             for q in fresh {
-                if tasks.len() >= max_active || ctx.done() {
+                if !ctx.passes_keywords(&q) {
+                    continue;
+                }
+                if tasks.len() >= max_active || ctx.done() || room <= 0 {
                     break;
                 }
                 if !queued.insert(q.norm.clone()) {
                     continue;
                 }
+                room -= 1;
                 tasks.push(async move {
                     (ctx.log)(&format!("\n→ {}", clip(&q.title, 70)));
                     let posted = ctx.handle_one(&q).await;
@@ -1222,7 +1655,7 @@ fn rand_f(min: f64, max: f64) -> f64 {
 
 const IMAGE_EXTS: [&str; 5] = ["jpg", "jpeg", "png", "gif", "webp"];
 
-pub fn list_images(dir: &str) -> Vec<String> {
+pub fn list_images(dir: impl AsRef<std::path::Path>) -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
     let mut out: Vec<String> = rd
         .flatten()
@@ -1240,7 +1673,7 @@ pub fn list_images(dir: &str) -> Vec<String> {
     out
 }
 
-fn pick_n_images(dir: &str, n: usize) -> Vec<String> {
+fn pick_n_images(dir: impl AsRef<std::path::Path>, n: usize) -> Vec<String> {
     let mut list = list_images(dir);
     if list.len() <= n {
         return list;
@@ -1271,6 +1704,32 @@ fn pick_n_gifs(pool: &[PoolImage], selected: &[String], n: usize) -> Vec<PoolIma
 mod tests {
     use super::*;
 
+    /// Разбор списка: строки, запятые, регистр и повторы.
+    #[test]
+    fn keywords_are_parsed_into_a_clean_list() {
+        let w = parse_keywords("VPN, впн\nобход блокировок ,, vpn\n\n");
+        assert_eq!(w, vec!["vpn", "впн", "обход блокировок"], "список разобран неверно: {w:?}");
+        assert!(parse_keywords("   ,\n ").is_empty(), "из пустого списка получились слова");
+    }
+
+    /// Слово ищется и в заголовке, и в теле, без оглядки на регистр. Пустой
+    /// список пропускает всё — иначе бот молча перестал бы отвечать.
+    #[test]
+    fn keyword_matches_title_and_body() {
+        let words = parse_keywords("vpn, блокировк");
+        let q = |title: &str, body: &str| Question {
+            title: title.into(),
+            body: body.into(),
+            ..Default::default()
+        };
+
+        assert!(has_keyword(&words, &q("Какой VPN выбрать?", "")), "не нашли в заголовке");
+        assert!(has_keyword(&words, &q("Вопрос", "как обойти блокировки")), "не нашли в теле");
+        assert!(has_keyword(&words, &q("VPN-сервис", "")), "слово внутри слова тоже считается");
+        assert!(!has_keyword(&words, &q("что приготовить на ужин", "")), "подошло лишнее");
+        assert!(has_keyword(&[], &q("что угодно", "")), "пустой список должен пропускать всё");
+    }
+
     #[test]
     fn scramble_keeps_words_and_tail() {
         let src = "почему небо синее?";
@@ -1288,11 +1747,9 @@ mod tests {
     }
 
     #[test]
-    fn signature_and_tag() {
+    fn signature_is_separated_by_a_blank_line() {
         assert_eq!(with_signature("текст", "  "), "текст");
         assert_eq!(with_signature("текст", "подпись"), "текст\n\nподпись");
-        let t = with_random_tag("ответ");
-        assert!(t.starts_with("ответ #"));
     }
 
     #[test]

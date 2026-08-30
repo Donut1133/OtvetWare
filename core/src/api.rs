@@ -24,6 +24,11 @@ pub struct Validation {
     pub alive: bool,
     pub blocked: bool,
     pub auth_bad: bool,
+    /// Аккаунт заблокирован сайтом. Сессия при этом ЖИВАЯ: сайт отвечает 200 и
+    /// отдаёт профиль, просто ни одно действие больше не проходит — голоса
+    /// «не регистрируются», ответы не появляются. Отличается от `auth_bad`
+    /// (разлогин) и лечится только новым аккаунтом.
+    pub banned: bool,
     pub karma: Option<Karma>,
     pub user_id: Option<i64>,
     pub username: Option<String>,
@@ -156,6 +161,10 @@ pub async fn validate_account(core: &Core, acc: &Account, stop: &Stop) -> Valida
             out.auth_bad = !p.ok && !p.blocked && (p.status == 401 || p.status == 403);
             out.alive = p.ok;
             if let Some(j) = p.json.as_ref().filter(|_| p.ok) {
+                // `user_status`: 0 — обычный аккаунт, отрицательное — бан.
+                // Поле приходит в том же ответе, так что проверка бана не стоит
+                // ни одного лишнего запроса.
+                out.banned = j.get("user_status").and_then(|v| v.as_i64()).is_some_and(|s| s < 0);
                 if let Some(id) = j.get("id").and_then(|v| v.as_i64()) {
                     out.user_id = Some(id);
                 }
@@ -192,11 +201,36 @@ pub async fn validate_account(core: &Core, acc: &Account, stop: &Stop) -> Valida
     out
 }
 
+/// Сколько живёт прогретая проверка. Больше пары минут держать нельзя: за это
+/// время аккаунт успевает разлогиниться, и «жив» окажется враньём.
+const WARM_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Проверка с оглядкой на прогрев: если раннер уже проверил этот аккаунт, пока
+/// работал предыдущий, готовый результат берётся без единого запроса.
+pub async fn validate_cached(core: &Core, acc: &Account, stop: &Stop) -> Validation {
+    if let Some(v) = core.warm_take(&acc.name, WARM_TTL) {
+        return v;
+    }
+    validate_account(core, acc, stop).await
+}
+
+/// Прогреть аккаунт заранее (вызывает раннер для СЛЕДУЮЩЕГО по очереди).
+pub async fn warm_account(core: &Core, acc: &Account, stop: &Stop) {
+    let v = validate_account(core, acc, stop).await;
+    // Сомнительные итоги не кэшируем: пусть режим переспросит сам.
+    if v.error.is_none() && !stop.is_stopped() {
+        persist_validation(core, &acc.name, &v);
+        core.warm_put(&acc.name, v);
+    }
+}
+
 /// Применить итог проверки к хранилищу: красим ТОЛЬКО при явном 401/403,
 /// зелёным — при `alive`. Антибот и сетевые ошибки статус не трогают.
 pub fn persist_validation(core: &Core, name: &str, v: &Validation) {
     if v.alive {
         core.accounts.set_auth(name, true);
+        // Бан снимают редко, но снимают — поэтому пишем и "нет", а не только "да".
+        core.accounts.set_banned(name, v.banned);
     } else if v.auth_bad {
         core.accounts.set_auth(name, false);
     }
@@ -289,14 +323,30 @@ pub async fn change_name(
     Err(format!("API не принял: {}", api_err_text(&r)))
 }
 
-fn re_cdn() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"(?i)/([a-f0-9]{50,}|[a-f0-9]+_[a-f0-9]+)\.(?:jpg|gif)").unwrap())
-}
-
-/// Хэш картинки из CDN-URL (`/api/pictures/images/<hash>.jpg`).
+/// Хэш картинки из чего угодно, что похоже на ссылку с CDN.
+///
+/// Форм несколько, и это выяснилось живой заливкой: сама заливка возвращает
+/// `"<хэш>.jpg?size=origin"` — БЕЗ слэша и С хвостом запроса, — а со страницы
+/// сайта копируется полный `https://.../api/pictures/images/<хэш>.jpg`. Старая
+/// регулярка требовала слэш перед хэшем и на ответ заливки не срабатывала:
+/// в пул уезжала строка «хэш.jpg?size=origin», из которой потом собиралась
+/// битая ссылка на картинку.
+///
+/// `None` — значит это не ссылка (например, путь к файлу на диске).
 pub fn extract_cdn_hash(url: &str) -> Option<String> {
-    re_cdn().captures(url).and_then(|c| c.get(1)).map(|m| m.as_str().to_string())
+    let no_query = url.split(['?', '#']).next().unwrap_or(url);
+    let last = no_query.rsplit(['/', '\\']).next().unwrap_or(no_query).trim();
+    let base = match last.rsplit_once('.') {
+        Some((head, ext))
+            if matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "gif" | "png" | "webp") =>
+        {
+            head
+        }
+        _ => last,
+    };
+    // Хэш mail.ru — длинная шестнадцатеричная строка (иногда с подчёркиванием).
+    let ok = base.len() >= 32 && base.chars().all(|c| c.is_ascii_hexdigit() || c == '_');
+    ok.then(|| base.to_string())
 }
 
 /// Смена аватара: заливаем файл (или берём готовый хэш из CDN-ссылки) и
@@ -312,9 +362,9 @@ pub async fn change_avatar(
         None => {
             let path = std::path::PathBuf::from(file_or_url);
             let up = core.http.upload_picture(acc, &path, stop).await?;
-            extract_cdn_hash(&up.url)
-                .or(Some(up.url.trim_end_matches(".jpg").trim_end_matches(".gif").to_string()))
-                .ok_or_else(|| format!("не извлечь хэш из url: {}", up.url))?
+            // Без хэша дальше идти нельзя: в профиль уедет битая ссылка, и
+            // аватар просто пропадёт.
+            extract_cdn_hash(&up.url).ok_or_else(|| format!("не извлечь хэш из url: {}", up.url))?
         }
     };
 
@@ -369,4 +419,29 @@ pub async fn ping(core: &Core, acc: &Account, stop: &Stop) -> Result<u16, String
         .await
         .map(|r| r.status)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Формы ссылок на картинку сняты с живого сайта: так отвечает заливка и
+    /// так копируется адрес со страницы.
+    #[test]
+    fn cdn_hash_is_extracted_from_every_shape() {
+        let hash = "62afcfc4acdc5723d994d3918dd1e275d627561ff1b04f03ef9417f896980631bb0fe43b234b484be3e2cf608c8d0ece";
+        // Ответ заливки: без слэша, с хвостом запроса.
+        assert_eq!(extract_cdn_hash(&format!("{hash}.jpg?size=origin")).as_deref(), Some(hash));
+        // Полная ссылка со страницы.
+        assert_eq!(
+            extract_cdn_hash(&format!("https://otvet.mail.ru/api/pictures/images/{hash}.jpg")).as_deref(),
+            Some(hash)
+        );
+        // Уже готовый хэш.
+        assert_eq!(extract_cdn_hash(hash).as_deref(), Some(hash));
+        // Путь к файлу на диске ссылкой не считается — иначе аватар не зальётся.
+        assert_eq!(extract_cdn_hash(r"C:\фотоvatar.jpg"), None);
+        assert_eq!(extract_cdn_hash("images/fire.gif"), None);
+        assert_eq!(extract_cdn_hash(""), None);
+    }
 }

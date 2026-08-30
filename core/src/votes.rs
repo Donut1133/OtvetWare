@@ -7,7 +7,7 @@
 use crate::accounts::Account;
 use crate::api;
 use crate::http::{HttpError, ReqOpts};
-use crate::util::{Log, Stop};
+use crate::util::{Log, Progress, Stop};
 use crate::{Core, RunOutcome};
 use regex::Regex;
 use serde_json::json;
@@ -95,6 +95,11 @@ pub fn parse_target_id(url: &str) -> Option<Target> {
     None
 }
 
+/// id вопроса из ссылки (у ссылки на ответ он тоже есть).
+pub fn topic_id_from_url(url: &str) -> Option<String> {
+    re_question().captures(url)?.get(1).map(|m| m.as_str().to_string())
+}
+
 /// Ссылка ведёт на конкретный пост/ответ (а не на профиль)?
 pub fn is_single_target(url: &str) -> bool {
     re_question().is_match(url) || re_reply().is_match(url)
@@ -124,10 +129,11 @@ pub async fn vote_one(
         "entityID": target.id.parse::<i64>().unwrap_or(0),
         "reactionSource": target.kind.source(),
     });
-    // Ретраи здесь ЗАПРЕЩЕНЫ. Повтор того же голоса сайт понимает как отмену:
-    // если первый POST дошёл, а ответ потерялся по дороге (обычное дело на
-    // дохлом прокси), вторая попытка снимет только что поставленный голос.
-    // Лучше потерять голос и честно написать об этом, чем тихо его отменить.
+    // Ретраев нет. Сегодня повтор того же голоса сайт принимает как есть —
+    // проверено живьём: второй такой же POST оставляет реакцию на месте, а
+    // противоположный её перезаписывает. Но поведение это недокументированное,
+    // и когда-то оно было переключателем; цена ошибки — тихо снятый голос,
+    // поэтому вслепую повторять запись всё равно не будем.
     let opts = ReqOpts::post(body).referer(referer).no_retry();
     let r = core.http.request(acc, &path, opts, stop).await?;
     if r.blocked {
@@ -153,19 +159,20 @@ pub async fn vote_on_single(
     log: &Log,
     stop: &Stop,
     blocked: &mut bool,
+    progress: &Progress,
 ) -> i64 {
     let Some(target) = parse_target_id(url) else {
-        log("❌ Ссылка не похожа на вопрос/ответ (нужен /question/... или ?reply=...).");
+        log("[-] Ссылка не похожа на вопрос/ответ (нужен /question/... или ?reply=...).");
         return 0;
     };
     let referer = url.split('#').next().unwrap_or(url).split('?').next().unwrap_or(url).to_string();
-    log(&format!("🎯 {} #{} → {}", target.kind.ru(), target.id, vote.label()));
+    log(&format!("[=] {} #{} → {}", target.kind.ru(), target.id, vote.label()));
     if stop.is_stopped() {
-        log("⛔ Остановлено пользователем");
+        log("[x] Остановлено пользователем");
         return 0;
     }
     if *blocked {
-        log("🛑 Блокировка (418/429).");
+        log("[x] Блокировка (418/429).");
         return 0;
     }
     if stop.sleep_human(delay).await {
@@ -173,13 +180,14 @@ pub async fn vote_on_single(
     }
     match vote_one(core, acc, &target, vote, &referer, stop).await {
         Ok(VoteRes::Ok) => {
-            log(&format!("✅ Голос ({}) поставлен на {} #{}!", vote.label(), target.kind.ru(), target.id));
+            progress.inc();
+            log(&format!("[+] Голос ({}) поставлен на {} #{}!", vote.label(), target.kind.ru(), target.id));
             1
         }
         Ok(VoteRes::Blocked) => {
             *blocked = true;
             log(&format!(
-                "🛑 Антибот mail.ru (418/429) — голос на {} #{} отклонён.",
+                "[x] Антибот mail.ru (418/429) — голос на {} #{} отклонён.",
                 target.kind.ru(),
                 target.id
             ));
@@ -187,7 +195,7 @@ pub async fn vote_on_single(
         }
         Ok(VoteRes::NoReg) => {
             log(&format!(
-                "⚠️  Голос НЕ зарегался на {} #{} (сервер молча отклонил).",
+                "[!] Голос не засчитан на {} #{} — сервер молча отклонил.",
                 target.kind.ru(),
                 target.id
             ));
@@ -195,14 +203,14 @@ pub async fn vote_on_single(
         }
         Err(HttpError::Aborted) => 0,
         Err(e) => {
-            log(&format!("⚠️  Сеть при голосе на {} #{}: {e}", target.kind.ru(), target.id));
+            log(&format!("[!] Сеть при голосе на {} #{}: {e}", target.kind.ru(), target.id));
             0
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Victim {
+pub struct Profile {
     pub id: i64,
     pub name: String,
 }
@@ -218,7 +226,7 @@ pub async fn resolve_profile_result(
     acc: &Account,
     profile_url: &str,
     stop: &Stop,
-) -> Result<Victim, String> {
+) -> Result<Profile, String> {
     let caps = re_profile()
         .captures(profile_url)
         .ok_or_else(|| format!("не похоже на ссылку профиля: {}", crate::util::clip(profile_url, 60)))?;
@@ -226,7 +234,7 @@ pub async fn resolve_profile_result(
     let name = urlencoding::decode(raw).map(|c| c.into_owned()).unwrap_or_else(|_| raw.to_string());
     if let Some(rest) = name.strip_prefix("id") {
         if let Ok(id) = rest.parse::<i64>() {
-            return Ok(Victim { id, name });
+            return Ok(Profile { id, name });
         }
     }
     // Основной путь — служебный эндпоинт профиля.
@@ -246,7 +254,7 @@ pub async fn resolve_profile_result(
             .and_then(|v| v.as_str())
             .unwrap_or(&name)
             .to_string();
-        return Ok(Victim { id, name: uname });
+        return Ok(Profile { id, name: uname });
     }
 
     // Запасной путь — сама страница профиля. Служебный эндпоинт может отдать
@@ -262,7 +270,7 @@ pub async fn resolve_profile_result(
     // которая сработала.
     if let Some(c) = re_page_profile_id().captures(&page.text) {
         if let Some(id) = c.get(1).or_else(|| c.get(2)).and_then(|m| m.as_str().parse::<i64>().ok()) {
-            return Ok(Victim { id, name });
+            return Ok(Profile { id, name });
         }
     }
     Err(format!(
@@ -278,7 +286,7 @@ fn re_page_profile_id() -> &'static Regex {
 }
 
 /// Короткая форма для мест, где причина неважна.
-pub async fn resolve_profile(core: &Core, acc: &Account, profile_url: &str, stop: &Stop) -> Option<Victim> {
+pub async fn resolve_profile(core: &Core, acc: &Account, profile_url: &str, stop: &Stop) -> Option<Profile> {
     resolve_profile_result(core, acc, profile_url, stop).await.ok()
 }
 
@@ -297,11 +305,12 @@ pub async fn vote_on_profile(
     log: &Log,
     stop: &Stop,
     blocked: &mut bool,
+    progress: &Progress,
 ) -> i64 {
     let victim = match resolve_profile_result(core, acc, profile_url, stop).await {
         Ok(v) => v,
         Err(e) => {
-            log(&format!("❌ {e}"));
+            log(&format!("[-] {e}"));
             return 0;
         }
     };
@@ -311,10 +320,10 @@ pub async fn vote_on_profile(
     };
     let kind = if want_replies { Kind::Reply } else { Kind::Topic };
     log(&format!(
-        "🎯 Профиль: {} (id {}) → {} на {}",
+        "[=] Профиль: {} (id {}) → {} на {}",
         victim.name,
         victim.id,
-        if vote == Vote::Plus { "👍 плюсы ▲" } else { "👎 минусы ▼" },
+        if vote == Vote::Plus { "плюсы ▲" } else { "минусы ▼" },
         if want_replies { "ответы" } else { "посты" }
     ));
 
@@ -324,15 +333,15 @@ pub async fn vote_on_profile(
 
     loop {
         if stop.is_stopped() {
-            log("\n⛔ Остановлено пользователем");
+            log("\n[x] Остановлено пользователем");
             break;
         }
         if *blocked {
-            log("\n🛑 Блокировка mail.ru (418/429) — останавливаю аккаунт.");
+            log("\n[x] Блокировка mail.ru (418/429) — останавливаю аккаунт.");
             break;
         }
         if limit > 0 && processed >= limit {
-            log(&format!("\n🏁 Достигнут лимит {limit}."));
+            log(&format!("\n[=] Достигнут лимит {limit}."));
             break;
         }
 
@@ -351,17 +360,17 @@ pub async fn vote_on_profile(
             Ok(r) => r,
             Err(HttpError::Aborted) => break,
             Err(e) => {
-                log(&format!("⚠️  Не загрузить посты жертвы: {e}"));
+                log(&format!("[!] Не загрузить посты профиля: {e}"));
                 break;
             }
         };
         if r.blocked {
             *blocked = true;
-            log("🛑 Блокировка при загрузке постов жертвы.");
+            log("[x] Блокировка при загрузке постов профиля.");
             break;
         }
         if !r.ok {
-            log(&format!("⚠️  Не загрузить посты жертвы (HTTP {}).", r.status));
+            log(&format!("[!] Не загрузить посты профиля (HTTP {}).", r.status));
             break;
         }
         let items = r
@@ -371,7 +380,7 @@ pub async fn vote_on_profile(
             .cloned()
             .unwrap_or_default();
         if items.is_empty() {
-            log("📄 Посты/ответы кончились.");
+            log("[>] Посты/ответы кончились.");
             break;
         }
 
@@ -402,21 +411,22 @@ pub async fn vote_on_profile(
             match vote_one(core, acc, &target, vote, &referer, stop).await {
                 Ok(VoteRes::Ok) => {
                     success += 1;
-                    log(&format!("  ✅ {} #{id}", kind.ru()));
+                    progress.inc();
+                    log(&format!("  [+] {} #{id}", kind.ru()));
                 }
                 Ok(VoteRes::Blocked) => {
                     *blocked = true;
-                    log(&format!("🛑 Антибот на {} #{id} — стоп аккаунта.", kind.ru()));
+                    log(&format!("[x] Антибот на {} #{id} — стоп аккаунта.", kind.ru()));
                     break;
                 }
                 Ok(VoteRes::NoReg) => {
                     skipped += 1;
-                    log(&format!("  ⏭️  {} #{id} (не зарегался)", kind.ru()));
+                    log(&format!("  [!] {} #{id} (сервер отклонил)", kind.ru()));
                 }
                 Err(HttpError::Aborted) => break,
                 Err(e) => {
                     skipped += 1;
-                    log(&format!("  ⚠️  {} #{id}: {e}", kind.ru()));
+                    log(&format!("  [!] {} #{id}: {e}", kind.ru()));
                 }
             }
             processed += 1;
@@ -427,7 +437,7 @@ pub async fn vote_on_profile(
 
         let limit_hit = limit > 0 && processed >= limit;
         if fresh == 0 && !stop.is_stopped() && !*blocked && !limit_hit {
-            log("📄 Новых постов/ответов нет — стоп.");
+            log("[>] Новых постов/ответов нет — стоп.");
             break;
         }
         // Пагинация курсором = id последнего элемента страницы.
@@ -438,7 +448,7 @@ pub async fn vote_on_profile(
     }
 
     log(&format!(
-        "\n{}\n✅ Готово!  Проголосовано: {success}  |  Пропущено: {skipped}\n{}",
+        "\n{}\n[+] Готово! Проголосовано: {success} | Пропущено: {skipped}\n{}",
         "=".repeat(50),
         "=".repeat(50)
     ));
@@ -454,11 +464,20 @@ pub struct VoteParams {
     /// 0 = без лимита.
     pub limit: i64,
     pub check_auth: bool,
+    /// Живой счётчик для интерфейса.
+    pub progress: Progress,
 }
 
 impl Default for VoteParams {
     fn default() -> Self {
-        Self { targets: vec![], vote: Vote::Plus, delay: 2.0, limit: 0, check_auth: true }
+        Self {
+            targets: vec![],
+            vote: Vote::Plus,
+            delay: 2.0,
+            limit: 0,
+            check_auth: true,
+            progress: Progress::new(),
+        }
     }
 }
 
@@ -467,26 +486,30 @@ pub async fn run_votes(core: &Core, acc: &Account, p: &VoteParams, log: &Log, st
     let mut out = RunOutcome::default();
     let targets = crate::util::unique_targets(&p.targets);
     if targets.is_empty() {
-        log("❌ Не заданы ссылки.");
+        log("[-] Не заданы ссылки.");
         return out;
     }
 
     if p.check_auth {
-        let v = api::validate_account(core, acc, stop).await;
+        let v = api::validate_cached(core, acc, stop).await;
         api::persist_validation(core, &acc.name, &v);
         out.karma = v.karma.clone();
         if v.blocked {
             out.blocked = true;
-            log("🛑 Антибот (418/429) при проверке — статус не меняю.");
+            log("[x] Антибот (418/429) при проверке — статус не меняю.");
+        } else if v.banned {
+            log("[x] Аккаунт заблокирован сайтом — пропускаю. Сессия жива, но действия молча не проходят.");
+            out.skipped = true;
+            return out;
         } else if v.alive {
-            log("✅ Авторизован");
+            log("[+] Авторизован");
         } else if v.auth_bad {
-            log("🔒 НЕ авторизован");
+            log("[x] НЕ авторизован");
             log("Пропускаю аккаунт — не залогинен. Открой его через «Войти заново».");
             out.skipped = true;
             return out;
         } else {
-            log("⚠️  Не удалось проверить авторизацию (ошибка/сеть) — продолжаю, статус не трогаю.");
+            log("[!] Не удалось проверить авторизацию (ошибка/сеть) — продолжаю, статус не трогаю.");
         }
     }
 
@@ -494,20 +517,21 @@ pub async fn run_votes(core: &Core, acc: &Account, p: &VoteParams, log: &Log, st
     let total = targets.len();
     for (i, t) in targets.iter().enumerate() {
         if stop.is_stopped() {
-            log("\n⛔ Остановлено пользователем");
+            log("\n[x] Остановлено пользователем");
             break;
         }
         if blocked {
-            log("\n🛑 Блокировка mail.ru (418/429) — пропускаю остальные ссылки.");
+            log("\n[x] Блокировка mail.ru (418/429) — пропускаю остальные ссылки.");
             break;
         }
         if total > 1 {
-            log(&format!("\n🔗 Ссылка {}/{}: {}", i + 1, total, t));
+            log(&format!("\n[>] Ссылка {}/{}: {}", i + 1, total, t));
         }
         out.done += if is_single_target(t) {
-            vote_on_single(core, acc, t, p.vote, p.delay, log, stop, &mut blocked).await
+            vote_on_single(core, acc, t, p.vote, p.delay, log, stop, &mut blocked, &p.progress).await
         } else {
-            vote_on_profile(core, acc, t, p.vote, p.limit, p.delay, log, stop, &mut blocked).await
+            vote_on_profile(core, acc, t, p.vote, p.limit, p.delay, log, stop, &mut blocked, &p.progress)
+                .await
         };
     }
     out.blocked = blocked;

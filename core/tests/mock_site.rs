@@ -79,6 +79,16 @@ impl Mock {
     }
 
     /// Тело последнего запроса по пути, содержащему `needle`.
+    /// Все тела запросов по пути, содержащему `needle`.
+    pub fn bodies_matching(&self, needle: &str) -> Vec<serde_json::Value> {
+        self.bodies
+            .lock()
+            .iter()
+            .filter(|(p, _)| p.contains(needle))
+            .filter_map(|(_, b)| serde_json::from_str(b).ok())
+            .collect()
+    }
+
     pub fn last_body(&self, needle: &str) -> Option<serde_json::Value> {
         self.bodies
             .lock()
@@ -295,6 +305,7 @@ async fn votes_never_hit_the_same_post_twice() {
         &no_log(),
         &Stop::new(),
         &mut blocked,
+        &Default::default(),
     )
     .await;
 
@@ -334,6 +345,7 @@ async fn antibot_stops_the_account() {
         &no_log(),
         &Stop::new(),
         &mut blocked,
+        &Default::default(),
     )
     .await;
     assert_eq!(voted, 0);
@@ -365,6 +377,7 @@ async fn silently_rejected_vote_is_not_counted() {
         &no_log(),
         &Stop::new(),
         &mut blocked,
+        &Default::default(),
     )
     .await;
     assert_eq!(voted, 0, "молча отклонённый голос не должен считаться поставленным");
@@ -456,6 +469,7 @@ async fn feed_skips_answered_and_too_short() {
         &acc,
         &answered,
         &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
         10,
         &Stop::new(),
     )
@@ -507,6 +521,7 @@ async fn stop_interrupts_immediately() {
         &no_log(),
         &stop,
         &mut blocked,
+        &Default::default(),
     )
     .await;
     assert!(t.elapsed() < std::time::Duration::from_secs(5), "«Стоп» не прервал паузу: {:?}", t.elapsed());
@@ -589,6 +604,7 @@ async fn lost_response_does_not_resend_the_vote() {
         &no_log(),
         &Stop::new(),
         &mut blocked,
+        &Default::default(),
     )
     .await;
 
@@ -697,6 +713,7 @@ async fn vote_body_matches_contract() {
         &no_log(),
         &Stop::new(),
         &mut blocked,
+        &Default::default(),
     )
     .await;
     assert_eq!(voted, 1);
@@ -1000,6 +1017,7 @@ async fn dead_ai_key_stops_the_account() {
         feed_min: 0.0,
         feed_max: 0.0,
         check_auth: false,
+        verify_delay_sec: 0.0,
         ai: ai_cfg(&m.base),
         ..Default::default()
     };
@@ -1051,6 +1069,7 @@ async fn pool_image_is_attached_without_upload() {
         check_auth: false,
         image: answerer::ImageMode::Gif { selected: vec![] },
         image_count: 1,
+        verify_delay_sec: 0.0,
         ..Default::default()
     };
     let out = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
@@ -1102,6 +1121,7 @@ async fn conversation_memory_is_kept_and_sent_back() {
         check_auth: false,
         conversational: true,
         convo_budget_k: 0.0, // без сжатия
+        verify_delay_sec: 0.0,
         ai: ai_cfg(&m.base),
         ..Default::default()
     };
@@ -1123,5 +1143,1132 @@ async fn conversation_memory_is_kept_and_sent_back() {
         msgs.iter().any(|x| x["content"].as_str().unwrap_or("") == "ага, бывает"),
         "прошлый ответ не попал в историю: {ai_body}"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// ─── Лимиты, дедуп и отказы ────────────────────────────────────────────────
+
+/// Лимит ответов обязан держаться и когда пачка уходит РАЗОМ. Раньше все задачи
+/// пачки успевали увидеть «сделано 0» до первой отправки, и при лимите 2 и
+/// пачке 6 уходило шесть ответов.
+#[tokio::test]
+async fn parallel_batch_never_exceeds_the_limit() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("parlimit");
+    let acc = account("par-acc");
+
+    m.route(|r| {
+        if r.path.starts_with("/api/topic/feed") {
+            return Some(Res::json(
+                r#"{"result":{"feed":[
+                    {"id":901,"title":"Первый вопрос про жизнь"},
+                    {"id":902,"title":"Второй вопрос про жизнь"},
+                    {"id":903,"title":"Третий вопрос про жизнь"},
+                    {"id":904,"title":"Четвёртый вопрос про жизнь"},
+                    {"id":905,"title":"Пятый вопрос про жизнь"},
+                    {"id":906,"title":"Шестой вопрос про жизнь"}
+                ]}}"#,
+            ));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":1}}"#));
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::NoAi,
+        target: answerer::TargetMode::Feed,
+        limit: 2,
+        batch_size: 6,
+        parallel: true,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        feed_min: 0.0,
+        feed_max: 0.0,
+        check_auth: false,
+        verify_delay_sec: 0.0,
+        ..Default::default()
+    };
+    let out = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+
+    let posts = m.hits_matching("POST /api/topic/answers").len();
+    assert_eq!(posts, 2, "отправлено ответов сверх лимита: {posts}");
+    assert_eq!(out.done, 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Лимит подписок обязан обрывать список, а не проходить его целиком.
+/// Интерфейс его больше не задаёт (список ссылок и есть лимит), но у режима это
+/// часть договора: раз ограничение передали — оно должно сработать.
+#[tokio::test]
+async fn subscriptions_respect_the_limit() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("sublimit");
+    let acc = account("sub-acc");
+
+    m.route(|r| {
+        if r.path == "/api/topic/subscription" {
+            return Some(Res::json(r#"{"result":"Ok"}"#));
+        }
+        None
+    });
+
+    let p = otvet_core::subscribe::SubParams {
+        profiles: (1..=5).map(|i| format!("https://otvet.mail.ru/profile/id{i}")).collect(),
+        action: otvet_core::subscribe::SubAction::Subscribe,
+        delay: 0.0,
+        limit: 2,
+        check_auth: false,
+        progress: Default::default(),
+    };
+    let out = otvet_core::subscribe::run_subscriber(&core, &acc, &p, &no_log(), &Stop::new()).await;
+
+    assert_eq!(out.done, 2, "лимит подписок не сработал");
+    assert_eq!(m.hits_matching("/api/topic/subscription").len(), 2);
+}
+
+/// Готовые вопросы не должны повторяться внутри одного прогона: журнал
+/// читается один раз, поэтому список уже заданного нужно пополнять на лету.
+#[tokio::test]
+async fn ready_made_questions_do_not_repeat_in_one_run() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("askrepeat");
+    let acc = account("ask-acc");
+
+    m.route(|r| {
+        if r.method == "POST" && r.path == "/api/topic/question" {
+            static N: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+            let id = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Some(Res::json(format!(r#"{{"result":{{"id":{id}}}}}"#)));
+        }
+        // Проверка публикации: все вопросы на месте.
+        if let Some(id) = r.path.strip_prefix("/api/topic/question/") {
+            return Some(Res::json(format!(r#"{{"result":{{"id":{id}}}}}"#)));
+        }
+        None
+    });
+
+    // Шесть вопросов и шесть публикаций: со сломанным дедупом совпадение
+    // «все шесть разные» случайно выпадает в полутора случаях из ста.
+    let p = asker::AskParams {
+        mode: asker::AskMode::NoAi,
+        limit: 6,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        verify_delay_sec: 0.0,
+        check_auth: false,
+        noai_questions: vec![
+            "первый готовый вопрос".into(),
+            "второй готовый вопрос".into(),
+            "третий готовый вопрос".into(),
+            "четвёртый готовый вопрос".into(),
+            "пятый готовый вопрос".into(),
+            "шестой готовый вопрос".into(),
+        ],
+        ..Default::default()
+    };
+    let out = asker::run_asker(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out.done, 6);
+
+    let titles = otvet_core::journals::load_asked_titles(&dir, "ask-acc");
+    let uniq: std::collections::HashSet<&String> = titles.iter().collect();
+    assert_eq!(uniq.len(), titles.len(), "вопрос задан дважды за один прогон: {titles:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Одно и то же уведомление приходит в разных секциях ответа (`unread` и
+/// `day`). Отвечать на него дважды нельзя: в журнал id попадает только после
+/// отправки, поэтому дедуп нужен прямо в очереди.
+#[tokio::test]
+async fn duplicate_notification_is_answered_once() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("notifdup");
+    let acc = account("notif-acc");
+
+    m.route(|r| {
+        if r.path.starts_with("/api/notificator/notifications") {
+            let one = r#"{"id":42,"type":"new_reply_reply","entity_type":"reply","entity_id":777,
+                "page_uri":"/question/500","title":"мой ответ","body":"его реплика",
+                "created_at":"2026-08-01T10:00:00Z","authors":[{"id":5,"username":"vasya"}]}"#;
+            return Some(Res::json(format!(r#"{{"result":{{"unread":[{one}],"day":[{one}]}}}}"#)));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":9001}}"#));
+        }
+        if r.path.starts_with("/api/topic/answers/") {
+            // В ветке лежит и реплика собеседника, и наш ответ на неё: по
+            // второму бот проверяет, что отправленное не снесли.
+            return Some(Res::json(
+                r#"{"result":{"replies":[
+                    {"id":777,"content":{"type":"doc","content":[]},"author":{"id":5,"username":"vasya"}},
+                    {"id":9001,"content":{"type":"doc","content":[]},"author":{"id":1000,"username":"me"}}
+                ]}}"#,
+            ));
+        }
+        None
+    });
+
+    let p = replier::ReplyParams {
+        mode: replier::ReplyMode::NoAi,
+        limit: 0,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        max_age_hours: 0.0,
+        max_per_thread: 2,
+        pages: 1,
+        skip_own: false,
+        use_question: false,
+        use_chain: false,
+        check_auth: false,
+        verify_delay_sec: 0.0,
+        ..Default::default()
+    };
+    let out = replier::run_replier(&core, &acc, &p, &no_log(), &Stop::new()).await;
+
+    assert_eq!(out.done, 1, "на одну реплику ушло больше одного ответа");
+    assert_eq!(m.hits_matching("POST /api/topic/answers").len(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Сайт перестал принимать ответы (обычно — дневной лимит). Режим «Комменты»
+/// обязан остановиться после нескольких отказов подряд, а не перебирать всю
+/// очередь, оплачивая генерацию на каждую цель.
+#[tokio::test]
+async fn dead_daily_limit_stops_the_replier() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("replierfails");
+    let acc = account("fail-acc");
+
+    m.route(|r| {
+        if r.path.starts_with("/api/notificator/notifications") {
+            let items: Vec<String> = (0..10)
+                .map(|i| {
+                    format!(
+                        r#"{{"id":{},"type":"new_reply_reply","entity_type":"reply","entity_id":{},
+                        "page_uri":"/question/{}","title":"мой ответ","body":"реплика",
+                        "created_at":"2026-08-01T10:00:00Z","authors":[{{"id":5,"username":"vasya"}}]}}"#,
+                        100 + i,
+                        701 + i,
+                        600 + i
+                    )
+                })
+                .collect();
+            return Some(Res::json(format!(r#"{{"result":{{"unread":[{}]}}}}"#, items.join(","))));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res { status: 400, body: r#"{"message":"limit"}"#.into(), headers: vec![] });
+        }
+        if r.path.starts_with("/api/topic/answers/") {
+            let replies: Vec<String> = (0..10)
+                .map(|i| {
+                    format!(
+                        r#"{{"id":{},"content":{{"type":"doc","content":[]}},"author":{{"id":5,"username":"vasya"}}}}"#,
+                        701 + i
+                    )
+                })
+                .collect();
+            return Some(Res::json(format!(r#"{{"result":{{"replies":[{}]}}}}"#, replies.join(","))));
+        }
+        None
+    });
+
+    let p = replier::ReplyParams {
+        mode: replier::ReplyMode::NoAi,
+        limit: 0,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        max_age_hours: 0.0,
+        max_per_thread: 1,
+        pages: 1,
+        skip_own: false,
+        use_question: false,
+        use_chain: false,
+        check_auth: false,
+        ..Default::default()
+    };
+    let out = replier::run_replier(&core, &acc, &p, &no_log(), &Stop::new()).await;
+
+    assert_eq!(out.done, 0);
+    let posts = m.hits_matching("POST /api/topic/answers").len();
+    assert!(posts <= 5, "после пяти отказов подряд нужно остановиться, а попыток было {posts}");
+    assert!(posts >= 5, "остановились слишком рано: {posts}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// «Живость 0» — это ноль, а не «значение не задано»: раньше его молча
+/// подменяли на 0.7, и настройка не работала вообще.
+#[tokio::test]
+async fn zero_temperature_reaches_the_api() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("temp0");
+    let acc = account("temp-acc");
+
+    route_ai(m, "ответ");
+    m.route(|r| {
+        if r.path.starts_with("/api/topic/question/") {
+            return Some(Res::json(
+                r#"{"result":{"title":"Вопрос про жизнь","content":{"type":"doc","content":[]}}}"#,
+            ));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":1}}"#));
+        }
+        None
+    });
+
+    let mut ai = ai_cfg(&m.base);
+    ai.temperature = 0.0;
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::Ai,
+        target: answerer::TargetMode::Links,
+        links: vec![format!("{}/question/999", m.base)],
+        limit: 1,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        check_auth: false,
+        verify_delay_sec: 0.0,
+        ai,
+        ..Default::default()
+    };
+    let out = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out.done, 1);
+
+    let body = m.last_body("/v1/chat/completions").expect("запрос к нейросети");
+    assert_eq!(body["temperature"].as_f64(), Some(0.0), "температуру подменили: {body}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Сайт принял ответ, а через секунду его снесла автомодерация. Такой ответ
+/// нельзя ни засчитывать, ни записывать в журнал: вопрос остался без ответа.
+#[tokio::test]
+async fn vanished_answer_is_not_counted() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("vanished");
+    let acc = account("vanish-acc");
+
+    m.route(|r| {
+        if r.path.starts_with("/api/topic/question/") {
+            return Some(Res::json(
+                r#"{"result":{"title":"Вопрос про жизнь","content":{"type":"doc","content":[]}}}"#,
+            ));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":4242}}"#));
+        }
+        // В ветке нашего ответа нет — только чужой.
+        if r.path.starts_with("/api/topic/answers/") {
+            return Some(Res::json(
+                r#"{"result":{"replies":[{"id":777,"content":{"type":"doc","content":[]}}]}}"#,
+            ));
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::NoAi,
+        target: answerer::TargetMode::Links,
+        links: vec![format!("{}/question/555", m.base)],
+        limit: 1,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        check_auth: false,
+        verify_posted: true,
+        verify_delay_sec: 0.0,
+        ..Default::default()
+    };
+    let out = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+
+    assert_eq!(out.done, 0, "пропавший ответ засчитан как отправленный");
+    // Одна перегенерация: второй раз тем же текстом отправлять бессмысленно,
+    // а бесконечно долбиться — тем более.
+    let posts = m.hits_matching("POST /api/topic/answers").len();
+    assert_eq!(posts, 2, "ожидалась ровно одна повторная попытка, было {posts}");
+    let answered = otvet_core::journals::load_answered(&dir, "vanish-acc");
+    assert!(answered.is_empty(), "в журнал попал ответ, которого нет на сайте");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Ответ на месте — засчитываем и записываем в журнал.
+#[tokio::test]
+async fn present_answer_is_counted_once() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("present");
+    let acc = account("present-acc");
+
+    m.route(|r| {
+        if r.path.starts_with("/api/topic/question/") {
+            return Some(Res::json(
+                r#"{"result":{"title":"Вопрос про жизнь","content":{"type":"doc","content":[]}}}"#,
+            ));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":4242}}"#));
+        }
+        if r.path.starts_with("/api/topic/answers/") {
+            return Some(Res::json(
+                r#"{"result":{"replies":[{"id":4242,"content":{"type":"doc","content":[]}}]}}"#,
+            ));
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::NoAi,
+        target: answerer::TargetMode::Links,
+        links: vec![format!("{}/question/556", m.base)],
+        limit: 1,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        check_auth: false,
+        verify_posted: true,
+        verify_delay_sec: 0.0,
+        ..Default::default()
+    };
+    let out = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out.done, 1);
+    assert_eq!(m.hits_matching("POST /api/topic/answers").len(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Вопросы, заданные своими же аккаунтами, в работу не берутся.
+#[tokio::test]
+async fn own_questions_are_skipped() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("ownq");
+    let acc = account("own-acc");
+    // Свой второй аккаунт: id 4242 и ник «мойник».
+    let mut other = Account::new("другой мой");
+    other.user_id = Some(4242);
+    other.username = Some("мойник".into());
+    core.accounts.add(other).unwrap();
+
+    m.route(|r| {
+        if r.path.starts_with("/api/topic/feed") {
+            return Some(Res::json(
+                r#"{"result":{"feed":[
+                    {"id":1,"title":"Вопрос от чужого человека","author":{"id":7,"username":"vasya"}},
+                    {"id":2,"title":"Вопрос от моего аккаунта","author":{"id":4242,"username":"мойник"}},
+                    {"id":3,"title":"Ещё один мой вопрос","author":{"username":"МойНик"}}
+                ]}}"#,
+            ));
+        }
+        None
+    });
+
+    let mine = otvet_core::answerer::my_keys(&core);
+    let qs = otvet_core::answerer::collect_questions(
+        &core,
+        &acc,
+        &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
+        &mine,
+        10,
+        &Stop::new(),
+    )
+    .await
+    .unwrap();
+
+    let ids: Vec<&str> = qs.iter().map(|q| q.id.as_str()).collect();
+    assert_eq!(ids, vec!["1"], "свои вопросы попали в работу: {ids:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Пачка не должна превышать остаток лимита: иначе бот генерирует текст на
+/// вопросы, ответить на которые уже нельзя, и упирается в дневной лимит сайта.
+#[tokio::test]
+async fn batch_is_capped_by_the_remaining_limit() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("batchcap");
+    let acc = account("cap-acc");
+
+    route_ai(m, "ну такое");
+    m.route(|r| {
+        if r.path.starts_with("/api/topic/feed") {
+            let items: Vec<String> = (1..=20)
+                .map(|i| format!(r#"{{"id":{},"title":"Вопрос номер {i} про жизнь"}}"#, 300 + i))
+                .collect();
+            return Some(Res::json(format!(r#"{{"result":{{"feed":[{}]}}}}"#, items.join(","))));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":1}}"#));
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::Ai,
+        target: answerer::TargetMode::Feed,
+        limit: 3,
+        batch_size: 15,
+        // Пачкой разом: именно тут лишние вопросы стоят денег — каждый успевает
+        // сходить в нейросеть до того, как лимит закончится.
+        parallel: true,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        feed_min: 0.0,
+        feed_max: 0.0,
+        check_auth: false,
+        verify_posted: false,
+        ai: ai_cfg(&m.base),
+        ..Default::default()
+    };
+    let out = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+
+    assert_eq!(out.done, 3);
+    assert_eq!(m.hits_matching("POST /api/topic/answers").len(), 3);
+    // Главное: генераций не больше, чем ответов (+1 на проверку ключа).
+    // Иначе бот платит за текст, который отправить уже нельзя.
+    let gens = m.hits_matching("/v1/chat/completions").len();
+    assert!(gens <= 4, "лишние обращения к нейросети: {gens}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Под вопросом целая страница ответов — нашего в ней может не быть просто
+/// потому, что он не поместился. Считать его снесённым и слать второй нельзя:
+/// под вопросом окажутся два ответа от одного аккаунта.
+#[tokio::test]
+async fn full_page_of_answers_is_not_treated_as_vanished() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("fullpage");
+    let acc = account("page-acc");
+
+    m.route(|r| {
+        if r.path.starts_with("/api/topic/question/") {
+            return Some(Res::json(
+                r#"{"result":{"title":"Популярный вопрос про жизнь","content":{"type":"doc","content":[]}}}"#,
+            ));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":4242}}"#));
+        }
+        if r.path.starts_with("/api/topic/answers/") {
+            // Ровно страница чужих ответов, нашего нет.
+            let items: Vec<String> = (1..=20)
+                .map(|i| format!(r#"{{"id":{i},"content":{{"type":"doc","content":[]}}}}"#))
+                .collect();
+            return Some(Res::json(format!(r#"{{"result":{{"replies":[{}]}}}}"#, items.join(","))));
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::NoAi,
+        target: answerer::TargetMode::Links,
+        links: vec![format!("{}/question/557", m.base)],
+        limit: 1,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        check_auth: false,
+        verify_posted: true,
+        verify_delay_sec: 0.0,
+        ..Default::default()
+    };
+    let out = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+
+    assert_eq!(out.done, 1, "ответ засчитан не был");
+    assert_eq!(m.hits_matching("POST /api/topic/answers").len(), 1, "ушёл второй ответ на тот же вопрос");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Прогрев следующего аккаунта: раннер проверяет его, пока работает текущий,
+/// и режим стартует без трёх запросов на разогрев. Но ровно один раз — второй
+/// раз тот же результат отдавать нельзя, аккаунт мог разлогиниться.
+#[tokio::test]
+async fn warmed_validation_is_used_once() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("warm");
+    let acc = account("warm-acc");
+
+    m.route(|r| {
+        if r.path == "/api/auth/user" {
+            return Some(Res::json(r#"{"id":1000,"username":"botik"}"#));
+        }
+        if r.path.starts_with("/api/karma/score/") {
+            return Some(Res::json(
+                r#"{"result":{"total_score":5,"score":{"history":1,"knowledge":2,"discussion":2}}}"#,
+            ));
+        }
+        None
+    });
+
+    otvet_core::api::warm_account(&core, &acc, &Stop::new()).await;
+    let after_warm = m.hits_matching("/api/auth/user").len();
+    assert_eq!(after_warm, 1, "прогрев не сходил на сайт");
+
+    let v = otvet_core::api::validate_cached(&core, &acc, &Stop::new()).await;
+    assert!(v.alive);
+    assert_eq!(
+        m.hits_matching("/api/auth/user").len(),
+        after_warm,
+        "прогретая проверка всё равно полезла в сеть"
+    );
+
+    // Второй раз — уже честная проверка.
+    let _ = otvet_core::api::validate_cached(&core, &acc, &Stop::new()).await;
+    assert_eq!(
+        m.hits_matching("/api/auth/user").len(),
+        after_warm + 1,
+        "прогретый результат отдан повторно — так можно проспать разлогин"
+    );
+}
+
+/// Вопрос, который снесла автомодерация, засчитывать нельзя: иначе «задано 5»
+/// при пустом профиле, а лимит на аккаунт съеден впустую.
+#[tokio::test]
+async fn vanished_question_is_not_counted() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("askvanish");
+    let acc = account("ask-vanish");
+
+    m.route(|r| {
+        if r.method == "POST" && r.path == "/api/topic/question" {
+            return Some(Res::json(r#"{"result":{"id":501}}"#));
+        }
+        // Сайт принял вопрос и тут же его снёс.
+        if r.path.starts_with("/api/topic/question/") {
+            return Some(Res::status(404));
+        }
+        None
+    });
+
+    let p = asker::AskParams {
+        mode: asker::AskMode::NoAi,
+        limit: 3,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        verify_delay_sec: 0.0,
+        check_auth: false,
+        noai_questions: vec!["первый".into(), "второй".into(), "третий".into(), "четвёртый".into()],
+        ..Default::default()
+    };
+    let out = asker::run_asker(&core, &acc, &p, &no_log(), &Stop::new()).await;
+
+    assert_eq!(out.done, 0, "снесённый вопрос попал в счёт");
+    assert!(
+        otvet_core::journals::load_asked_titles(&dir, "ask-vanish").is_empty(),
+        "снесённый вопрос попал в журнал — потом его не повторят, хотя он не публиковался"
+    );
+    // Пять отказов подряд — и аккаунт останавливается, а не крутится вечно.
+    assert_eq!(m.hits_matching("POST /api/topic/question").len(), 5, "бот не остановился после отказов");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Не смогли проверить — считаем опубликованным. Ошибка в другую сторону
+/// стоит второго такого же вопроса от того же аккаунта.
+#[tokio::test]
+async fn unverifiable_question_still_counts() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("askunknown");
+    let acc = account("ask-unknown");
+
+    m.route(|r| {
+        if r.method == "POST" && r.path == "/api/topic/question" {
+            return Some(Res::json(r#"{"result":{"id":777}}"#));
+        }
+        if r.path.starts_with("/api/topic/question/") {
+            return Some(Res::status(500));
+        }
+        None
+    });
+
+    let p = asker::AskParams {
+        mode: asker::AskMode::NoAi,
+        limit: 1,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        verify_delay_sec: 0.0,
+        check_auth: false,
+        noai_questions: vec!["единственный".into()],
+        ..Default::default()
+    };
+    let out = asker::run_asker(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out.done, 1);
+    assert_eq!(otvet_core::journals::load_asked_titles(&dir, "ask-unknown").len(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Выключенная проверка не должна стоить ни одного лишнего запроса.
+#[tokio::test]
+async fn verification_off_does_not_check_questions() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("asknocheck");
+    let acc = account("ask-nocheck");
+
+    m.route(|r| {
+        if r.method == "POST" && r.path == "/api/topic/question" {
+            return Some(Res::json(r#"{"result":{"id":888}}"#));
+        }
+        None
+    });
+
+    let p = asker::AskParams {
+        mode: asker::AskMode::NoAi,
+        limit: 1,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        verify_posted: false,
+        check_auth: false,
+        noai_questions: vec!["без проверки".into()],
+        ..Default::default()
+    };
+    let out = asker::run_asker(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out.done, 1);
+    assert!(
+        m.hits_matching("GET /api/topic/question/").is_empty(),
+        "проверка выключена, а запрос всё равно ушёл"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Забаненный аккаунт сайт отдаёт как ЖИВОЙ: 200, профиль на месте, куки
+/// рабочие. Отличие одно — `user_status: -1`. Без него бот числил такой аккаунт
+/// живым и каждый прогон тратил на него проход: голоса «не регистрируются»,
+/// ответы не появляются, а в логе бодрое «Авторизован».
+#[tokio::test]
+async fn banned_account_is_seen_and_skipped() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("banned");
+    core.accounts.add(account("banned-acc")).unwrap();
+    let acc = core.accounts.get("banned-acc").unwrap();
+
+    m.route(|r| {
+        if r.path == "/api/auth/user" {
+            return Some(Res::json(r#"{"id":100200301,"username":"botik","user_status":-1}"#));
+        }
+        if r.path.starts_with("/api/karma/score/") {
+            return Some(Res::json(
+                r#"{"result":{"total_score":-39,"score":{"history":0,"knowledge":-4,"discussion":-35}}}"#,
+            ));
+        }
+        None
+    });
+
+    let v = otvet_core::api::validate_account(&core, &acc, &Stop::new()).await;
+    assert!(v.alive, "сессия и правда живая — этим бан и коварен");
+    assert!(v.banned, "бан не распознан");
+    otvet_core::api::persist_validation(&core, "banned-acc", &v);
+    assert_eq!(
+        core.accounts.get("banned-acc").and_then(|a| a.banned),
+        Some(true),
+        "бан не сохранился в accounts.json"
+    );
+
+    // И режим обязан такой аккаунт пропустить, а не тратить на него проход.
+    let p = votes::VoteParams {
+        targets: vec!["https://otvet.mail.ru/question/12345".into()],
+        vote: Vote::Plus,
+        delay: 0.0,
+        limit: 0,
+        check_auth: true,
+        progress: Default::default(),
+    };
+    let out = votes::run_votes(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert!(out.skipped, "заблокированный аккаунт должен пропускаться");
+    assert_eq!(out.done, 0);
+    assert!(
+        m.hits_matching("POST /api/topic/topics").is_empty(),
+        "в бан улетел запрос — проход потрачен впустую"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Обычный аккаунт (`user_status: 0`) баном считаться не должен, а снятый бан
+/// обязан сняться и в файле.
+#[tokio::test]
+async fn normal_status_clears_the_ban_flag() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("unbanned");
+    let mut a = Account::new("unban-acc");
+    a.cookies = Some("Mpop=x".into());
+    a.banned = Some(true);
+    core.accounts.add(a).unwrap();
+    let acc = core.accounts.get("unban-acc").unwrap();
+
+    m.route(|r| {
+        if r.path == "/api/auth/user" {
+            return Some(Res::json(r#"{"id":1,"username":"botik","user_status":0}"#));
+        }
+        None
+    });
+
+    let v = otvet_core::api::validate_account(&core, &acc, &Stop::new()).await;
+    assert!(!v.banned);
+    otvet_core::api::persist_validation(&core, "unban-acc", &v);
+    assert_eq!(core.accounts.get("unban-acc").and_then(|a| a.banned), Some(false), "бан не снялся");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Пауза должна останавливать прогон целиком, а не «на словах»: пока она стоит,
+/// на сайт не уходит ни одного запроса, а после «Продолжить» работа идёт с того
+/// же места, не теряя ни цели, ни счёта.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_freezes_the_run_and_resume_finishes_it() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("pause");
+    let acc = account("pause-acc");
+
+    m.route(|r| {
+        if r.method == "POST" && r.path.starts_with("/api/topic/topics/") {
+            return Some(Res::json(r#"{"result":{"user_reaction":1}}"#));
+        }
+        None
+    });
+
+    let stop = Stop::new();
+    let p = votes::VoteParams {
+        targets: (1..=4).map(|i| format!("https://otvet.mail.ru/question/100{i}")).collect(),
+        vote: Vote::Plus,
+        delay: 0.2,
+        limit: 0,
+        check_auth: false,
+        progress: Default::default(),
+    };
+    let task = {
+        let (core, acc, stop) = (core.clone(), acc.clone(), stop.clone());
+        tokio::spawn(async move { votes::run_votes(&core, &acc, &p, &no_log(), &stop).await })
+    };
+
+    // Ждём первый голос, затем встаём на паузу.
+    for _ in 0..100 {
+        if !m.hits_matching("POST /api/topic/topics/").is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    stop.pause();
+    let frozen = m.hits_matching("POST /api/topic/topics/").len();
+    assert!(frozen >= 1, "прогон не начался — тест ни о чём");
+
+    // Пауза 0.2 с между голосами: за полсекунды без паузы ушло бы ещё два.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        m.hits_matching("POST /api/topic/topics/").len(),
+        frozen,
+        "на паузе бот всё равно ходил на сайт"
+    );
+    assert!(!task.is_finished(), "на паузе прогон завершился сам");
+
+    stop.resume();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("после «Продолжить» прогон не ожил")
+        .unwrap();
+    assert_eq!(out.done, 4, "после паузы прогон обязан доделать оставшееся");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Своих тем может быть несколько, и каждая — отдельная тема, а не один длинный
+/// текст. Раньше поле было однострочным, и весь список уехал бы в промпт целиком.
+#[tokio::test]
+async fn every_question_takes_one_topic_from_the_list() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("topics");
+    let acc = account("topic-acc");
+
+    route_ai(m, "Что посмотреть вечером?");
+    m.route(|r| {
+        if r.method == "POST" && r.path == "/api/topic/question" {
+            return Some(Res::json(r#"{"result":{"id":321}}"#));
+        }
+        if let Some(id) = r.path.strip_prefix("/api/topic/question/") {
+            return Some(Res::json(format!(r#"{{"result":{{"id":{id}}}}}"#)));
+        }
+        None
+    });
+
+    let topics = vec!["кино".to_string(), "еда".to_string(), "работа".to_string()];
+    let p = asker::AskParams {
+        mode: asker::AskMode::Ai,
+        limit: 5,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        verify_delay_sec: 0.0,
+        check_auth: false,
+        topics: topics.clone(),
+        ai: ai_cfg(&m.base),
+        ..Default::default()
+    };
+    let out = asker::run_asker(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out.done, 5);
+
+    // Первый запрос к нейросети — проверка ключа, темы в нём нет.
+    let asked: Vec<String> = m
+        .bodies_matching("/v1/chat/completions")
+        .iter()
+        .filter_map(|body| {
+            let user = body["messages"].as_array()?.iter().find(|x| x["role"] == "user")?["content"]
+                .as_str()?
+                .to_string();
+            // После темы в сообщении идёт ещё абзац с требованием к заголовку.
+            user.split("на тему: ").nth(1).map(|t| t.lines().next().unwrap_or_default().trim().to_string())
+        })
+        .collect();
+    assert_eq!(asked.len(), 5, "тема должна уходить в каждый запрос: {asked:?}");
+    for t in &asked {
+        assert!(topics.contains(t), "нейросети ушла не тема из списка, а «{t}» — весь список целиком?");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Сайт может отказаться принимать конкретный текст (ссылка в ответе, слишком
+/// коротко, спам-фильтр). Ответа при этом не создаётся, поэтому правильный ход —
+/// сочинить другой текст и отправить ещё раз, а не терять вопрос целиком.
+#[tokio::test]
+async fn refused_answer_is_retried_with_another_text() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("refused");
+    let acc = account("refuse-acc");
+
+    m.route(|r| {
+        if r.path.starts_with("/api/topic/question/") {
+            return Some(Res::json(
+                r#"{"result":{"title":"Вопрос про жизнь","content":{"type":"doc","content":[]}}}"#,
+            ));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            static N: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            // Первый текст сайт отвергает, второй принимает.
+            return Some(if N.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Res {
+                    status: 400, ..Res::json(r#"{"error":{"message":"текст не прошёл модерацию"}}"#)
+                }
+            } else {
+                Res::json(r#"{"result":{"id":4242}}"#)
+            });
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::NoAi,
+        target: answerer::TargetMode::Links,
+        links: vec![format!("{}/question/555", m.base)],
+        limit: 1,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        verify_posted: false,
+        check_auth: false,
+        ..Default::default()
+    };
+    let out = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+
+    assert_eq!(out.done, 1, "после отказа ответ так и не ушёл");
+    assert_eq!(
+        m.hits_matching("POST /api/topic/answers").len(),
+        2,
+        "второй попытки не было — вопрос потеряли"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// То же для вопросов: отказ по тексту — повод сочинить другой, а не считать
+/// его неудачей и не идти дальше с тем же самым.
+#[tokio::test]
+async fn refused_question_is_replaced_by_another() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("refusedq");
+    let acc = account("refuseq-acc");
+
+    m.route(|r| {
+        if r.method == "POST" && r.path == "/api/topic/question" {
+            static N: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            return Some(if N.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Res {
+                    status: 422, ..Res::json(r#"{"error":"нельзя такое спрашивать"}"#)
+                }
+            } else {
+                Res::json(r#"{"result":{"id":900}}"#)
+            });
+        }
+        if let Some(id) = r.path.strip_prefix("/api/topic/question/") {
+            return Some(Res::json(format!(r#"{{"result":{{"id":{id}}}}}"#)));
+        }
+        None
+    });
+
+    let p = asker::AskParams {
+        mode: asker::AskMode::NoAi,
+        limit: 1,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        verify_delay_sec: 0.0,
+        check_auth: false,
+        noai_questions: vec!["первый готовый".into(), "второй готовый".into()],
+        ..Default::default()
+    };
+    let out = asker::run_asker(&core, &acc, &p, &no_log(), &Stop::new()).await;
+
+    assert_eq!(out.done, 1, "после отказа вопрос так и не опубликовался");
+    assert_eq!(m.hits_matching("POST /api/topic/question").len(), 2, "второй попытки не было");
+    // Отвергнутый заголовок не должен попасть в журнал: его на сайте нет.
+    let titles = otvet_core::journals::load_asked_titles(&dir, "refuseq-acc");
+    assert_eq!(titles.len(), 1, "в журнал попал и отвергнутый вопрос: {titles:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// И в «Комментах»: отвергнутая реплика возвращается в очередь и пишется
+/// заново. Одна попытка на цель — если сайт отказывает и второй, дело не в тексте.
+#[tokio::test]
+async fn refused_reply_is_written_again_once() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("refusedr");
+    let acc = account("refuser-acc");
+
+    m.route(|r| {
+        if r.path.starts_with("/api/notificator/notifications") {
+            let one = r#"{"id":7,"type":"new_reply_reply","entity_type":"reply","entity_id":700,
+                "page_uri":"/question/600","title":"мой ответ","body":"его реплика",
+                "created_at":"2026-08-01T10:00:00Z","authors":[{"id":42,"username":"vasya"}]}"#;
+            return Some(Res::json(format!(r#"{{"result":{{"unread":[{one}]}}}}"#)));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            static N: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            return Some(if N.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Res { status: 400, ..Res::json(r#"{"error":"нельзя"}"#) }
+            } else {
+                Res::json(r#"{"result":{"id":808}}"#)
+            });
+        }
+        if r.path.starts_with("/api/topic/answers/") {
+            return Some(Res::json(
+                r#"{"result":{"replies":[
+                    {"id":700,"content":{"type":"doc","content":[]},"author":{"id":42,"username":"vasya"}}
+                ]}}"#,
+            ));
+        }
+        None
+    });
+
+    let p = replier::ReplyParams {
+        mode: replier::ReplyMode::NoAi,
+        limit: 1,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        max_age_hours: 0.0,
+        max_per_thread: 2,
+        pages: 1,
+        skip_own: false,
+        use_question: false,
+        use_chain: false,
+        verify_posted: false,
+        check_auth: false,
+        noai_replies: vec!["ага".into(), "ну да".into()],
+        ..Default::default()
+    };
+    let out = replier::run_replier(&core, &acc, &p, &no_log(), &Stop::new()).await;
+
+    assert_eq!(out.done, 1, "после отказа реплика так и не ушла");
+    assert_eq!(m.hits_matching("POST /api/topic/answers").len(), 2, "второй попытки не было");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Ответы по диапазону номеров — в том числе на вопросы, которых ещё нет.
+/// Номера у mail.ru идут подряд, и сайт принимает ответ авансом. Проверяем, что
+/// бот идёт по диапазону подряд, уважает лимит и не отвечает дважды при
+/// повторном запуске того же диапазона.
+#[tokio::test]
+async fn range_answers_go_in_order_and_respect_the_journal() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("range");
+    let acc = account("range-acc");
+
+    m.route(|r| {
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            static N: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+            let id = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Some(Res::json(format!(r#"{{"result":{{"id":{id}}}}}"#)));
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::Ai, // ядро обязано само перевести это в готовые фразы
+        target: answerer::TargetMode::Range,
+        range_from: 100,
+        range_to: 104,
+        limit: 3,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        check_auth: false,
+        ..Default::default()
+    };
+    let out = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out.done, 3, "лимит в диапазоне не сработал");
+    assert!(!out.exhausted, "диапазон не пройден — упёрлись в лимит, работа осталась");
+
+    let ids: Vec<i64> =
+        m.bodies_matching("/api/topic/answers").iter().filter_map(|b| b["topic_id"].as_i64()).collect();
+    assert_eq!(ids, vec![100, 101, 102], "диапазон прошли не по порядку");
+    // Нейросеть не спрашивали: вопроса ещё нет, писать не о чем.
+    assert!(m.hits_matching("/v1/chat/completions").is_empty(), "в диапазоне позвали нейросеть");
+    // И страницу вопроса не читали — её тоже ещё нет.
+    assert!(m.hits_matching("GET /api/topic/question/").is_empty(), "лишний запрос за текстом вопроса");
+
+    // Второй запуск того же диапазона продолжает с того места, где остановились.
+    let out2 = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+    assert_eq!(out2.done, 2, "повторный запуск не дошёл до хвоста диапазона");
+    assert!(out2.exhausted, "диапазон пройден целиком — прогон должен об этом сказать");
+    let ids: Vec<i64> =
+        m.bodies_matching("/api/topic/answers").iter().filter_map(|b| b["topic_id"].as_i64()).collect();
+    assert_eq!(ids, vec![100, 101, 102, 103, 104], "по одному из вопросов ответили дважды");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Слова-приметы: из ленты берутся только вопросы, где они встретились.
+/// Остальные не берутся вовсе — ни лимита, ни запроса к нейросети на них не
+/// тратим, а текст ответа остаётся обычным, от нейросети.
+#[tokio::test]
+async fn keywords_filter_the_feed() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("trigger");
+    let acc = account("trig-acc");
+
+    route_ai(m, "ответ от нейросети");
+    m.route(|r| {
+        if r.path.starts_with("/api/topic/feed") {
+            return Some(Res::json(
+                r#"{"result":{"feed":[
+                    {"id":900,"title":"Какой VPN сейчас работает?","content":{"type":"doc","content":[]},
+                     "author":{"id":7,"nick":"вася","username":"vasya"}},
+                    {"id":901,"title":"Что приготовить на ужин по-быстрому?","content":{"type":"doc","content":[]},
+                     "author":{"id":8,"nick":"петя","username":"petya"}}
+                ]}}"#,
+            ));
+        }
+        if r.method == "POST" && r.path == "/api/topic/answers" {
+            return Some(Res::json(r#"{"result":{"id":555}}"#));
+        }
+        None
+    });
+
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::Ai,
+        target: answerer::TargetMode::Feed,
+        // Ровно один: лента в заглушке не меняется, и без лимита прогон стоял бы
+        // и ждал новых вопросов — так он и должен себя вести.
+        limit: 1,
+        recent_scan: 10,
+        delay_min: 0.0,
+        delay_max: 0.0,
+        feed_min: 0.0,
+        feed_max: 0.0,
+        verify_posted: false,
+        check_auth: false,
+        skip_own_authors: false,
+        keywords: answerer::parse_keywords("vpn, впн"),
+        ai: ai_cfg(&m.base),
+        ..Default::default()
+    };
+    let out = answerer::run_answerer(&core, &acc, &p, &no_log(), &Stop::new()).await;
+
+    assert_eq!(out.done, 1, "ответить надо ровно на один вопрос — про VPN");
+    let body = m.last_body("/api/topic/answers").expect("ответ ушёл");
+    assert_eq!(body["topic_id"].as_i64(), Some(900), "ответили не на тот вопрос");
+    assert!(body.to_string().contains("ответ от нейросети"), "текст должен быть от нейросети: {body}");
+    // Про ужин нейросеть не спрашивали: этот вопрос из ленты вообще не берётся.
+    let about_dinner =
+        m.bodies_matching("/v1/chat/completions").iter().filter(|b| b.to_string().contains("ужин")).count();
+    assert_eq!(about_dinner, 0, "лишний вопрос уехал в нейросеть — это деньги на ветер");
     let _ = std::fs::remove_dir_all(dir);
 }

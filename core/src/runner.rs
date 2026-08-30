@@ -37,6 +37,8 @@ pub struct RunnerCfg {
     pub round_pause_min: f64,
     /// Порог сетевых сбоев для ротации прокси.
     pub proxy_rotate_fails: u32,
+    /// Прогревать следующий аккаунт, пока работает текущий.
+    pub prefetch_next: bool,
 }
 
 impl Default for RunnerCfg {
@@ -48,6 +50,7 @@ impl Default for RunnerCfg {
             repeat_rounds: false,
             round_pause_min: 0.0,
             proxy_rotate_fails: 2,
+            prefetch_next: true,
         }
     }
 }
@@ -71,7 +74,7 @@ pub async fn run(
 ) -> RunSummary {
     let mut summary = RunSummary::default();
     if accounts.is_empty() {
-        log("❌ Не выбран ни один аккаунт с куками. Добавь аккаунт (вход через браузер или вставка кук) и отметь галочкой.");
+        log("[-] Не выбран ни один аккаунт с куками. Добавь аккаунт (вход через браузер или вставка кук) и отметь галочкой.");
         return summary;
     }
 
@@ -83,7 +86,7 @@ pub async fn run(
     let concurrency = cfg.concurrency.clamp(1, accounts.len());
     let prefixed = concurrency > 1;
     log(&format!(
-        "🚀 Аккаунтов: {} | одновременно: {}{}",
+        "[=] Аккаунтов: {} | одновременно: {}{}",
         accounts.len(),
         concurrency,
         if prefixed { " (параллельно)" } else { " (по очереди)" }
@@ -91,7 +94,7 @@ pub async fn run(
 
     if cfg.repeat_rounds {
         log(&format!(
-            "🔁 Повтор кругов включён — новый круг через {} мин (до «Стоп»). Лимит: всего {}, за круг {}.",
+            "[=] Повтор кругов включён — новый круг через {} мин (до «Стоп»). Лимит: всего {}, за круг {}.",
             cfg.round_pause_min,
             if cfg.total_limit > 0 { cfg.total_limit.to_string() } else { "∞".into() },
             if cfg.round_limit > 0 { cfg.round_limit.to_string() } else { "∞".into() },
@@ -109,7 +112,7 @@ pub async fn run(
         round += 1;
         if cfg.repeat_rounds {
             log(&format!("\n{}", "═".repeat(48)));
-            log(&format!("🔄 Круг {round}"));
+            log(&format!("[=] Круг {round}"));
             log(&"═".repeat(48));
         }
 
@@ -132,20 +135,28 @@ pub async fn run(
             break;
         }
         if pass.processed == 0 {
-            log("\n🏁 Все аккаунты исчерпали общий лимит — продолжать нечем. Останавливаюсь.");
+            // Причина бывает любой: лимит, разлогин, бан, нет кук. Общее одно —
+            // за целый круг никто не отработал, и следующий будет таким же.
+            log("\n[=] За круг не отработал ни один аккаунт (лимит, разлогин или бан). Останавливаюсь.");
+            break;
+        }
+        // Работа кончилась по существу: диапазон номеров пройден целиком. В
+        // ленте так не бывает — там новые вопросы появляются сами.
+        if pass.exhausted >= pass.processed {
+            log("\n[=] Работа кончилась: отвечать больше не на что. Останавливаюсь.");
             break;
         }
         log(&format!(
-            "\n📊 Круг {round} завершён. Антибот: {}, по лимиту/готово: {} (из {}).",
-            pass.blocked,
+            "\n[=] Круг {round} завершён. Отработали: {} из {}, поймали антибот: {}.",
             accounts.len() - pass.blocked,
-            accounts.len()
+            accounts.len(),
+            pass.blocked
         ));
 
         let wait_ms = (cfg.round_pause_min * 60_000.0) as u64;
         if wait_ms > 0 {
             log(&format!(
-                "⏳ Пауза перед кругом {}: {} (можно нажать «Стоп»)...",
+                "[>] Пауза перед кругом {}: {} (можно нажать «Стоп»)...",
                 round + 1,
                 fmt_left(wait_ms)
             ));
@@ -155,18 +166,25 @@ pub async fn run(
         }
     }
 
+    // Ротация кук пишется на диск с задержкой — дописываем хвост, пока прогон
+    // ещё в руках у нас, а не в момент, когда программу закрыли.
+    core.accounts.flush();
+
     summary.rounds = round;
     summary.stopped = stop.is_stopped();
     if summary.stopped {
-        log("\n⛔ Остановлено пользователем");
+        log("\n[x] Остановлено пользователем");
     }
-    log("\n🎉 Готово по всем аккаунтам.");
+    log("\n[+] Готово по всем аккаунтам.");
     summary
 }
 
 struct PassResult {
     blocked: usize,
     processed: usize,
+    /// Сколько аккаунтов сказали «работы больше нет» — например, диапазон
+    /// номеров пройден целиком.
+    exhausted: usize,
     done: i64,
 }
 
@@ -185,6 +203,7 @@ async fn run_one_pass(
     let idx = Arc::new(AtomicUsize::new(0));
     let blocked = Arc::new(AtomicUsize::new(0));
     let processed = Arc::new(AtomicUsize::new(0));
+    let exhausted = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(parking_lot::Mutex::new(0i64));
     let total = accounts.len();
 
@@ -193,6 +212,7 @@ async fn run_one_pass(
         let idx = idx.clone();
         let blocked = blocked.clone();
         let processed = processed.clone();
+        let exhausted = exhausted.clone();
         let done = done.clone();
         let accounts: Vec<Account> = accounts.to_vec();
         let run_one = run_one.clone();
@@ -207,6 +227,11 @@ async fn run_one_pass(
                 if stop.is_stopped() {
                     return;
                 }
+                // На паузе новый аккаунт не берём: пусть очередь стоит целиком,
+                // а не «текущий доработал, следующий уже пошёл».
+                if stop.hold().await {
+                    return;
+                }
                 let i = idx.fetch_add(1, Ordering::SeqCst);
                 if i >= accounts.len() {
                     return;
@@ -216,7 +241,7 @@ async fn run_one_pass(
                 let already = *done_by_acc.lock().get(&acc.name).unwrap_or(&0);
                 if cfg.total_limit > 0 && already >= cfg.total_limit {
                     log(&format!(
-                        "⏭️  {}: общий лимит {} исчерпан — пропускаю круг",
+                        "[!] {}: общий лимит {} исчерпан — пропускаю круг",
                         acc.name, cfg.total_limit
                     ));
                     continue;
@@ -234,23 +259,23 @@ async fn run_one_pass(
                 acc.set_rotate_log(acc_log.clone());
 
                 if prefixed {
-                    log(&format!("🟢 Старт: {} ({}/{})", acc.name, i + 1, total));
+                    log(&format!("[>] Старт: {} ({}/{})", acc.name, i + 1, total));
                 } else {
                     log(&format!("\n{}", "═".repeat(48)));
-                    log(&format!("👤 Аккаунт {}/{}: {}", i + 1, total, acc.name));
+                    log(&format!("[=] Аккаунт {}/{}: {}", i + 1, total, acc.name));
                     log(&"═".repeat(48));
                 }
 
                 let prxs = acc.proxy_list();
                 if prxs.len() > 1 {
                     acc_log(&format!(
-                        "🌐 Прокси: {} (×{}, ротация при {} сбоях)",
+                        "[>] Прокси: {} (×{}, ротация при {} сбоях)",
                         prxs.iter().map(|p| crate::proxy::mask_proxy(p)).collect::<Vec<_>>().join(" | "),
                         prxs.len(),
                         cfg.proxy_rotate_fails
                     ));
                 } else if let Some(p) = acc.active_proxy() {
-                    acc_log(&format!("🌐 Прокси: {}", crate::proxy::mask_proxy(&p)));
+                    acc_log(&format!("[>] Прокси: {}", crate::proxy::mask_proxy(&p)));
                 }
 
                 // Лимит на этот проход = строжайший из остатка общего и лимита круга.
@@ -258,6 +283,20 @@ async fn run_one_pass(
                 let round_limit = if cfg.round_limit > 0 { cfg.round_limit } else { i64::MAX };
                 let effective = remain_total.min(round_limit);
                 let pass_limit = if effective == i64::MAX { 0 } else { effective.max(0) };
+
+                // Пока этот аккаунт работает, проверяем следующий по очереди:
+                // авторизация и карма — три запроса, и делать их на старте, пока
+                // человек смотрит в пустой лог, незачем. Только для работы по
+                // очереди: при параллельном прогоне аккаунты и так перекрываются.
+                if cfg.prefetch_next && concurrency == 1 {
+                    if let Some(next) = accounts.get(i + 1).cloned() {
+                        let core = core.clone();
+                        let stop = stop.clone();
+                        tokio::spawn(async move {
+                            crate::api::warm_account(&core, &next, &stop).await;
+                        });
+                    }
+                }
 
                 let res = run_one(acc.clone(), pass_limit, acc_log.clone(), stop.clone()).await;
 
@@ -272,6 +311,9 @@ async fn run_one_pass(
                 if !res.skipped {
                     processed.fetch_add(1, Ordering::SeqCst);
                 }
+                if res.exhausted {
+                    exhausted.fetch_add(1, Ordering::SeqCst);
+                }
             }
         }));
     }
@@ -284,6 +326,7 @@ async fn run_one_pass(
     PassResult {
         blocked: blocked.load(Ordering::SeqCst),
         processed: processed.load(Ordering::SeqCst),
+        exhausted: exhausted.load(Ordering::SeqCst),
         done: done_total,
     }
 }
@@ -315,7 +358,7 @@ async fn countdown(wait_ms: u64, next_round: i64, log: &Log, stop: &Stop) -> boo
         let bucket = left.div_ceil(step);
         if bucket < last_bucket {
             last_bucket = bucket;
-            log(&format!("⏳ До круга {next_round}: осталось {}", fmt_left(left)));
+            log(&format!("[>] До круга {next_round}: осталось {}", fmt_left(left)));
         }
     }
 }

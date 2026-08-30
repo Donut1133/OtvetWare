@@ -107,18 +107,13 @@ pub fn install(ctx: &egui::Context) {
     });
 }
 
-/// Яркость строки лога по её смыслу. Цвета нет — есть «громкость».
-pub fn log_color(line: &str) -> Color32 {
-    let t = line.trim_start();
-    let head = t.chars().next().unwrap_or(' ');
-    match head {
-        // успех и итоги — самое яркое
-        '✅' | '🎉' => FG_STRONG,
-        // проблемы — светлее фона, но глуше успеха
-        '❌' | '🛑' | '🔒' | '⛔' => BAD,
-        '⚠' | '⏭' | '🔄' | '⏳' => WARN,
-        // служебное: заголовки аккаунтов, разделители
-        '👤' | '═' | '─' | '🚀' | '🔁' | '📊' => FG_DIM,
+/// Яркость строки лога по её маркеру. Цвета нет — есть «громкость».
+pub fn log_color(mark: Option<char>) -> Color32 {
+    match mark {
+        Some('+') => FG_STRONG, // получилось — самое яркое
+        Some('-') | Some('x') => BAD,
+        Some('!') => WARN,
+        Some('=') => FG_DIM, // заголовки и итоги
         _ => FG,
     }
 }

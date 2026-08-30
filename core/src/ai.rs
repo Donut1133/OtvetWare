@@ -213,7 +213,7 @@ impl AiClient {
                 Ok(a) if !a.is_empty() => return Ok(a),
                 Ok(a) => {
                     if i + 1 < attempts {
-                        log(&format!("   ⚠️  Пустой ответ — повторю ({}/{attempts})", i + 1));
+                        log(&format!("   [!] Пустой ответ — повторю ({}/{attempts})", i + 1));
                         if stop.sleep_ms(1500).await {
                             return Err(AiError::Aborted);
                         }
@@ -224,7 +224,7 @@ impl AiClient {
                 Err(AiError::Aborted) => return Err(AiError::Aborted),
                 Err(e) => {
                     if i + 1 < attempts {
-                        log(&format!("   ⚠️  {e} — повторю ({}/{attempts})", i + 1));
+                        log(&format!("   [!] {e} — повторю ({}/{attempts})", i + 1));
                         if stop.sleep_ms(1500).await {
                             return Err(AiError::Aborted);
                         }

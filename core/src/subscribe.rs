@@ -8,8 +8,8 @@
 use crate::accounts::Account;
 use crate::api;
 use crate::http::{HttpError, ReqOpts};
-use crate::util::{Log, Stop};
-use crate::votes::{resolve_profile, Victim};
+use crate::util::{Log, Progress, Stop};
+use crate::votes::{resolve_profile, Profile};
 use crate::{Core, RunOutcome};
 use serde_json::json;
 
@@ -83,7 +83,7 @@ pub async fn subscription_status(
     acc: &Account,
     profile_url: &str,
     stop: &Stop,
-) -> Option<(Victim, bool)> {
+) -> Option<(Profile, bool)> {
     let who = resolve_profile(core, acc, profile_url, stop).await?;
     let referer = format!("https://otvet.mail.ru/profile/{}", who.name);
     let sub = is_subscribed(core, acc, who.id, &referer, stop).await;
@@ -95,12 +95,25 @@ pub struct SubParams {
     pub profiles: Vec<String>,
     pub action: SubAction,
     pub delay: f64,
+    /// Сколько подписок/отписок сделать за проход (0 = сколько ссылок, столько
+    /// и сделать). Интерфейс лимита не задаёт — список ссылок и есть лимит, —
+    /// но из своего кода режим можно ограничить.
+    pub limit: i64,
     pub check_auth: bool,
+    /// Живой счётчик для интерфейса.
+    pub progress: Progress,
 }
 
 impl Default for SubParams {
     fn default() -> Self {
-        Self { profiles: vec![], action: SubAction::Subscribe, delay: 2.0, check_auth: true }
+        Self {
+            profiles: vec![],
+            action: SubAction::Subscribe,
+            delay: 2.0,
+            limit: 0,
+            check_auth: true,
+            progress: Progress::new(),
+        }
     }
 }
 
@@ -108,49 +121,58 @@ pub async fn run_subscriber(core: &Core, acc: &Account, p: &SubParams, log: &Log
     let mut out = RunOutcome::default();
     let targets = crate::util::unique_targets(&p.profiles);
     if targets.is_empty() {
-        log("❌ Не заданы профили.");
+        log("[-] Не заданы профили.");
         return out;
     }
 
     if p.check_auth {
-        let v = api::validate_account(core, acc, stop).await;
+        let v = api::validate_cached(core, acc, stop).await;
         api::persist_validation(core, &acc.name, &v);
         out.karma = v.karma.clone();
         if v.blocked {
             out.blocked = true;
-            log("🛑 Антибот (418/429) при проверке — статус не меняю.");
+            log("[x] Антибот (418/429) при проверке — статус не меняю.");
+        } else if v.banned {
+            log("[x] Аккаунт заблокирован сайтом — пропускаю. Сессия жива, но действия молча не проходят.");
+            out.skipped = true;
+            return out;
         } else if v.alive {
-            log("✅ Авторизован");
+            log("[+] Авторизован");
         } else if v.auth_bad {
-            log("🔒 НЕ авторизован");
+            log("[x] НЕ авторизован");
             log("Пропускаю аккаунт — не залогинен.");
             out.skipped = true;
             return out;
         } else {
-            log("⚠️  Не удалось проверить авторизацию (ошибка/сеть) — продолжаю, статус не трогаю.");
+            log("[!] Не удалось проверить авторизацию (ошибка/сеть) — продолжаю, статус не трогаю.");
         }
     }
 
     let verb = p.action.ru();
     log(&format!(
-        "👤 {} — профилей: {}",
-        if p.action == SubAction::Subscribe { "➕ Подписка" } else { "➖ Отписка" },
-        targets.len()
+        "[=] {} — профилей: {}{}",
+        if p.action == SubAction::Subscribe { "Подписка" } else { "Отписка" },
+        targets.len(),
+        if p.limit > 0 { format!(", лимит {}", p.limit) } else { String::new() }
     ));
 
     for (i, t) in targets.iter().enumerate() {
         if stop.is_stopped() {
-            log("\n⛔ Остановлено пользователем");
+            log("\n[x] Остановлено пользователем");
             break;
         }
         if out.blocked {
-            log("\n🛑 Блокировка mail.ru (418/429) — стоп аккаунта.");
+            log("\n[x] Блокировка mail.ru (418/429) — стоп аккаунта.");
+            break;
+        }
+        if p.limit > 0 && out.done >= p.limit {
+            log(&format!("\n[=] Достигнут лимит {}.", p.limit));
             break;
         }
         let who = match crate::votes::resolve_profile_result(core, acc, t, stop).await {
             Ok(w) => w,
             Err(e) => {
-                log(&format!("⚠️  {e}"));
+                log(&format!("[!] {e}"));
                 continue;
             }
         };
@@ -158,22 +180,23 @@ pub async fn run_subscriber(core: &Core, acc: &Account, p: &SubParams, log: &Log
         match subscribe_one(core, acc, who.id, p.action, &referer, stop).await {
             Ok(SubRes::Ok) => {
                 out.done += 1;
-                log(&format!("✅ {verb}: {} (id {}) [{}]", who.name, who.id, out.done));
+                p.progress.inc();
+                log(&format!("[+] {verb}: {} (id {}) [{}]", who.name, who.id, out.done));
             }
             Ok(SubRes::Blocked) => {
                 out.blocked = true;
-                log(&format!("🛑 Антибот на {verb} {} — стоп аккаунта.", who.name));
+                log(&format!("[x] Антибот на {verb} {} — стоп аккаунта.", who.name));
                 break;
             }
-            Ok(SubRes::Fail) => log(&format!("⚠️  Не удалось ({verb}): {}", who.name)),
+            Ok(SubRes::Fail) => log(&format!("[!] Не удалось ({verb}): {}", who.name)),
             Err(HttpError::Aborted) => break,
-            Err(e) => log(&format!("⚠️  Сеть ({verb} {}): {e}", who.name)),
+            Err(e) => log(&format!("[!] Сеть ({verb} {}): {e}", who.name)),
         }
         if i + 1 < targets.len() && !out.blocked && stop.sleep_human(p.delay).await {
             break;
         }
     }
 
-    log(&format!("\n{}\n✅ Готово!  {verb}: {}\n{}", "=".repeat(50), out.done, "=".repeat(50)));
+    log(&format!("\n{}\n[+] Готово! {verb}: {}\n{}", "=".repeat(50), out.done, "=".repeat(50)));
     out
 }

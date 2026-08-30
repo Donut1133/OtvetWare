@@ -75,6 +75,10 @@ pub struct Account {
     pub karma_at: Option<i64>,
     #[serde(rename = "authBad", default, skip_serializing_if = "Option::is_none")]
     pub auth_bad: Option<bool>,
+    /// Заблокирован сайтом (`user_status < 0`). Не то же самое, что разлогин:
+    /// сессия жива, а действия молча не проходят.
+    #[serde(rename = "banned", default, skip_serializing_if = "Option::is_none")]
+    pub banned: Option<bool>,
     #[serde(rename = "userId", default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -139,28 +143,32 @@ impl Account {
 
     // ─── прокси и ротация ───────────────────────────────────────────────────
 
-    /// Текущий список прокси. Перечитываем, если поле изменилось; индекс,
+    /// Текущий список прокси. Перечитываем, только если поле изменилось; индекс,
     /// вышедший за диапазон, роняем в 0.
+    ///
+    /// Ключ кэша — исходная строка поля, а не разобранный список: на каждый
+    /// HTTP-запрос иначе уходил разбор строки, склейка ключа и копия вектора,
+    /// а запросов за прогон десятки тысяч.
     pub fn proxy_list(&self) -> Vec<String> {
         let src = match &self.proxies {
             Some(v) if !v.is_empty() => v.join("|"),
             _ => self.proxy.clone().unwrap_or_default(),
         };
-        let list = crate::proxy::split_proxies(&src);
-        let key = list.join("||");
         let mut cached_key = self.rt.proxy_list_key.lock();
-        if *cached_key != key {
-            *cached_key = key;
-            *self.rt.proxy_list.lock() = list.clone();
-            let idx = self.rt.proxy_idx.load(Ordering::Relaxed);
-            if idx >= list.len() {
-                self.rt.proxy_idx.store(0, Ordering::Relaxed);
-            }
-            // стартовая синхронизация: активный прокси = выбранный элемент списка
-            let mut act = self.rt.active_proxy.lock();
-            if act.is_none() && !list.is_empty() {
-                *act = Some(list[self.rt.proxy_idx.load(Ordering::Relaxed).min(list.len() - 1)].clone());
-            }
+        if *cached_key == src {
+            return self.rt.proxy_list.lock().clone();
+        }
+        let list = crate::proxy::split_proxies(&src);
+        *cached_key = src;
+        *self.rt.proxy_list.lock() = list.clone();
+        let idx = self.rt.proxy_idx.load(Ordering::Relaxed);
+        if idx >= list.len() {
+            self.rt.proxy_idx.store(0, Ordering::Relaxed);
+        }
+        // стартовая синхронизация: активный прокси = выбранный элемент списка
+        let mut act = self.rt.active_proxy.lock();
+        if act.is_none() && !list.is_empty() {
+            *act = Some(list[self.rt.proxy_idx.load(Ordering::Relaxed).min(list.len() - 1)].clone());
         }
         list
     }
@@ -208,7 +216,11 @@ impl Account {
         self.rt.fail_cnt.store(0, Ordering::Relaxed);
         self.rt.proxy_idx.store(0, Ordering::Relaxed);
         let list = {
+            // Сбрасываем и ключ, и сам список: пустая строка — это ВАЛИДНЫЙ
+            // ключ (аккаунт без прокси), и по одному только ключу кэш бы не
+            // обновился.
             *self.rt.proxy_list_key.lock() = String::new();
+            self.rt.proxy_list.lock().clear();
             self.proxy_list()
         };
         *self.rt.active_proxy.lock() = list.first().cloned();
@@ -286,6 +298,9 @@ pub fn normalize_cookies_input(input: &str) -> String {
 
 // ─── Хранилище ──────────────────────────────────────────────────────────────
 
+/// Как часто не жалко переписывать файл из-за ротации кук, секунд.
+const COOKIE_FLUSH_SEC: u64 = 3;
+
 /// accounts.json. Все изменения идут через `mutate`, запись атомарная.
 pub struct AccountsStore {
     writer: crate::store_io::FileWriter,
@@ -293,6 +308,9 @@ pub struct AccountsStore {
     /// Файл существует, но не разобрался. Держим текст ошибки, чтобы сказать о
     /// ней вслух, а не делать вид, что аккаунтов просто нет.
     load_error: RwLock<Option<String>>,
+    /// В памяти новее, чем на диске: отложенная запись ротации кук.
+    dirty: std::sync::atomic::AtomicBool,
+    last_save: Mutex<std::time::Instant>,
 }
 
 impl AccountsStore {
@@ -303,6 +321,8 @@ impl AccountsStore {
             writer: crate::store_io::FileWriter::new(path),
             list: RwLock::new(list),
             load_error: RwLock::new(load_error),
+            dirty: std::sync::atomic::AtomicBool::new(false),
+            last_save: Mutex::new(std::time::Instant::now()),
         }
     }
 
@@ -364,20 +384,23 @@ impl AccountsStore {
 
     /// Правка одного аккаунта по имени + немедленная запись файла.
     pub fn mutate<F: FnOnce(&mut Account)>(&self, name: &str, f: F) -> bool {
-        let changed = {
-            let mut list = self.list.write();
-            match list.iter_mut().find(|a| a.name == name) {
-                Some(a) => {
-                    f(a);
-                    true
-                }
-                None => false,
-            }
-        };
+        let changed = self.mutate_mem(name, f);
         if changed {
             let _ = self.save();
         }
         changed
+    }
+
+    /// Правка только в памяти, без записи на диск.
+    fn mutate_mem<F: FnOnce(&mut Account)>(&self, name: &str, f: F) -> bool {
+        let mut list = self.list.write();
+        match list.iter_mut().find(|a| a.name == name) {
+            Some(a) => {
+                f(a);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Правка всего списка (добавление/удаление/массовые операции).
@@ -435,6 +458,10 @@ impl AccountsStore {
         self.mutate(name, |a| a.auth_bad = Some(!ok));
     }
 
+    pub fn set_banned(&self, name: &str, banned: bool) {
+        self.mutate(name, |a| a.banned = Some(banned));
+    }
+
     pub fn set_karma(&self, name: &str, karma: Karma) {
         self.mutate(name, |a| {
             a.karma = Some(karma);
@@ -456,8 +483,33 @@ impl AccountsStore {
     }
 
     /// Ротация сессионных кук: сервер прислал Set-Cookie — сохраняем.
+    ///
+    /// В память — сразу, на диск — не чаще раза в `COOKIE_FLUSH_SEC`. mail.ru
+    /// обновляет сессионную куку почти на каждом ответе, и запись всего файла
+    /// (со всеми аккаунтами и куками, это сотни килобайт) на каждый ответ
+    /// упирала прогон в диск: блокирующий вызов на воркере tokio, которых
+    /// всего четыре, да ещё под общим мьютексом записи. Остаток дописывается
+    /// в `flush()` — по концу прогона и при выходе.
     pub fn set_cookies(&self, name: &str, cookies: &str) {
-        self.mutate(name, |a| a.cookies = Some(cookies.to_string()));
+        if !self.mutate_mem(name, |a| a.cookies = Some(cookies.to_string())) {
+            return;
+        }
+        let due = {
+            let last = self.last_save.lock();
+            last.elapsed() >= std::time::Duration::from_secs(COOKIE_FLUSH_SEC)
+        };
+        if due {
+            let _ = self.save();
+        } else {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Дописать отложенные изменения на диск (конец прогона, выход из программы).
+    pub fn flush(&self) {
+        if self.dirty.load(Ordering::Relaxed) {
+            let _ = self.save();
+        }
     }
 
     pub fn set_proxy(&self, name: &str, proxy: &str) {
@@ -465,11 +517,16 @@ impl AccountsStore {
             a.proxy = if proxy.trim().is_empty() { None } else { Some(proxy.trim().to_string()) };
             // список прокси перечитается на следующем обращении
             *a.rt.proxy_list_key.lock() = String::new();
+            a.rt.proxy_list.lock().clear();
             *a.rt.active_proxy.lock() = None;
         });
     }
 
     pub fn save(&self) -> std::io::Result<()> {
+        // Флаг снимаем ДО снимка списка: правка, случившаяся во время записи,
+        // должна снова пометить файл грязным, а не потеряться.
+        self.dirty.store(false, Ordering::Relaxed);
+        *self.last_save.lock() = std::time::Instant::now();
         let txt = {
             let list = self.list.read();
             serde_json::to_string_pretty(&*list).unwrap_or_else(|_| "[]".into())
@@ -484,6 +541,8 @@ impl AccountsStore {
         // что уже загружено, и показываем ошибку.
         if err.is_none() {
             *self.list.write() = list;
+            // Память теперь равна диску — отложенных правок больше нет.
+            self.dirty.store(false, Ordering::Relaxed);
         }
         *self.load_error.write() = err;
     }
@@ -513,6 +572,31 @@ mod tests {
         assert!(!looks_logged_in("foo=1; _ga=2"));
         let from_json = normalize_cookies_input(r#"[{"name":"a","value":"1"},{"name":"b","value":"2"}]"#);
         assert_eq!(from_json, "a=1; b=2");
+    }
+
+    /// Ротация кук пишется на диск отложенно — но НЕ теряется: в памяти она
+    /// видна сразу, а `flush()` дописывает хвост.
+    #[test]
+    fn deferred_cookie_write_is_not_lost() {
+        let dir = std::env::temp_dir().join(format!("otvetware-cookies-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AccountsStore::open(&dir);
+        store.add(Account::new("acc")).unwrap();
+
+        store.set_cookies("acc", "Mpop=first");
+        store.set_cookies("acc", "Mpop=second");
+        // В памяти — последнее значение, кто бы ни спросил.
+        assert_eq!(store.get("acc").and_then(|a| a.cookies).as_deref(), Some("Mpop=second"));
+
+        store.flush();
+        let txt = std::fs::read_to_string(dir.join("accounts.json")).unwrap();
+        assert!(txt.contains("Mpop=second"), "куки не дописаны на диск: {txt}");
+
+        // Повторный flush без изменений ничего не портит.
+        store.flush();
+        assert!(std::fs::read_to_string(dir.join("accounts.json")).unwrap().contains("Mpop=second"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -255,13 +255,13 @@ impl Http {
                     Ok(p) => b = b.proxy(p),
                     Err(e) => self.warn_once(
                         &key,
-                        &format!("⚠️  Прокси {} не принят ({e}). Запросы идут НАПРЯМУЮ.", mask_proxy(&key)),
+                        &format!("[!] Прокси {} не принят ({e}). Запросы идут НАПРЯМУЮ.", mask_proxy(&key)),
                         log,
                     ),
                 },
                 None => self.warn_once(
                     &key,
-                    &format!("⚠️  Прокси не распарсился ({}). Запросы идут НАПРЯМУЮ.", mask_proxy(&key)),
+                    &format!("[!] Прокси не распарсился ({}). Запросы идут НАПРЯМУЮ.", mask_proxy(&key)),
                     log,
                 ),
             }
@@ -288,6 +288,12 @@ impl Http {
     /// Базовый запрос. Возвращает `Resp` даже на 4xx/5xx; `Err` — только сеть,
     /// таймаут или «Стоп» (как `fetch` в JS: он тоже бросает лишь на сети).
     pub async fn request(&self, acc: &Account, path_or_url: &str, opts: ReqOpts, stop: &Stop) -> HttpResult {
+        // Пауза проверяется здесь, а не только в паузах между шагами: «на паузе»
+        // должно значить «на сайт не уходит ни одного запроса», в каком бы месте
+        // своего цикла режим ни находился.
+        if stop.hold().await {
+            return Err(HttpError::Aborted);
+        }
         let url = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
             path_or_url.to_string()
         } else {
@@ -302,7 +308,7 @@ impl Http {
                 // ретрай пойдёт уже через него.
                 if let Some((old, new)) = acc.note_proxy_fail() {
                     let msg = format!(
-                        "🔄 Прокси не отвечает ×{} → сменил: {} → {}",
+                        "[!] Прокси не отвечает ×{} → сменил: {} → {}",
                         acc.rotate_threshold(),
                         mask_proxy(&old),
                         mask_proxy(&new)

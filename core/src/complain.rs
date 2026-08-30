@@ -8,7 +8,7 @@
 use crate::accounts::Account;
 use crate::api;
 use crate::http::{HttpError, ReqOpts};
-use crate::util::{Log, Stop};
+use crate::util::{Log, Progress, Stop};
 use crate::votes::{parse_target_id, Kind, Target};
 use crate::{Core, RunOutcome};
 use serde_json::json;
@@ -114,17 +114,18 @@ pub async fn complain_on_profile(
     log: &Log,
     stop: &Stop,
     blocked: &mut bool,
+    progress: &Progress,
 ) -> i64 {
     let who = match crate::votes::resolve_profile_result(core, acc, profile_url, stop).await {
         Ok(w) => w,
         Err(e) => {
-            log(&format!("❌ {e}"));
+            log(&format!("[-] {e}"));
             return 0;
         }
     };
     let kind = if want_replies { Kind::Reply } else { Kind::Topic };
     log(&format!(
-        "🎯 Профиль: {} (id {}) → жалобы на {} (причина: {reason})",
+        "[=] Профиль: {} (id {}) → жалобы на {} (причина: {reason})",
         who.name,
         who.id,
         if want_replies { "ответы" } else { "посты" }
@@ -135,15 +136,15 @@ pub async fn complain_on_profile(
 
     loop {
         if stop.is_stopped() {
-            log("\n⛔ Остановлено пользователем");
+            log("\n[x] Остановлено пользователем");
             break;
         }
         if *blocked {
-            log("\n🛑 Блокировка mail.ru (418/429) — останавливаю аккаунт.");
+            log("\n[x] Блокировка mail.ru (418/429) — останавливаю аккаунт.");
             break;
         }
         if limit > 0 && processed >= limit {
-            log(&format!("\n🏁 Достигнут лимит {limit}."));
+            log(&format!("\n[=] Достигнут лимит {limit}."));
             break;
         }
 
@@ -162,17 +163,17 @@ pub async fn complain_on_profile(
             Ok(r) => r,
             Err(HttpError::Aborted) => break,
             Err(e) => {
-                log(&format!("⚠️  Не загрузить ленту жертвы: {e}"));
+                log(&format!("[!] Не загрузить ленту профиля: {e}"));
                 break;
             }
         };
         if r.blocked {
             *blocked = true;
-            log("🛑 Блокировка при загрузке ленты жертвы.");
+            log("[x] Блокировка при загрузке ленты профиля.");
             break;
         }
         if !r.ok {
-            log(&format!("⚠️  Не загрузить ленту жертвы (HTTP {}).", r.status));
+            log(&format!("[!] Не загрузить ленту профиля (HTTP {}).", r.status));
             break;
         }
         let items = r
@@ -182,7 +183,7 @@ pub async fn complain_on_profile(
             .cloned()
             .unwrap_or_default();
         if items.is_empty() {
-            log("📄 Посты/ответы кончились.");
+            log("[>] Посты/ответы кончились.");
             break;
         }
 
@@ -213,19 +214,20 @@ pub async fn complain_on_profile(
             match complain_content(core, acc, &target, reason, &referer, stop).await {
                 Ok(ComplainRes::Ok) => {
                     success += 1;
+                    progress.inc();
                     log(&format!(
-                        "  ✅ {} #{id}",
+                        "  [+] {} #{id}",
                         if want_replies { "report_reply" } else { "report_topic" }
                     ));
                 }
                 Ok(ComplainRes::Blocked) => {
                     *blocked = true;
-                    log(&format!("🛑 Антибот на {} #{id} — стоп аккаунта.", kind.ru()));
+                    log(&format!("[x] Антибот на {} #{id} — стоп аккаунта.", kind.ru()));
                     break;
                 }
-                Ok(ComplainRes::Fail) => log(&format!("  ⚠️  {} #{id} (сервер отклонил)", kind.ru())),
+                Ok(ComplainRes::Fail) => log(&format!("  [!] {} #{id} (сервер отклонил)", kind.ru())),
                 Err(HttpError::Aborted) => break,
-                Err(e) => log(&format!("  ⚠️  {} #{id}: {e}", kind.ru())),
+                Err(e) => log(&format!("  [!] {} #{id}: {e}", kind.ru())),
             }
             processed += 1;
             if stop.sleep_human(delay).await {
@@ -235,7 +237,7 @@ pub async fn complain_on_profile(
 
         let limit_hit = limit > 0 && processed >= limit;
         if fresh == 0 && !stop.is_stopped() && !*blocked && !limit_hit {
-            log("📄 Новых постов/ответов нет — стоп.");
+            log("[>] Новых постов/ответов нет — стоп.");
             break;
         }
         if last_id == pos {
@@ -254,6 +256,8 @@ pub struct ComplainParams {
     pub delay: f64,
     pub limit: i64,
     pub check_auth: bool,
+    /// Живой счётчик для интерфейса.
+    pub progress: Progress,
 }
 
 impl Default for ComplainParams {
@@ -265,6 +269,7 @@ impl Default for ComplainParams {
             delay: 2.0,
             limit: 0,
             check_auth: true,
+            progress: Progress::new(),
         }
     }
 }
@@ -279,82 +284,91 @@ pub async fn run_complainer(
     let mut out = RunOutcome::default();
     let targets = crate::util::unique_targets(&p.targets);
     if targets.is_empty() {
-        log("❌ Не заданы ссылки.");
+        log("[-] Не заданы ссылки.");
         return out;
     }
 
     if p.check_auth {
-        let v = api::validate_account(core, acc, stop).await;
+        let v = api::validate_cached(core, acc, stop).await;
         api::persist_validation(core, &acc.name, &v);
         out.karma = v.karma.clone();
         if v.blocked {
             out.blocked = true;
-            log("🛑 Антибот (418/429) при проверке — статус не меняю.");
+            log("[x] Антибот (418/429) при проверке — статус не меняю.");
+        } else if v.banned {
+            log("[x] Аккаунт заблокирован сайтом — пропускаю. Сессия жива, но действия молча не проходят.");
+            out.skipped = true;
+            return out;
         } else if v.alive {
-            log("✅ Авторизован");
+            log("[+] Авторизован");
         } else if v.auth_bad {
-            log("🔒 НЕ авторизован");
+            log("[x] НЕ авторизован");
             log("Пропускаю аккаунт — не залогинен.");
             out.skipped = true;
             return out;
         } else {
-            log("⚠️  Не удалось проверить авторизацию (ошибка/сеть) — продолжаю, статус не трогаю.");
+            log("[!] Не удалось проверить авторизацию (ошибка/сеть) — продолжаю, статус не трогаю.");
         }
     }
 
-    log(&format!("🚩 Жалобы — цель: {} · причина: {} · ссылок: {}", p.target.ru(), p.reason, targets.len()));
+    log(&format!("[>] Жалобы — цель: {} · причина: {} · ссылок: {}", p.target.ru(), p.reason, targets.len()));
 
     let mut blocked = out.blocked;
     for (i, t) in targets.iter().enumerate() {
         if stop.is_stopped() {
-            log("\n⛔ Остановлено пользователем");
+            log("\n[x] Остановлено пользователем");
             break;
         }
         if blocked {
-            log("\n🛑 Блокировка mail.ru (418/429) — стоп аккаунта.");
+            log("\n[x] Блокировка mail.ru (418/429) — стоп аккаунта.");
             break;
         }
 
         match p.target {
             ComplainTarget::User => match crate::votes::resolve_profile_result(core, acc, t, stop).await {
-                Err(e) => log(&format!("⚠️  {e}")),
+                Err(e) => log(&format!("[!] {e}")),
                 Ok(who) => {
                     let referer = format!("https://otvet.mail.ru/profile/{}", who.name);
                     match complain_user(core, acc, who.id, &p.reason, &referer, stop).await {
                         Ok(ComplainRes::Ok) => {
                             out.done += 1;
-                            log(&format!("✅ Жалоба (профиль): {} (id {}) [{}]", who.name, who.id, out.done));
+                            p.progress.inc();
+                            log(&format!(
+                                "[+] Жалоба (профиль): {} (id {}) [{}]",
+                                who.name, who.id, out.done
+                            ));
                         }
                         Ok(ComplainRes::Blocked) => {
                             blocked = true;
-                            log(&format!("🛑 Антибот на жалобу о {} — стоп аккаунта.", who.name));
+                            log(&format!("[x] Антибот на жалобу о {} — стоп аккаунта.", who.name));
                             break;
                         }
-                        Ok(ComplainRes::Fail) => log(&format!("⚠️  Не удалось (жалоба о {})", who.name)),
+                        Ok(ComplainRes::Fail) => log(&format!("[!] Не удалось (жалоба о {})", who.name)),
                         Err(HttpError::Aborted) => break,
-                        Err(e) => log(&format!("⚠️  Сеть (жалоба о {}): {e}", who.name)),
+                        Err(e) => log(&format!("[!] Сеть (жалоба о {}): {e}", who.name)),
                     }
                 }
             },
             ComplainTarget::Single => match parse_target_id(t) {
-                None => log(&format!("⚠️  Ссылка не похожа на пост/ответ: {t}")),
+                None => log(&format!("[!] Ссылка не похожа на пост/ответ: {t}")),
                 Some(tgt) => {
                     let referer = t.split('#').next().unwrap_or(t).to_string();
                     match complain_content(core, acc, &tgt, &p.reason, &referer, stop).await {
                         Ok(ComplainRes::Ok) => {
                             out.done += 1;
-                            log(&format!("✅ Жалоба ({} #{}) [{}]", tgt.kind.ru(), tgt.id, out.done));
+                            p.progress.inc();
+                            log(&format!("[+] Жалоба ({} #{}) [{}]", tgt.kind.ru(), tgt.id, out.done));
                         }
                         Ok(ComplainRes::Blocked) => {
                             blocked = true;
-                            log(&format!("🛑 Антибот на {} #{} — стоп аккаунта.", tgt.kind.ru(), tgt.id));
+                            log(&format!("[x] Антибот на {} #{} — стоп аккаунта.", tgt.kind.ru(), tgt.id));
                             break;
                         }
                         Ok(ComplainRes::Fail) => {
-                            log(&format!("⚠️  Не удалось (жалоба на {} #{})", tgt.kind.ru(), tgt.id))
+                            log(&format!("[!] Не удалось (жалоба на {} #{})", tgt.kind.ru(), tgt.id))
                         }
                         Err(HttpError::Aborted) => break,
-                        Err(e) => log(&format!("⚠️  Сеть (жалоба на {} #{}): {e}", tgt.kind.ru(), tgt.id)),
+                        Err(e) => log(&format!("[!] Сеть (жалоба на {} #{}): {e}", tgt.kind.ru(), tgt.id)),
                     }
                 }
             },
@@ -370,6 +384,7 @@ pub async fn run_complainer(
                     log,
                     stop,
                     &mut blocked,
+                    &p.progress,
                 )
                 .await;
             }
@@ -381,6 +396,6 @@ pub async fn run_complainer(
     }
 
     out.blocked = blocked;
-    log(&format!("\n{}\n✅ Готово!  Жалоб отправлено: {}\n{}", "=".repeat(50), out.done, "=".repeat(50)));
+    log(&format!("\n{}\n[+] Готово! Жалоб отправлено: {}\n{}", "=".repeat(50), out.done, "=".repeat(50)));
     out
 }
