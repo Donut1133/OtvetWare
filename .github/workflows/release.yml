@@ -3,9 +3,9 @@ name: Release
 # Собирает .exe и прикладывает его к релизу, когда пушится тег вида v1.0.0:
 #   git tag v1.0.0 && git push origin v1.0.0
 #
-# Архива два. Лёгкий — только программа, ей нужен установленный Chrome. Полный —
-# с патченной сборкой Chromium внутри: она прячет следы автоматизации, которых
-# обычный Chrome не прячет, и человеку не надо ничего доустанавливать.
+# Архив один и всегда с браузером. Системный Chrome бот не берёт: тот
+# обновляется сам, и его версия разъезжается с той, которой представляется
+# персона, а следов автоматизации он не прячет вовсе.
 on:
   push:
     tags: ["v*"]
@@ -34,7 +34,7 @@ jobs:
       - name: Сборка
         run: cargo build --release -p otvet-gui
 
-      - name: Собрать лёгкий архив
+      - name: Собрать содержимое архива
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -46,7 +46,6 @@ jobs:
           # увидел бы один стиль-заглушку вместо готового списка.
           New-Item -ItemType Directory -Force dist/accounts | Out-Null
           Copy-Item data/*.example.json, data/README.md dist/accounts/
-          Compress-Archive -Path dist/* -DestinationPath otvetware-windows-x64.zip
 
       - name: Скачать патченный Chromium
         shell: pwsh
@@ -70,32 +69,26 @@ jobs:
             throw "Версии разошлись. Либо закрепи другую patchright, либо поправь FALLBACK_VERSION в core/src/persona.rs"
           }
 
-      - name: Собрать архив с браузером
+      - name: Собрать архив
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force full | Out-Null
-          Copy-Item dist/* full/ -Recurse
           # Раскладку не меняем: бот сам ищет browsers/<что-угодно>/chrome-win64/chrome.exe
           # рядом с программой, поэтому папка кладётся как есть.
-          Copy-Item browsers full/browsers -Recurse
-          Compress-Archive -Path full/* -DestinationPath otvetware-windows-x64-with-browser.zip
+          Copy-Item browsers dist/browsers -Recurse
+          Compress-Archive -Path dist/* -DestinationPath otvetware-windows-x64.zip
 
       - name: Опубликовать релиз
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            otvetware-windows-x64.zip
-            otvetware-windows-x64-with-browser.zip
+          files: otvetware-windows-x64.zip
           generate_release_notes: true
           body: |
-            ## Что скачивать
+            Скачать, распаковать, запустить `otvetware.exe`. Внутри всё нужное,
+            включая браузер для входа в аккаунты — доустанавливать ничего не надо.
 
-            **`otvetware-windows-x64-with-browser.zip`** — если не уверен.
-            Внутри всё нужное, включая браузер для входа в аккаунты. Распаковать
-            и запустить `otvetware.exe`.
-
-            **`otvetware-windows-x64.zip`** — если на компьютере уже стоит Google
-            Chrome и не хочется качать лишние две сотни мегабайт.
+            При первом запуске Windows покажет «Система Windows защитила ваш
+            компьютер»: файл не подписан сертификатом. «Подробнее» → «Выполнить
+            в любом случае».
 
             Данные (аккаунты, отпечатки, журналы) программа складывает в папку
             `accounts` рядом с собой — переносится копированием этой папки.
