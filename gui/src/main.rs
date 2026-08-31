@@ -129,8 +129,22 @@ fn data_root() -> PathBuf {
     pick_root(env, &cwd, exe_dir)
 }
 
+/// Прежние сборки держали настройки в профиле Windows, а не в папке данных.
+/// Переносим один раз: иначе после обновления человек открывает окно и видит
+/// пустые поля — ни ссылок, ни промптов, ни ключа нейросети.
+fn move_old_settings(appdata: Option<PathBuf>, to: &Path) {
+    if to.exists() {
+        return;
+    }
+    let Some(old) = appdata.map(|d| d.join("otvetware").join("data").join("app.ron")) else { return };
+    if old.is_file() {
+        let _ = std::fs::copy(&old, to);
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let root = data_root();
+    move_old_settings(std::env::var_os("APPDATA").map(PathBuf::from), &root.join("settings.ron"));
     let core = Core::open(&root);
     let bg = state::Bg::new(core);
 
@@ -141,6 +155,12 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1360.0, 820.0])
             .with_min_inner_size([1000.0, 620.0])
             .with_title(format!("{} — {}", theme::APP_NAME, root.display())),
+        // Настройки — в папку данных, а не в профиль Windows. Иначе получалось
+        // так: папку `accounts` перенесли на другой компьютер, а ссылки, лимиты
+        // и ключ нейросети остались на старом. И наоборот: две копии программы
+        // на одной машине незаметно делили одни настройки, так что скачанный
+        // архив показывал ключ, которого в нём не было.
+        persistence_path: Some(root.join("settings.ron")),
         ..Default::default()
     };
 
@@ -167,6 +187,35 @@ mod tests {
     }
 
     /// Свежая установка: рядом с .exe нет ничего — заводим свою папку.
+    /// Настройки переезжают из профиля в папку данных ровно один раз и только
+    /// если своих ещё нет: иначе обновление затирало бы то, что человек уже
+    /// поменял в новой версии.
+    #[test]
+    fn old_settings_move_once_and_never_overwrite() {
+        let dir = std::env::temp_dir().join(format!("otvetware-mv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let appdata = dir.join("appdata");
+        std::fs::create_dir_all(appdata.join("otvetware").join("data")).unwrap();
+        std::fs::write(appdata.join("otvetware").join("data").join("app.ron"), "старые").unwrap();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let to = dir.join("data").join("settings.ron");
+
+        move_old_settings(Some(appdata.clone()), &to);
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "старые", "настройки не переехали");
+
+        // Второй запуск не трогает уже изменённое.
+        std::fs::write(&to, "новые").unwrap();
+        move_old_settings(Some(appdata.clone()), &to);
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "новые", "переезд затёр свежие настройки");
+
+        // Переносить нечего — файла просто не появится.
+        let empty = dir.join("data").join("другой.ron");
+        move_old_settings(Some(dir.join("пусто")), &empty);
+        assert!(!empty.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn fresh_install_gets_a_folder_next_to_the_exe() {
         let tmp = tmp_dir("fresh");
