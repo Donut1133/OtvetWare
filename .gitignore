@@ -31,3 +31,6 @@ replied*.json
 *.log
 .DS_Store
 Thumbs.db
+
+# Временная папка, которую оставляет после себя переписывание истории.
+.git-rewrite/
