@@ -50,7 +50,17 @@ pub fn chrome_path(root: &Path) -> Option<PathBuf> {
     // раскладке данные лежат в `accounts`, а тяжёлые `browsers` обычно остаются
     // рядом с .exe.
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
-    for dir in [Some(root.join("browsers")), exe_dir.map(|d| d.join("browsers"))].into_iter().flatten() {
+    let cwd = std::env::current_dir().ok();
+    for dir in [
+        Some(root.join("browsers")),
+        exe_dir.map(|d| d.join("browsers")),
+        // Текущая папка — это запуск из клона: `cargo run` кладёт .exe в
+        // target/release, а браузер человек ставит в корень проекта.
+        cwd.map(|d| d.join("browsers")),
+    ]
+    .into_iter()
+    .flatten()
+    {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for e in rd.flatten() {
             for rel in [
@@ -66,18 +76,12 @@ pub fn chrome_path(root: &Path) -> Option<PathBuf> {
             }
         }
     }
-    // Затем — системный Chrome. Edge сюда намеренно НЕ добавлен: персона
-    // представляется Chrome, а client hints у Edge свои, и запуск под ним даёт
-    // расхождение UA с брендами — сигнал заметнее, чем отсутствие браузера.
-    for p in [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ] {
-        let p = PathBuf::from(p);
-        if p.exists() {
-            return Some(p);
-        }
-    }
+    // Системный браузер намеренно НЕ ищем. Он обновляется сам, и его версия
+    // разъезжается с той, которой представляется персона: UA говорит «148», а
+    // движок оказывается 151-м — это ловится перебором возможностей. Плюс
+    // обычный Chrome не прячет следы автоматизации, ради которых и берётся
+    // патченная сборка. Лучше внятно сказать «браузера нет», чем тихо работать
+    // с приметным.
     None
 }
 
@@ -625,7 +629,7 @@ pub async fn open_as(
 ) -> anyhow::Result<()> {
     let chrome = chrome_path(root).ok_or_else(|| {
         anyhow::anyhow!(
-            "не найден браузер. Нужен Chrome или Edge — обычно Edge уже стоит в Windows. Если браузер портативный, положи его папку в browsers/ рядом с программой"
+            "не найден браузер. Он должен лежать в папке browsers рядом с программой — скачай архив с релиза целиком, там она уже внутри"
         )
     })?;
     let port = free_port().await?;
@@ -741,7 +745,7 @@ pub async fn login_and_harvest(
 ) -> anyhow::Result<Harvest> {
     let chrome = chrome_path(root).ok_or_else(|| {
         anyhow::anyhow!(
-            "не найден браузер. Нужен Chrome или Edge — обычно Edge уже стоит в Windows. Если браузер портативный, положи его папку в browsers/ рядом с программой"
+            "не найден браузер. Он должен лежать в папке browsers рядом с программой — скачай архив с релиза целиком, там она уже внутри"
         )
     })?;
     let port = free_port().await?;

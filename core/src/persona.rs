@@ -337,6 +337,14 @@ pub fn chrome_full_version(root: &Path) -> String {
                     return v;
                 }
             }
+            // Версия ТОГО браузера, которым мы правда пойдём входить. Иначе
+            // персона говорила бы «Chrome 148», а движок оказывался бы, скажем,
+            // 151-м: UA против набора возможностей — то же расхождение, из-за
+            // которого мы не берём Edge. Chrome и patchright кладут номер рядом
+            // с chrome.exe: первый папкой, второй файлом `<версия>.manifest`.
+            if let Some(v) = crate::cdp::chrome_path(root).as_deref().and_then(version_beside) {
+                return v;
+            }
             let p = root.join("node_modules/patchright-core/browsers.json");
             if let Ok(txt) = std::fs::read_to_string(&p) {
                 if let Ok(j) = serde_json::from_str::<Value>(&txt) {
@@ -354,6 +362,35 @@ pub fn chrome_full_version(root: &Path) -> String {
             FALLBACK_VERSION.to_string()
         })
         .clone()
+}
+
+/// Номер версии, лежащий рядом с `chrome.exe`: у Chrome это папка
+/// `151.0.7922.174`, у сборки patchright — файл `148.0.7778.96.manifest`.
+fn version_beside(exe: &Path) -> Option<String> {
+    let dir = exe.parent()?;
+    let looks_like_version = |s: &str| {
+        let parts: Vec<&str> = s.split('.').collect();
+        parts.len() == 4 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    };
+    let mut found: Option<String> = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let stem = name.strip_suffix(".manifest").unwrap_or(&name).to_string();
+        if looks_like_version(&stem) {
+            // Версий рядом может лежать несколько (Chrome не всегда убирает
+            // старую после обновления) — берём старшую.
+            if found.as_deref().is_none_or(|old| older(old, &stem)) {
+                found = Some(stem);
+            }
+        }
+    }
+    found
+}
+
+/// Сравнение версий по числам, а не по строкам: «9.0.0.0» не старше «10.0.0.0».
+fn older(a: &str, b: &str) -> bool {
+    let nums = |s: &str| s.split('.').filter_map(|p| p.parse::<u32>().ok()).collect::<Vec<_>>();
+    nums(a) < nums(b)
 }
 
 pub fn chrome_major(root: &Path) -> String {
@@ -615,6 +652,49 @@ mod tests {
             checked += 1;
         }
         eprintln!("сверено персон: {checked}");
+    }
+
+    /// Версия берётся у того браузера, которым и пойдём входить. Расхождение
+    /// «UA говорит 148, движок 151» ловится обычным перебором возможностей, и
+    /// это ровно та несостыковка, из-за которой мы не запускаемся под Edge.
+    #[test]
+    fn version_is_read_from_the_browser_we_will_launch() {
+        // Имя с солью: одного pid мало — тестовых двоичных файлов бывает
+        // несколько, и они гоняются разом, деля временную папку на двоих.
+        let dir = std::env::temp_dir().join(format!(
+            "otvetware-ver-{}-{}",
+            std::process::id(),
+            crate::util::rand_range(1, 1_000_000)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Chrome держит номер версии папкой рядом с chrome.exe.
+        let chrome = dir.join("chrome");
+        std::fs::create_dir_all(chrome.join("151.0.7922.174")).unwrap();
+        std::fs::write(chrome.join("chrome.exe"), b"").unwrap();
+        assert_eq!(version_beside(&chrome.join("chrome.exe")).as_deref(), Some("151.0.7922.174"));
+
+        // Сборка patchright — файлом `<версия>.manifest`.
+        let patched = dir.join("patched");
+        std::fs::create_dir_all(&patched).unwrap();
+        std::fs::write(patched.join("148.0.7778.96.manifest"), b"").unwrap();
+        std::fs::write(patched.join("chrome.exe"), b"").unwrap();
+        assert_eq!(version_beside(&patched.join("chrome.exe")).as_deref(), Some("148.0.7778.96"));
+
+        // После обновления рядом может остаться старая — берём старшую, и
+        // сравниваем числами: строкой «9» оказалась бы больше «10».
+        std::fs::create_dir_all(chrome.join("149.0.9.9")).unwrap();
+        assert_eq!(version_beside(&chrome.join("chrome.exe")).as_deref(), Some("151.0.7922.174"));
+        assert!(older("149.0.9.9", "151.0.7922.174"));
+        assert!(older("9.0.0.0", "10.0.0.0"), "версии сравниваются как строки");
+
+        // Ничего похожего рядом нет — пусть решает тот, кто звал.
+        let bare = dir.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(bare.join("chrome.exe"), b"").unwrap();
+        assert_eq!(version_beside(&bare.join("chrome.exe")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
