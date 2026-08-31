@@ -17,8 +17,9 @@ pub struct Identity {
 
 /// Итог проверки аккаунта.
 ///
-/// `auth_bad` = ТОЧНО не залогинен (401/403). Антибот (418/429) и сетевые сбои
-/// не дают ни `alive`, ни `auth_bad` — красить аккаунт в этом случае нельзя.
+/// `auth_bad` = ТОЧНО не залогинен, см. [`auth_failed`]. Антибот (418/429) и
+/// сетевые сбои не дают ни `alive`, ни `auth_bad` — красить аккаунт в этом
+/// случае нельзя.
 #[derive(Debug, Clone, Default)]
 pub struct Validation {
     pub alive: bool,
@@ -34,6 +35,32 @@ pub struct Validation {
     pub username: Option<String>,
     /// Сеть/прокси не дали ответа — статус трогать нельзя.
     pub error: Option<String>,
+}
+
+/// Сессия протухла — это видно по ответу сайта.
+///
+/// 401/403 — очевидный случай. Но чаще mail.ru отдаёт разлогин как **400** с
+/// телом `{"code":4,"message":"token expired: token expired"}`, и по одному
+/// только статусу это неотличимо от «не понравилось тело запроса». Раньше такой
+/// аккаунт оставался без статуса («непонятный ответ»), шёл в работу как живой и
+/// упирался в пять отказов подряд на отправке.
+pub fn auth_failed(r: &Resp) -> bool {
+    if r.ok || r.blocked {
+        return false;
+    }
+    if r.status == 401 || r.status == 403 {
+        return true;
+    }
+    r.status == 400 && token_expired(r)
+}
+
+/// Тело 400-го говорит про токен, а не про содержимое запроса.
+fn token_expired(r: &Resp) -> bool {
+    // Тела таких ответов короткие; ограничение — страховка от гигантского HTML.
+    let body = r.text.chars().take(400).collect::<String>().to_lowercase();
+    ["token expired", "token is expired", "invalid token", "token invalid", "not authorized"]
+        .iter()
+        .any(|m| body.contains(m))
 }
 
 fn re_karma_url() -> &'static Regex {
@@ -144,8 +171,9 @@ pub async fn fetch_karma(core: &Core, acc: &Account, user_id: i64, stop: &Stop) 
 
 /// Проверка аккаунта без браузера. Заодно освежает userId и ник.
 ///
-/// Пробуем `/api/auth/user`: без кук он отдаёт 403, а с куками — актуальные
-/// id и ник одним запросом. Карма для проверки не годится в принципе:
+/// Пробуем `/api/auth/user`: без живой сессии он отдаёт 403 или 400 «token
+/// expired», а с куками — актуальные id и ник одним запросом. Карма для
+/// проверки не годится в принципе:
 /// `/api/karma/score` публичный и отвечает 200 даже разлогиненному.
 ///
 /// Ник ОБЯЗАТЕЛЬНО перечитываем каждый раз. Раньше он брался из базы, только
@@ -158,7 +186,7 @@ pub async fn validate_account(core: &Core, acc: &Account, stop: &Stop) -> Valida
     match probe {
         Ok(p) => {
             out.blocked = p.blocked;
-            out.auth_bad = !p.ok && !p.blocked && (p.status == 401 || p.status == 403);
+            out.auth_bad = auth_failed(&p);
             out.alive = p.ok;
             if let Some(j) = p.json.as_ref().filter(|_| p.ok) {
                 // `user_status`: 0 — обычный аккаунт, отрицательное — бан.
@@ -224,7 +252,7 @@ pub async fn warm_account(core: &Core, acc: &Account, stop: &Stop) {
     }
 }
 
-/// Применить итог проверки к хранилищу: красим ТОЛЬКО при явном 401/403,
+/// Применить итог проверки к хранилищу: красим ТОЛЬКО при явном разлогине,
 /// зелёным — при `alive`. Антибот и сетевые ошибки статус не трогают.
 pub fn persist_validation(core: &Core, name: &str, v: &Validation) {
     if v.alive {
@@ -495,5 +523,35 @@ mod tests {
         assert_eq!(extract_cdn_hash(r"C:\фотоvatar.jpg"), None);
         assert_eq!(extract_cdn_hash("images/fire.gif"), None);
         assert_eq!(extract_cdn_hash(""), None);
+    }
+
+    fn resp(status: u16, body: &str) -> Resp {
+        Resp {
+            status,
+            ok: (200..300).contains(&status),
+            blocked: status == 418 || status == 429,
+            text: body.to_string(),
+            json: serde_json::from_str(body).ok(),
+            url: "https://otvet.mail.ru/api/auth/user".into(),
+        }
+    }
+
+    /// Тела сняты с живого сайта: так отвечает otvet.mail.ru аккаунту, у
+    /// которого протухли куки. 400 с «token expired» раньше не считался
+    /// разлогином, и такой аккаунт уходил в работу как живой.
+    #[test]
+    fn a_dead_session_is_recognised_in_both_shapes() {
+        assert!(auth_failed(&resp(403, "")));
+        assert!(auth_failed(&resp(401, "")));
+        assert!(auth_failed(&resp(400, r#"{"code":4,"message":"token expired: token expired"}"#)));
+
+        // 400 по содержимому запроса разлогином не считается.
+        assert!(!auth_failed(&resp(400, r#"{"error":{"code":"x[999-999]","message":"empty topic id"}}"#)));
+        assert!(!auth_failed(&resp(400, r#"{"error":{"message":"content text is too short"}}"#)));
+        // Антибот и сетевые 5xx статус не трогают.
+        assert!(!auth_failed(&resp(429, "")));
+        assert!(!auth_failed(&resp(418, "")));
+        assert!(!auth_failed(&resp(500, "")));
+        assert!(!auth_failed(&resp(200, r#"{"id":1}"#)));
     }
 }

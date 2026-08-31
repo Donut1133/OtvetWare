@@ -1022,6 +1022,23 @@ struct RunCtx<'a> {
 }
 
 impl RunCtx<'_> {
+    /// Отказов подряд набралось столько, что дальше идти незачем.
+    ///
+    /// Причину уточняем одним запросом: протухшая сессия и дневной лимит дают
+    /// на отправке один и тот же отказ, и раньше в лог всегда уходил лимит —
+    /// даже когда аккаунт был просто разлогинен.
+    async fn report_fail_stop(&self) {
+        let v = api::validate_account(self.core, self.acc, self.stop).await;
+        api::persist_validation(self.core, &self.acc.name, &v);
+        if v.auth_bad {
+            (self.log)(&format!(
+                "[x] Подряд {MAX_FAILS} отказов при отправке — аккаунт разлогинен, нужен новый вход."
+            ));
+        } else {
+            (self.log)(&format!("[x] Подряд {MAX_FAILS} отказов при отправке — останавливаю аккаунт."));
+        }
+    }
+
     fn done(&self) -> bool {
         self.stop.is_stopped()
             || self.sh.blocked()
@@ -1215,62 +1232,50 @@ impl RunCtx<'_> {
         if !self.sh.reserve(self.p.limit) {
             return Step::Stop;
         }
-        let posted_id = match post_answer(
-            self.core,
-            self.acc,
-            &q.id,
-            &answer,
-            image.as_ref(),
-            self.log,
-            self.stop,
-        )
-        .await
-        {
-            Err(_) => {
-                self.sh.release(self.p.limit);
-                return Step::Stop;
-            }
-            Ok(PostRes::Blocked) => {
-                self.sh.release(self.p.limit);
-                // Антибот: без этого флага бот продолжал бы долбиться в
-                // закрытую дверь и получал бы 418 на каждый следующий ответ.
-                self.sh.blocked.store(true, Ordering::SeqCst);
-                (self.log)("   [x] Антибот mail.ru при отправке (418/429) — стоп аккаунта.");
-                return Step::Stop;
-            }
-            Ok(PostRes::Rejected(why)) => {
-                // Отказали по тексту, а не по аккаунту: место под лимитом
-                // возвращаем и пробуем другим текстом. Счётчик отказов при этом
-                // ведём общий — если сайт отказывает подряд (дневной лимит), с
-                // перегенерацией это стоило бы денег за нейросеть на пустом месте.
-                self.sh.release(self.p.limit);
-                let fails = self.sh.fails.fetch_add(1, Ordering::SeqCst) + 1;
-                if fails >= MAX_FAILS {
-                    (self.log)(&format!(
-                        "[x] Подряд {MAX_FAILS} отказов при отправке — останавливаю аккаунт (обычно это дневной лимит ответов)."
-                    ));
+        let posted_id =
+            match post_answer(self.core, self.acc, &q.id, &answer, image.as_ref(), self.log, self.stop).await
+            {
+                Err(_) => {
+                    self.sh.release(self.p.limit);
                     return Step::Stop;
                 }
-                (self.log)(&format!("   [!] Сайт не принял ответ ({why})"));
-                return Step::Rejected;
-            }
-            Ok(PostRes::Failed) => {
-                // Не антибот, а разовый сбой: ждём подольше, чтобы не
-                // молотить сайт без передышки.
-                self.sh.release(self.p.limit);
-                let fails = self.sh.fails.fetch_add(1, Ordering::SeqCst) + 1;
-                if fails >= MAX_FAILS {
-                    (self.log)(&format!(
-                            "[x] Подряд {MAX_FAILS} отказов при отправке — останавливаю аккаунт (обычно это дневной лимит ответов)."
-                        ));
+                Ok(PostRes::Blocked) => {
+                    self.sh.release(self.p.limit);
+                    // Антибот: без этого флага бот продолжал бы долбиться в
+                    // закрытую дверь и получал бы 418 на каждый следующий ответ.
+                    self.sh.blocked.store(true, Ordering::SeqCst);
+                    (self.log)("   [x] Антибот mail.ru при отправке (418/429) — стоп аккаунта.");
                     return Step::Stop;
                 }
-                (self.log)("   [!] Не отправлено — пауза 10 сек, дальше следующий вопрос.");
-                self.stop.sleep_ms(10_000).await;
-                return Step::Stop;
-            }
-            Ok(PostRes::Ok(id)) => id,
-        };
+                Ok(PostRes::Rejected(why)) => {
+                    // Отказали по тексту, а не по аккаунту: место под лимитом
+                    // возвращаем и пробуем другим текстом. Счётчик отказов при этом
+                    // ведём общий — если сайт отказывает подряд (дневной лимит), с
+                    // перегенерацией это стоило бы денег за нейросеть на пустом месте.
+                    self.sh.release(self.p.limit);
+                    let fails = self.sh.fails.fetch_add(1, Ordering::SeqCst) + 1;
+                    if fails >= MAX_FAILS {
+                        self.report_fail_stop().await;
+                        return Step::Stop;
+                    }
+                    (self.log)(&format!("   [!] Сайт не принял ответ ({why})"));
+                    return Step::Rejected;
+                }
+                Ok(PostRes::Failed) => {
+                    // Не антибот, а разовый сбой: ждём подольше, чтобы не
+                    // молотить сайт без передышки.
+                    self.sh.release(self.p.limit);
+                    let fails = self.sh.fails.fetch_add(1, Ordering::SeqCst) + 1;
+                    if fails >= MAX_FAILS {
+                        self.report_fail_stop().await;
+                        return Step::Stop;
+                    }
+                    (self.log)("   [!] Не отправлено — пауза 10 сек, дальше следующий вопрос.");
+                    self.stop.sleep_ms(10_000).await;
+                    return Step::Stop;
+                }
+                Ok(PostRes::Ok(id)) => id,
+            };
 
         // 4) проверка, что ответ реально виден
         //

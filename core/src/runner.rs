@@ -39,6 +39,9 @@ pub struct RunnerCfg {
     pub proxy_rotate_fails: u32,
     /// Прогревать следующий аккаунт, пока работает текущий.
     pub prefetch_next: bool,
+    /// Убирать из списка аккаунты, про которых стало точно известно, что они
+    /// разлогинены или забанены.
+    pub drop_dead: bool,
 }
 
 impl Default for RunnerCfg {
@@ -51,8 +54,18 @@ impl Default for RunnerCfg {
             round_pause_min: 0.0,
             proxy_rotate_fails: 2,
             prefetch_next: true,
+            drop_dead: true,
         }
     }
+}
+
+/// Аккаунт, которому в следующем круге делать нечего.
+///
+/// Бан отличается от разлогина тем, что сессия у него живая и сайт отвечает как
+/// обычно — но ни одно действие не проходит, так что для круга он такой же
+/// мёртвый груз.
+fn is_dead(a: &Account) -> bool {
+    a.auth_bad == Some(true) || a.banned == Some(true)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -72,6 +85,7 @@ pub async fn run(
     log: Log,
     stop: Stop,
 ) -> RunSummary {
+    let mut accounts = accounts;
     let mut summary = RunSummary::default();
     if accounts.is_empty() {
         log("[-] Не выбран ни один аккаунт с куками. Добавь аккаунт (вход через браузер или вставка кук) и отметь галочкой.");
@@ -152,6 +166,27 @@ pub async fn run(
             accounts.len(),
             pass.blocked
         ));
+
+        // Разлогиненный и забаненный из круга в круг ничего не сделают: у
+        // первого мертва сессия, у второго сайт молча выбрасывает любое
+        // действие. Держать их в списке — это по лишнему запросу на проверку
+        // каждый круг и мусор в логе.
+        if cfg.drop_dead {
+            let before = accounts.len();
+            accounts.retain(|a| core.accounts.get(&a.name).is_none_or(|s| !is_dead(&s)));
+            let dropped = before - accounts.len();
+            if dropped > 0 {
+                log(&format!(
+                    "[=] Выкинул из круга: {dropped} (разлогин или бан). Осталось: {}.",
+                    accounts.len()
+                ));
+            }
+            if accounts.is_empty() {
+                log("
+[=] Рабочих аккаунтов не осталось. Останавливаюсь.");
+                break;
+            }
+        }
 
         let wait_ms = (cfg.round_pause_min * 60_000.0) as u64;
         if wait_ms > 0 {

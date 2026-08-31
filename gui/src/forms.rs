@@ -49,6 +49,15 @@ pub struct CommonForm {
     pub round_pause_min: f64,
     pub proxy_rotate_fails: u32,
     pub check_auth: bool,
+    /// Убирать из кругов тех, кто оказался разлогинен или забанен.
+    #[serde(default = "yes")]
+    pub drop_dead: bool,
+}
+
+/// Значение по умолчанию для галок, которых не было в старых настройках: без
+/// него serde подставит `false` и молча выключит то, что должно быть включено.
+fn yes() -> bool {
+    true
 }
 
 impl Default for CommonForm {
@@ -62,6 +71,7 @@ impl Default for CommonForm {
             round_pause_min: 10.0,
             proxy_rotate_fails: 2,
             check_auth: true,
+            drop_dead: true,
         }
     }
 }
@@ -123,6 +133,17 @@ impl CommonForm {
                 if shared_work {
                     hint(ui, "Круги остановятся сами, когда в диапазоне не останется свободных номеров.");
                 }
+                ui.add_enabled(
+                    self.repeat_rounds,
+                    egui::Checkbox::new(
+                        &mut self.drop_dead,
+                        "Выкидывать разлогиненные и забаненные из следующих кругов",
+                    ),
+                );
+                hint(
+                    ui,
+                    "Такой аккаунт всё равно ничего не сделает: у разлогиненного мертва сессия, у забаненного сайт молча выбрасывает любое действие. Без галки он остаётся в списке и каждый круг стоит лишней проверки.",
+                );
             }
 
             ui.checkbox(&mut self.check_auth, "Проверять авторизацию перед работой");

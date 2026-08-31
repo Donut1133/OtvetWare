@@ -50,6 +50,7 @@ async fn total_limit_is_spread_across_rounds() {
         repeat_rounds: true,
         round_pause_min: 0.0,
         proxy_rotate_fails: 2,
+        drop_dead: true,
     };
     let summary = runner::run(core, accounts, cfg, spy(calls.clone(), 2), no_log(), Stop::new()).await;
 
@@ -225,4 +226,78 @@ async fn rounds_stop_when_there_is_nothing_left() {
     assert_eq!(summary.rounds, 2, "кругов должно быть ровно два: {}", summary.rounds);
     assert_eq!(calls.lock().len(), 4, "лишние проходы по аккаунтам");
     assert!(!summary.stopped, "останавливались не «Стопом», а по концу работы");
+}
+
+/// Разлогиненный (или забаненный) аккаунт не должен кочевать из круга в круг.
+///
+/// Сам он ничего не сделает — сессия мертва, — но каждый круг стоит проверки и
+/// строчки в логе. С галкой «выкидывать» он выпадает после того круга, на
+/// котором это выяснилось; без неё бот берётся за него снова и снова.
+#[tokio::test]
+async fn dead_accounts_leave_the_rounds() {
+    let run = |drop_dead: bool, tag: &str| {
+        let (core, accounts) = core_and_accounts(tag, 3);
+        for a in &accounts {
+            core.accounts.add(a.clone()).unwrap();
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let cfg = RunnerCfg {
+            prefetch_next: false,
+            concurrency: 1,
+            repeat_rounds: true,
+            round_pause_min: 0.0,
+            drop_dead,
+            ..Default::default()
+        };
+        let one: RunOne = {
+            let calls = calls.clone();
+            let core = core.clone();
+            Arc::new(move |acc: Account, _limit, _log, _stop| {
+                let calls = calls.clone();
+                let core = core.clone();
+                Box::pin(async move {
+                    calls.lock().push(acc.name.clone());
+                    // acc1 разлогинен, acc2 забанен — так их помечает проверка
+                    // авторизации в начале работы аккаунта.
+                    if acc.name == "acc1" {
+                        core.accounts.set_auth(&acc.name, false);
+                        return RunOutcome { skipped: true, ..Default::default() };
+                    }
+                    if acc.name == "acc2" {
+                        core.accounts.set_banned(&acc.name, true);
+                        return RunOutcome { skipped: true, ..Default::default() };
+                    }
+                    RunOutcome { done: 1, ..Default::default() }
+                })
+            })
+        };
+        let stop = Stop::new();
+        {
+            // Три круга и хватит: дальше картина не меняется.
+            let stop = stop.clone();
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                loop {
+                    if calls.lock().len() >= 30 {
+                        stop.stop();
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            });
+        }
+        (core, accounts, cfg, one, calls, stop)
+    };
+
+    let (core, accounts, cfg, one, calls, stop) = run(true, "dead-on");
+    runner::run(core, accounts, cfg, one, no_log(), stop).await;
+    let seen = calls.lock().clone();
+    assert_eq!(seen.iter().filter(|n| *n == "acc1").count(), 1, "разлогин взяли повторно: {seen:?}");
+    assert_eq!(seen.iter().filter(|n| *n == "acc2").count(), 1, "бан взяли повторно: {seen:?}");
+    assert!(seen.iter().filter(|n| *n == "acc0").count() > 1, "живой должен продолжать: {seen:?}");
+
+    let (core, accounts, cfg, one, calls, stop) = run(false, "dead-off");
+    runner::run(core, accounts, cfg, one, no_log(), stop).await;
+    let seen = calls.lock().clone();
+    assert!(seen.iter().filter(|n| *n == "acc1").count() > 1, "без галки должен браться снова: {seen:?}");
 }

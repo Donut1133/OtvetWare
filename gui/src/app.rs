@@ -139,6 +139,7 @@ impl App {
             // Прогревать следующий аккаунт есть смысл только если его вообще
             // собираются проверять.
             prefetch_next: c.check_auth,
+            drop_dead: c.drop_dead,
         };
         let check_auth = c.check_auth;
         let core = self.bg.core.clone();
