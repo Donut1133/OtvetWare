@@ -1,6 +1,6 @@
 //! otvet-core — вся логика бота otvet.mail.ru без единого пикселя интерфейса.
 //!
-//! Порт JS-версии (httpclient/bot/answerer/asker/replier/server) на Rust.
+//! Ядро бота: HTTP, аккаунты, режимы, оркестратор прогона.
 //! Данные общие со старым приложением: `accounts.json`, `personas.json`,
 //! `styles.json`, `gif-pool.json`, журналы `answered_*.ndjson` и т.д. — можно
 //! запускать то одну версию, то другую на одной папке.

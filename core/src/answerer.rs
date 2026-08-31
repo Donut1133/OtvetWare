@@ -1889,7 +1889,7 @@ mod tests {
     fn scramble_keeps_words_and_tail() {
         let src = "почему небо синее?";
         let out = scramble_question(src);
-        // Хвостовая пунктуация клеится к СЛУЧАЙНОМУ слову (как в JS-версии),
+        // Хвостовая пунктуация клеится к СЛУЧАЙНОМУ слову,
         // поэтому проверяем её наличие, а не позицию.
         assert_eq!(out.matches('?').count(), 1);
         let mut a: Vec<String> = src.replace('?', "").split_whitespace().map(|s| s.to_string()).collect();

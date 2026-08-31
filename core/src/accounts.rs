@@ -1,6 +1,6 @@
 //! accounts.rs — модель аккаунта и хранилище accounts.json.
 //!
-//! Файл общий с JS-версией, поэтому:
+//! Файл читают и другие инструменты, поэтому:
 //!  · имена полей — camelCase как там (`authBad`, `userId`, `karmaAt`, …);
 //!  · всё незнакомое (`_persona`, `profileDir`, будущие поля) складывается в
 //!    `extra` и пишется обратно как есть — иначе запуск Rust-версии молча съел бы
@@ -29,7 +29,7 @@ pub struct Karma {
 
 /// Рантайм-состояние аккаунта: ротация прокси и кэш персоны. Живёт в `Arc`,
 /// поэтому клон аккаунта, ушедший в воркер, видит те же счётчики — как объект по
-/// ссылке в JS. В JSON не попадает.
+/// ссылке. В JSON не попадает.
 #[derive(Default)]
 pub struct AccountRt {
     pub proxy_idx: AtomicUsize,
@@ -111,7 +111,7 @@ impl Account {
         self.karma.as_ref().map(|k| k.total)
     }
 
-    /// Персона, сохранённая в самом аккаунте (`_persona` из JS-версии).
+    /// Персона, сохранённая в самом аккаунте (поле `_persona`).
     pub fn stored_persona(&self) -> Option<crate::persona::Persona> {
         self.extra.get("_persona").and_then(|v| serde_json::from_value(v.clone()).ok())
     }
@@ -534,7 +534,7 @@ impl AccountsStore {
         self.writer.write(&txt)
     }
 
-    /// Перечитать файл с диска (его могла поправить JS-версия или руки).
+    /// Перечитать файл с диска (его могли поправить снаружи или руками).
     pub fn reload(&self) {
         let (list, err) = Self::read_file(self.writer.path());
         // Битый файл не должен молча превращать список в пустой: оставляем то,

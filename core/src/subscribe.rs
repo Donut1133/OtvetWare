@@ -1,4 +1,4 @@
-//! subscribe.rs — подписка/отписка на пользователей. Порт bot.js.
+//! subscribe.rs — подписка и отписка на пользователей.
 //!
 //! Контракт (снят с JS-бандла + живой проверкой):
 //!   POST   /api/topic/subscription  {user:{id}}          → {result:"Ok"}

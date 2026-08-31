@@ -1,4 +1,4 @@
-//! complain.rs — жалобы (abuse) на пользователей, посты и ответы. Порт bot.js.
+//! complain.rs — жалобы (abuse) на пользователей, посты и ответы.
 //!
 //! Контракт снят с JS-бандла otvet.mail.ru (antispam-клиент):
 //!   POST /api/antispam/report_user   {id:<userId>,  report_type}
