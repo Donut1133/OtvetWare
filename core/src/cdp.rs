@@ -85,12 +85,48 @@ pub fn chrome_path(root: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Свободный порт от ОС (её же и просим выбрать, чтобы не угадывать).
-async fn free_port() -> std::io::Result<u16> {
-    let l = TcpListener::bind("127.0.0.1:0").await?;
-    let p = l.local_addr()?.port();
-    drop(l);
-    Ok(p)
+/// Файл, в который браузер пишет выбранный им порт отладчика.
+fn devtools_port_file(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("DevToolsActivePort")
+}
+
+/// Адрес отладчика ИМЕННО ЭТОГО окна.
+///
+/// Порт выбирает сам браузер (`--remote-debugging-port=0`) и пишет его в
+/// `DevToolsActivePort` в своём профиле: первая строка — порт, вторая — путь
+/// сокета.
+///
+/// Раньше порт подбирали мы: биндили `127.0.0.1:0`, отпускали сокет и отдавали
+/// номер флагом. Между «отпустили» и «браузер занял» тот же номер успевал
+/// достаться следующему запуску — и второе окно подключалось не к себе, а к
+/// первому, уже работающему. Оттуда брались чужие вкладки в окне «другого
+/// аккаунта», куки уходили не в тот браузер, а когда то окно закрывали —
+/// сыпалось «Session with given id not found».
+async fn wait_devtools(profile_dir: &Path, child: &mut tokio::process::Child) -> anyhow::Result<String> {
+    let file = devtools_port_file(profile_dir);
+    for _ in 0..160 {
+        if let Some(url) = read_devtools_url(&file) {
+            return Ok(url);
+        }
+        // Браузер с уже занятым профилем не поднимает своё окно: он передаёт
+        // запрос работающей копии и сразу выходит. Порта от него не дождаться.
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            anyhow::bail!("окно этого аккаунта уже открыто — закрой его и попробуй снова");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    anyhow::bail!("браузер не поднял отладочный порт")
+}
+
+fn read_devtools_url(file: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let mut lines = text.lines();
+    let port: u16 = lines.next()?.trim().parse().ok()?;
+    let path = lines.next()?.trim();
+    if port == 0 || !path.starts_with('/') {
+        return None;
+    }
+    Some(format!("ws://127.0.0.1:{port}{path}"))
 }
 
 /// Локальный мост до прокси С ЛОГИНОМ — и SOCKS5, и HTTP.
@@ -372,23 +408,8 @@ struct Cdp {
 }
 
 impl Cdp {
-    async fn connect(port: u16) -> anyhow::Result<Self> {
-        // Адрес отладчика браузер публикует по HTTP; ждём, пока поднимется.
-        let http = reqwest::Client::new();
-        let mut ws_url = None;
-        for _ in 0..60 {
-            if let Ok(r) = http.get(format!("http://127.0.0.1:{port}/json/version")).send().await {
-                if let Ok(j) = r.json::<Value>().await {
-                    if let Some(u) = j.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
-                        ws_url = Some(u.to_string());
-                        break;
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        let url = ws_url.ok_or_else(|| anyhow::anyhow!("браузер не поднял отладочный порт"))?;
-        let (ws, _) = tokio_tungstenite::connect_async(url).await?;
+    async fn connect(ws_url: &str) -> anyhow::Result<Self> {
+        let (ws, _) = tokio_tungstenite::connect_async(ws_url).await?;
         Ok(Self { ws, next_id: 1 })
     }
 
@@ -407,11 +428,17 @@ impl Cdp {
     /// страница догрузилась, — но по медленному прокси и это небыстро, поэтому
     /// ждём дольше обычного, а молчание считаем «идёт, просто медленно»: окно
     /// уже открыто, и убивать его из-за неответа нечестно.
-    async fn navigate(&mut self, session: &str, url: &str) -> anyhow::Result<()> {
+    async fn navigate(&mut self, session: &str, url: &str) -> anyhow::Result<Option<String>> {
         let params = serde_json::json!({ "url": url });
         match self.send("Page.navigate", params, Some(session), Duration::from_secs(45)).await {
-            Ok(_) => Ok(()),
-            Err(e) if e.to_string().contains("не ответил") => Ok(()),
+            // `errorText` в ответе — это «переход не состоялся»: не разрешилось
+            // имя, не поднялся туннель через прокси, оборвалось соединение.
+            // Раньше мы его не читали и говорили «браузер открыт» над окном,
+            // в котором висела страница ошибки.
+            Ok(v) => {
+                Ok(v.get("errorText").and_then(|e| e.as_str()).filter(|e| !e.is_empty()).map(String::from))
+            }
+            Err(e) if e.to_string().contains("не ответил") => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -456,7 +483,7 @@ impl Cdp {
 
     /// Подключиться к первой вкладке-странице. Возвращает `sessionId`, которым
     /// дальше адресуются команды страницы.
-    async fn attach_page(&mut self) -> anyhow::Result<String> {
+    async fn attach_page(&mut self) -> anyhow::Result<(String, String)> {
         let list = self.call("Target.getTargets", serde_json::json!({})).await?;
         let target = list
             .get("targetInfos")
@@ -466,12 +493,38 @@ impl Cdp {
             .ok_or_else(|| anyhow::anyhow!("браузер не открыл ни одной вкладки"))?;
         // flatten — сессия поверх того же сокета, отдельное соединение не нужно.
         let r = self
-            .call("Target.attachToTarget", serde_json::json!({ "targetId": target, "flatten": true }))
+            .call("Target.attachToTarget", serde_json::json!({ "targetId": &target, "flatten": true }))
             .await?;
-        r.get("sessionId")
+        let session = r
+            .get("sessionId")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .ok_or_else(|| anyhow::anyhow!("CDP не выдал сессию вкладки"))
+            .ok_or_else(|| anyhow::anyhow!("CDP не выдал сессию вкладки"))?;
+        Ok((target, session))
+    }
+
+    /// Следующее СОБЫТИЕ (не ответ на команду). `None` — соединение закрылось
+    /// или сработал `stop`.
+    async fn next_event(&mut self, stop: &Stop) -> Option<Value> {
+        use futures::StreamExt;
+        loop {
+            let m = tokio::select! {
+                _ = stop.wait() => return None,
+                m = self.ws.next() => m?.ok()?,
+            };
+            let Ok(txt) = m.into_text() else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&txt) else { continue };
+            if v.get("method").is_some() {
+                return Some(v);
+            }
+        }
+    }
+
+    /// Жива ли сессия вкладки. Дешёвый вопрос, на который мёртвая сессия
+    /// отвечает ошибкой, — нужен, чтобы не сыпать пятью одинаковыми жалобами
+    /// подряд, когда вкладки уже нет.
+    async fn session_alive(&mut self, session: &str) -> bool {
+        self.call_in(session, "Page.getFrameTree", serde_json::json!({})).await.is_ok()
     }
 
     /// Все куки браузера (не только текущей вкладки).
@@ -515,7 +568,13 @@ fn stealth_source(p: &Persona) -> String {
 ///
 /// Порядок важен: инжект регистрируется ДО перехода на страницу, иначе первый
 /// же документ успевает прочитать настоящие значения.
-async fn wear_persona(cdp: &mut Cdp, session: &str, p: &Persona, log: &Log) -> anyhow::Result<()> {
+async fn wear_persona(
+    cdp: &mut Cdp,
+    session: &str,
+    p: &Persona,
+    log: &Log,
+    announce: bool,
+) -> anyhow::Result<()> {
     cdp.call_in(session, "Page.enable", serde_json::json!({})).await?;
     // Инжект регистрируется РОВНО один раз: он ставит шум canvas, и второй
     // проход положил бы шум поверх шума — отпечаток аккаунта перестал бы быть
@@ -526,15 +585,21 @@ async fn wear_persona(cdp: &mut Cdp, session: &str, p: &Persona, log: &Log) -> a
         serde_json::json!({ "source": stealth_source(p) }),
     )
     .await?;
-    apply_emulation(cdp, session, p, log).await;
-    log(&format!(
-        "[>] Отпечаток аккаунта: экран {}x{}, ядер {}, {}, {}",
-        p.screen.width,
-        p.screen.height,
-        p.hardware_concurrency,
-        p.timezone_id,
-        crate::util::clip(&p.gpu.renderer, 40)
-    ));
+    // До перехода страница ещё about:blank — спрашивать её не о чем, важно
+    // лишь, что команды приняты. Проверка ждёт настоящего документа.
+    for f in apply_emulation(cdp, session, p).await {
+        log(&format!("[!] Отпечаток: не применилось — {f}"));
+    }
+    if announce {
+        log(&format!(
+            "[>] Отпечаток аккаунта: экран {}x{}, ядер {}, {}, {}",
+            p.screen.width,
+            p.screen.height,
+            p.hardware_concurrency,
+            p.timezone_id,
+            crate::util::clip(&p.gpu.renderer, 40)
+        ));
+    }
     Ok(())
 }
 
@@ -544,7 +609,8 @@ async fn wear_persona(cdp: &mut Cdp, session: &str, p: &Persona, log: &Log) -> a
 /// правки страница видела настоящую таймзону и настоящее число ядер, хотя
 /// команды уходили без ошибок. Инжект так не теряется: он регистрируется на
 /// страницу и переживает переходы, поэтому и вызывается один раз.
-async fn apply_emulation(cdp: &mut Cdp, session: &str, p: &Persona, log: &Log) {
+async fn apply_emulation(cdp: &mut Cdp, session: &str, p: &Persona) -> Vec<String> {
+    let mut failed = Vec::new();
     // Метаданные UA — ключевая часть: из них Chrome сам собирает и
     // navigator.userAgentData, и заголовки Sec-CH-UA. Без них UA скажет одно, а
     // client hints другое, и противоречие ловится одним сравнением.
@@ -562,7 +628,7 @@ async fn apply_emulation(cdp: &mut Cdp, session: &str, p: &Persona, log: &Log) {
         )
         .await;
     if let Err(e) = ua {
-        log(&format!("[!] Отпечаток: не встали метаданные UA ({e})"));
+        failed.push(format!("метаданные UA ({e})"));
     }
 
     // Дальше — по одной необязательной подмене. Каждая может отсутствовать в
@@ -582,7 +648,165 @@ async fn apply_emulation(cdp: &mut Cdp, session: &str, p: &Persona, log: &Log) {
         ),
     ] {
         if let Err(e) = cdp.call_in(session, method, params).await {
-            log(&format!("[!] Отпечаток: {method} не применился ({e})"));
+            // Локаль — оверрайд на ВЕСЬ браузер, а не на вкладку: на второй
+            // вкладке та же команда отвечает «уже действует». Это и есть нужное
+            // состояние, а не сбой.
+            if e.to_string().contains("locale override is already in effect") {
+                continue;
+            }
+            failed.push(format!("{method} ({e})"));
+        }
+    }
+    failed
+}
+
+/// Что страница видит на самом деле — по тем полям, которые ставит только
+/// `Emulation`. GPU и экран сюда не входят: их подменяет инжект, и он переживает
+/// переходы сам.
+async fn seen_by_page(cdp: &mut Cdp, session: &str) -> Option<(String, i64, bool)> {
+    let js = "JSON.stringify([Intl.DateTimeFormat().resolvedOptions().timeZone,        navigator.hardwareConcurrency,        !!(navigator.userAgentData&&navigator.userAgentData.brands||[]).some(b=>/Chrome/.test(b.brand))])";
+    let r = cdp
+        .call_in(session, "Runtime.evaluate", serde_json::json!({ "expression": js, "returnByValue": true }))
+        .await
+        .ok()?;
+    parse_seen(&r)
+}
+
+/// Разбор ответа `Runtime.evaluate`.
+///
+/// Вынесено отдельно не для красоты: `call_in` отдаёт уже РАЗВЁРНУТЫЙ `result`
+/// ответа CDP, и лишний `result` в пути молча превращал проверку в «страница
+/// показывает своё» — на живых окнах отпечаток стоял, а в лог шла тревога.
+fn parse_seen(result: &Value) -> Option<(String, i64, bool)> {
+    let v: Value = serde_json::from_str(result.get("result")?.get("value")?.as_str()?).ok()?;
+    let a = v.as_array()?;
+    Some((a.first()?.as_str()?.to_string(), a.get(1)?.as_i64()?, a.get(2)?.as_bool()?))
+}
+
+/// Надеть подмены и УБЕДИТЬСЯ, что страница их видит.
+///
+/// `Page.navigate` возвращается, когда переход только начался. Документ
+/// коммитится позже и, как правило, в новом процессе отрисовки — вместе со
+/// старым пропадают все `Emulation.*`. Раскладка сразу после `navigate`
+/// попадает в процесс, который вот-вот выбросят: команды уходят в живую сессию,
+/// ошибок нет ни одной, а страница видит настоящие таймзону и число ядер.
+/// Замерено живьём: два аккаунта с разными персонами показывали 16 ядер и
+/// Asia/Yekaterinburg — железо и часовой пояс этого компьютера.
+///
+/// Поэтому не «применили и пошли дальше», а «применили и переспросили
+/// страницу», пока она не ответит нужным.
+async fn settle_persona(cdp: &mut Cdp, session: &str, p: &Persona, log: &Log) -> Settled {
+    let mut session = session.to_string();
+    let mut last_fail = Vec::new();
+    for attempt in 0..12 {
+        if attempt > 0 && !cdp.session_alive(&session).await {
+            match cdp.attach_page().await {
+                Ok((_, fresh)) => session = fresh,
+                // Вкладки нет и новую не дают — значит окна уже нет. Человек
+                // закрыл его сам, пока страница грузилась: жаловаться не на что.
+                Err(_) => return Settled::WindowGone,
+            }
+        }
+        last_fail = apply_emulation(cdp, &session, p).await;
+        if let Some((tz, cores, chrome_brand)) = seen_by_page(cdp, &session).await {
+            if tz == p.timezone_id && cores == p.hardware_concurrency && chrome_brand {
+                return Settled::Ok;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    let why = if last_fail.is_empty() {
+        "страница показывает своё".to_string()
+    } else {
+        last_fail.join(", ")
+    };
+    log(&format!("[!] Отпечаток НЕ встал целиком ({why}) — окно светит настоящей машиной."));
+    Settled::NotApplied
+}
+
+/// Чем кончилась попытка надеть отпечаток на открытую страницу.
+#[derive(Debug, PartialEq, Eq)]
+enum Settled {
+    /// Страница показывает персону.
+    Ok,
+    /// Окно живо, но подмены не удержались — об этом уже сказано в логе.
+    NotApplied,
+    /// Окна больше нет: человек закрыл его, не дожидаясь загрузки.
+    WindowGone,
+}
+
+/// Оставить в окне ровно одну вкладку — ту, которую сейчас откроем.
+///
+/// Профиль у аккаунта постоянный, и браузер норовит вернуть в него всё, что
+/// было открыто в прошлый раз. Плюс если окно этого аккаунта уже открыто,
+/// Chrome не поднимает второе, а доклеивает вкладку в старое. И в том, и в
+/// другом случае человек получает десяток чужих вкладок, среди которых теряется
+/// та, ради которой окно и открывали.
+async fn close_other_tabs(cdp: &mut Cdp, keep: &str) {
+    let Ok(list) = cdp.call("Target.getTargets", serde_json::json!({})).await else { return };
+    let others: Vec<String> = list
+        .get("targetInfos")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+                .filter_map(|t| t.get("targetId").and_then(|v| v.as_str()))
+                .filter(|id| *id != keep)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in &others {
+        let _ = cdp.call("Target.closeTarget", serde_json::json!({ "targetId": id })).await;
+    }
+}
+
+/// Держать соединение открытым, пока живёт окно, и одевать новые вкладки.
+///
+/// `Emulation.*` — это оверрайды ОТЛАДОЧНОЙ СЕССИИ, а не настройки браузера:
+/// как только клиент CDP отсоединяется, Chrome возвращает настоящие значения.
+/// Замерено живьём: с подключённым отладчиком страница показывала
+/// `Europe/Moscow / 4`, а через мгновение после закрытия сокета — реальные
+/// `Asia/Yekaterinburg / 16`.
+///
+/// Раньше `open_as` закрывал соединение сразу после навигации, и окно,
+/// открытое «под аккаунтом», почти сразу начинало светить настоящими таймзоной,
+/// числом ядер и метаданными UA. Инжект при этом оставался — то есть GPU и
+/// память были поддельными, а часовой пояс настоящим. Такое противоречие
+/// заметнее, чем честное отсутствие подмен.
+async fn hold_persona(mut cdp: Cdp, first: String, p: Persona, log: Log, stop: Stop) {
+    // Новая вкладка открывается без сессии, а значит и без подмен. Ловим её
+    // появление и одеваем так же, как первую.
+    if cdp.call("Target.setDiscoverTargets", serde_json::json!({ "discover": true })).await.is_err() {
+        // Не смогли подписаться — всё равно держим сокет: подмены на уже
+        // одетой вкладке живут ровно до его закрытия.
+        stop.wait().await;
+        return;
+    }
+    while let Some(ev) = cdp.next_event(&stop).await {
+        if ev.get("method").and_then(|m| m.as_str()) != Some("Target.targetCreated") {
+            continue;
+        }
+        let info = ev.get("params").and_then(|x| x.get("targetInfo"));
+        if info.and_then(|i| i.get("type")).and_then(|t| t.as_str()) != Some("page") {
+            continue;
+        }
+        let Some(id) = info.and_then(|i| i.get("targetId")).and_then(|t| t.as_str()).map(String::from) else {
+            continue;
+        };
+        // Первую вкладку пропускаем: подписка сообщает и про уже существующие,
+        // а второй инжект положил бы шум canvas поверх шума — отпечаток
+        // перестал бы быть постоянным.
+        if id == first {
+            continue;
+        }
+        let attach =
+            cdp.call("Target.attachToTarget", serde_json::json!({ "targetId": id, "flatten": true })).await;
+        let Some(sid) = attach.ok().and_then(|r| r.get("sessionId")?.as_str().map(String::from)) else {
+            continue;
+        };
+        if wear_persona(&mut cdp, &sid, &p, &log, false).await.is_err() {
+            log("[!] Отпечаток: новая вкладка осталась без подмен.");
         }
     }
 }
@@ -632,18 +856,25 @@ pub async fn open_as(
             "не найден браузер. Он должен лежать в папке browsers рядом с программой — скачай архив с релиза целиком, там она уже внутри"
         )
     })?;
-    let port = free_port().await?;
     std::fs::create_dir_all(profile_dir).ok();
+    // Файл от прошлого запуска: браузер удаляет его, когда закрывается сам, но
+    // не когда его убили. Оставить — значит подключиться к мёртвому порту.
+    let _ = std::fs::remove_file(devtools_port_file(profile_dir));
 
     // Своя «жизнь» моста и наблюдателя за окном.
     let alive = Stop::new();
 
     let mut cmd = tokio::process::Command::new(&chrome);
     cmd.arg(format!("--user-data-dir={}", profile_dir.display()))
-        .arg(format!("--remote-debugging-port={port}"))
+        // 0 = порт выбирает браузер и пишет его в свой профиль, см. wait_devtools.
+        .arg("--remote-debugging-port=0")
         .arg("--remote-allow-origins=*")
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
+        // Прошлый раз окно могли закрыть жёстко — тогда браузер предлагает
+        // «восстановить страницы». Нам восстанавливать нечего: вкладку мы
+        // открываем свою.
+        .arg("--hide-crash-restore-bubble")
         .arg("--disable-blink-features=AutomationControlled")
         // WebRTC умеет ходить по UDP мимо HTTP-прокси и через STUN отдать
         // настоящий IP. Для аккаунта на прокси это мгновенный деанон.
@@ -667,19 +898,15 @@ pub async fn open_as(
     cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("не запустить браузер: {e}"))?;
 
-    // Chromium с уже занятым профилем не поднимает своё окно, а передаёт запрос
-    // работающей копии и сразу выходит. Ждать от него отладочный порт бесполезно
-    // — лучше сказать об этом сразу и понятными словами.
-    for _ in 0..8 {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            alive.stop();
-            anyhow::bail!("окно этого аккаунта уже открыто — закрой его и попробуй снова");
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    let mut cdp = match Cdp::connect(port).await {
-        Ok(c) => c,
+    let mut cdp = match wait_devtools(profile_dir, &mut child).await {
+        Ok(ws) => match Cdp::connect(&ws).await {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = child.kill().await;
+                alive.stop();
+                return Err(e);
+            }
+        },
         Err(e) => {
             let _ = child.kill().await;
             alive.stop();
@@ -703,28 +930,48 @@ pub async fn open_as(
     // Дальше работаем в ТОЙ ЖЕ пустой вкладке, а не открываем новую: отпечаток
     // надо надеть до первого документа, а `Target.createTarget` с адресом
     // навигирует сразу — инжект уже не успел бы.
-    let session = match cdp.attach_page().await {
-        Ok(sid) => sid,
+    let (target, session) = match cdp.attach_page().await {
+        Ok(pair) => pair,
         Err(e) => {
             let _ = child.kill().await;
             alive.stop();
             return Err(e);
         }
     };
-    if let Err(e) = wear_persona(&mut cdp, &session, persona, log).await {
+    // Чистим ДО отпечатка и перехода: окно должно открыться с одной вкладкой,
+    // а не с прошлогодним хвостом.
+    close_other_tabs(&mut cdp, &target).await;
+    if let Err(e) = wear_persona(&mut cdp, &session, persona, log, true).await {
         log(&format!("[!] Отпечаток не встал целиком ({e}) — открываю как есть."));
     }
-    if let Err(e) = cdp.navigate(&session, url).await {
-        let _ = child.kill().await;
-        alive.stop();
-        return Err(anyhow::anyhow!("не удалось открыть страницу: {e}"));
+    match cdp.navigate(&session, url).await {
+        Err(e) => {
+            let _ = child.kill().await;
+            alive.stop();
+            return Err(anyhow::anyhow!("не удалось открыть страницу: {e}"));
+        }
+        Ok(Some(err)) => log(&format!("[!] Страница не открылась: {err} — похоже на прокси.")),
+        Ok(None) => {}
     }
-    // Переход мог сменить процесс отрисовки — навешиваем подмены заново.
-    apply_emulation(&mut cdp, &session, persona, log).await;
+    // Переход мог сменить процесс отрисовки, а то и саму вкладку.
+    if settle_persona(&mut cdp, &session, persona, log).await == Settled::WindowGone {
+        // Врать «браузер открыт» про закрытое окно незачем.
+        log("[x] Окно закрыли, не дождавшись страницы.");
+        alive.stop();
+        return Ok(());
+    }
     log(&format!("[+] Браузер открыт, кук перенесено: {n}"));
 
-    // Ждём, пока человек закроет окно, — только чтобы прибрать мост и не
-    // оставлять зомби-процесс.
+    // Соединение НЕ закрываем: вместе с ним исчезли бы все `Emulation.*`.
+    // Оно живёт ровно столько же, сколько окно.
+    let persona = persona.clone();
+    let log_held = log.clone();
+    let held = alive.clone();
+    tokio::spawn(async move {
+        hold_persona(cdp, target, persona, log_held, held).await;
+    });
+    // Ждём, пока человек закроет окно, — чтобы прибрать мост, отпустить
+    // соединение и не оставлять зомби-процесс.
     tokio::spawn(async move {
         let _ = child.wait().await;
         alive.stop();
@@ -748,15 +995,20 @@ pub async fn login_and_harvest(
             "не найден браузер. Он должен лежать в папке browsers рядом с программой — скачай архив с релиза целиком, там она уже внутри"
         )
     })?;
-    let port = free_port().await?;
     std::fs::create_dir_all(profile_dir).ok();
+    let _ = std::fs::remove_file(devtools_port_file(profile_dir));
 
     let mut cmd = tokio::process::Command::new(&chrome);
     cmd.arg(format!("--user-data-dir={}", profile_dir.display()))
-        .arg(format!("--remote-debugging-port={port}"))
+        // 0 = порт выбирает браузер и пишет его в свой профиль, см. wait_devtools.
+        .arg("--remote-debugging-port=0")
         .arg("--remote-allow-origins=*")
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
+        // Прошлый раз окно могли закрыть жёстко — тогда браузер предлагает
+        // «восстановить страницы». Нам восстанавливать нечего: вкладку мы
+        // открываем свою.
+        .arg("--hide-crash-restore-bubble")
         .arg("--disable-blink-features=AutomationControlled")
         // WebRTC умеет ходить по UDP мимо HTTP-прокси и через STUN отдать
         // настоящий IP. Для аккаунта на прокси это мгновенный деанон.
@@ -788,8 +1040,14 @@ pub async fn login_and_harvest(
     log("[>] Открываю браузер — войди в аккаунт вручную. Окно закроется само.");
     let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("не запустить браузер: {e}"))?;
 
-    let mut cdp = match Cdp::connect(port).await {
-        Ok(c) => c,
+    let mut cdp = match wait_devtools(profile_dir, &mut child).await {
+        Ok(ws) => match Cdp::connect(&ws).await {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = child.kill().await;
+                return Err(e);
+            }
+        },
         Err(e) => {
             let _ = child.kill().await;
             return Err(e);
@@ -800,15 +1058,22 @@ pub async fn login_and_harvest(
     // здесь мы и показываемся сайту живым браузером: тридцать входов с одной
     // машины должны выглядеть как тридцать разных машин.
     match cdp.attach_page().await {
-        Ok(session) => {
-            if let Err(e) = wear_persona(&mut cdp, &session, persona, log).await {
+        Ok((target, session)) => {
+            close_other_tabs(&mut cdp, &target).await;
+            if let Err(e) = wear_persona(&mut cdp, &session, persona, log, true).await {
                 log(&format!("[!] Отпечаток не встал целиком ({e}) — вход как есть."));
             }
-            if let Err(e) = cdp.navigate(&session, LOGIN_URL).await {
-                let _ = child.kill().await;
-                return Err(anyhow::anyhow!("не открылась страница входа: {e}"));
+            match cdp.navigate(&session, LOGIN_URL).await {
+                Err(e) => {
+                    let _ = child.kill().await;
+                    return Err(anyhow::anyhow!("не открылась страница входа: {e}"));
+                }
+                Ok(Some(err)) => log(&format!("[!] Страница входа не открылась: {err} — похоже на прокси.")),
+                Ok(None) => {}
             }
-            apply_emulation(&mut cdp, &session, persona, log).await;
+            if settle_persona(&mut cdp, &session, persona, log).await == Settled::WindowGone {
+                log("[x] Окно закрыли, не дождавшись страницы входа.");
+            }
         }
         Err(e) => {
             let _ = child.kill().await;
@@ -864,6 +1129,80 @@ pub async fn login_and_harvest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ответ снят с живого Chromium. Путь до значения тут легко промахнуть на
+    /// один уровень, и промах не виден: проверка отпечатка просто всегда
+    /// говорит «не встал», хотя на странице всё стоит.
+    #[test]
+    fn the_page_answer_is_unwrapped_at_the_right_depth() {
+        let ok = serde_json::json!({
+            "result": { "type": "string", "value": "[\"Europe/Moscow\",8,true]" }
+        });
+        assert_eq!(parse_seen(&ok), Some(("Europe/Moscow".into(), 8, true)));
+
+        // Лишний уровень — это ответ ЦЕЛИКОМ, а не развёрнутый `result`.
+        let wrapped = serde_json::json!({ "result": ok.clone() });
+        assert_eq!(parse_seen(&wrapped), None);
+
+        // Страница ответила не тем — молчим, а не паникуем.
+        assert_eq!(parse_seen(&serde_json::json!({ "result": { "value": "не json" } })), None);
+        assert_eq!(parse_seen(&serde_json::json!({})), None);
+        assert_eq!(parse_seen(&serde_json::json!({ "result": { "value": "[\"Europe/Moscow\"]" } })), None);
+    }
+
+    /// Формат файла снят с живого Chromium: порт, затем путь сокета.
+    ///
+    /// Читать его нужно целиком и с проверками: браузер создаёт файл пустым и
+    /// дописывает уже потом, так что на полуготовом мы обязаны сказать «ещё
+    /// нет», а не собрать битый адрес и подключиться неизвестно куда.
+    #[test]
+    fn debugger_address_is_read_from_the_browsers_own_file() {
+        let dir = std::env::temp_dir().join(format!("otvetware-devtools-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = devtools_port_file(&dir);
+        assert_eq!(file.file_name().unwrap(), "DevToolsActivePort");
+
+        assert_eq!(read_devtools_url(&file), None, "файла ещё нет");
+
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(read_devtools_url(&file), None, "пустой файл — браузер только начал");
+
+        std::fs::write(
+            &file, "56731
+",
+        )
+        .unwrap();
+        assert_eq!(read_devtools_url(&file), None, "порт есть, пути ещё нет");
+
+        std::fs::write(
+            &file,
+            "56731
+/devtools/browser/9f2c
+",
+        )
+        .unwrap();
+        assert_eq!(read_devtools_url(&file).as_deref(), Some("ws://127.0.0.1:56731/devtools/browser/9f2c"));
+
+        std::fs::write(
+            &file,
+            "0
+/devtools/browser/9f2c
+",
+        )
+        .unwrap();
+        assert_eq!(read_devtools_url(&file), None, "нулевой порт — браузер не поднял отладчик");
+
+        std::fs::write(
+            &file,
+            "мусор
+тоже мусор
+",
+        )
+        .unwrap();
+        assert_eq!(read_devtools_url(&file), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// В инжект должны уезжать значения ИМЕННО этой персоны. Если конфиг
     /// разъедется с тем, что читает `stealth.js`, подмена молча не сработает:

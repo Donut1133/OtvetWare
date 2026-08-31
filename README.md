@@ -85,7 +85,7 @@ cargo run --release -p otvet-gui
 тестами и зовётся из своих скриптов.
 
 ```bash
-cargo test --workspace       # 139 тестов, поднимают локальный сервер-заглушку
+cargo test --workspace       # 141 тест, поднимают локальный сервер-заглушку
 cargo clippy --all-targets   # чисто
 cargo fmt --all
 ```
