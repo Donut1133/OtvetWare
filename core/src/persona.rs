@@ -1,6 +1,6 @@
 //! persona.rs — порт fingerprint.js: детерминированные антидетект-«персоны».
 //!
-//! Ключевое требование — СОВМЕСТИМОСТЬ с JS-версией: тот же seed обязан давать
+//! Ключевое требование — ПОСТОЯНСТВО: тот же seed обязан давать
 //! ту же персону, иначе аккаунт, залогиненный старым приложением, начнёт ходить
 //! по API с другим «железом» под теми же куками. Поэтому PRNG (FNV-1a +
 //! mulberry32) и ПОРЯДОК обращений к нему повторены один в один.
@@ -19,7 +19,7 @@ pub const FALLBACK_VERSION: &str = "148.0.7778.96";
 
 // ─── PRNG ───────────────────────────────────────────────────────────────────
 
-/// FNV-1a 32 бита. Строка обходится по UTF-16 code units (как charCodeAt в JS),
+/// FNV-1a 32 бита. Строка обходится по UTF-16 code units,
 /// а не по байтам UTF-8 — иначе кириллическое имя аккаунта дало бы другой seed.
 pub fn hash32(s: &str) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
@@ -298,7 +298,7 @@ pub struct Persona {
     #[serde(rename = "reducedMotion")]
     pub reduced_motion: String,
     pub noise: Noise,
-    /// Неизвестные поля из JS-версии сохраняем, чтобы не терять их при записи.
+    /// Неизвестные поля сохраняем, чтобы не терять их при записи.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
 }
@@ -344,20 +344,6 @@ pub fn chrome_full_version(root: &Path) -> String {
             // с chrome.exe: первый папкой, второй файлом `<версия>.manifest`.
             if let Some(v) = crate::cdp::chrome_path(root).as_deref().and_then(version_beside) {
                 return v;
-            }
-            let p = root.join("node_modules/patchright-core/browsers.json");
-            if let Ok(txt) = std::fs::read_to_string(&p) {
-                if let Ok(j) = serde_json::from_str::<Value>(&txt) {
-                    if let Some(arr) = j.get("browsers").and_then(|b| b.as_array()) {
-                        for b in arr {
-                            if b.get("name").and_then(|n| n.as_str()) == Some("chromium") {
-                                if let Some(v) = b.get("browserVersion").and_then(|v| v.as_str()) {
-                                    return v.to_string();
-                                }
-                            }
-                        }
-                    }
-                }
             }
             FALLBACK_VERSION.to_string()
         })
@@ -406,7 +392,7 @@ pub struct PersonaOpts {
     pub timezone_id: Option<String>,
 }
 
-/// Чистая функция: один seed → одна и та же персона (совместимо с JS).
+/// Чистая функция: один seed → одна и та же персона.
 pub fn build_persona(seed: &str, opts: &PersonaOpts, root: &Path) -> Persona {
     let os_key = match opts.os.as_deref() {
         None | Some("host") => host_os().to_string(),
@@ -424,7 +410,7 @@ pub fn build_persona(seed: &str, opts: &PersonaOpts, root: &Path) -> Persona {
         t.ua_platform, major
     );
 
-    // ПОРЯДОК обращений к ГПСЧ обязан совпадать с JS — иначе персона «поедет».
+    // ПОРЯДОК обращений к ГПСЧ менять нельзя — иначе персона «поедет».
     let (screen_w, screen_h, dpr) = {
         let s = r.pick_w(&t.screens);
         (s.w, s.h, s.dpr)
@@ -617,7 +603,7 @@ mod tests {
         assert_eq!(hash32(""), 0x811c_9dc5);
     }
 
-    /// Главная проверка совместимости: персоны, сгенерированные JS-версией и
+    /// Главная проверка совместимости: персоны, записанные раньше, и
     /// лежащие в personas.json, должны воспроизводиться байт-в-байт. Если этот
     /// тест красный — аккаунт под теми же куками сменит «железо».
     #[test]

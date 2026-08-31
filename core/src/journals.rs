@@ -1,4 +1,4 @@
-//! journals.rs — журналы и справочники на диске. Формат общий с JS-версией.
+//! journals.rs — журналы и справочники на диске.
 //!
 //!  · `answered_<акк>.ndjson` — на что уже отвечали (одна строка = один JSON,
 //!    append-only: переписывать файл целиком после каждого ответа — это O(n²) IO);
@@ -283,7 +283,7 @@ impl Styles {
 
     /// Промпт стиля для режима: `answer` | `question` | `reply`.
     /// Если для режима своего промпта нет — берём `answer` (так же вела себя
-    /// JS-версия: у большинства стилей описан только он).
+    /// у большинства стилей описан только он).
     pub fn prompt(&self, style: &str, mode: &str) -> String {
         let by_style = self
             .prompts
@@ -314,7 +314,7 @@ pub struct PoolImage {
     pub tag: String,
 }
 
-/// Записать пул целиком. Формат — массив, как у JS-версии.
+/// Записать пул целиком. Формат — массив.
 pub fn save_gif_pool(root: &Path, items: &[PoolImage]) -> std::io::Result<()> {
     let txt = serde_json::to_string_pretty(items).unwrap_or_else(|_| "[]".into());
     crate::store_io::FileWriter::new(root.join("gif-pool.json")).write(&txt)

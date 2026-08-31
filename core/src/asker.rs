@@ -437,7 +437,7 @@ pub async fn run_asker(core: &Core, acc: &Account, p: &AskParams, log: &Log, sto
                 pick_one(&topics).cloned().unwrap_or_else(|| "жизнь".into())
             };
             log(&format!("\n[>] Генерирую вопрос (тема: {topic})..."));
-            // «жизнь» — это отсутствие темы, а не тема: так было в JS-версии.
+            // «жизнь» — это отсутствие темы, а не тема.
             let topic_arg = if !own && topic == "жизнь" { String::new() } else { topic };
             match generate_question(core, &ai, &topic_arg, &question_prompt, &p.mention, log, stop).await {
                 Ok(q) if !q.title.is_empty() => q,

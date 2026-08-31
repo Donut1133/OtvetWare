@@ -1,6 +1,6 @@
 //! http.rs — HTTP-ядро: запросы к otvet.mail.ru под куками аккаунта.
 //!
-//! Порт httpclient.js. Браузер для РАБОТЫ бота не нужен — только для входа.
+//! Браузер для РАБОТЫ бота не нужен — только для входа.
 //!
 //! Что здесь важно и почему:
 //!  · UA/язык/client hints берутся ИЗ ОДНОЙ персоны (см. persona.rs). Антибот
@@ -15,11 +15,9 @@
 //!  · Сетевой сбой засчитывается текущему прокси; после порога — ротация на
 //!    следующий прокси аккаунта, и ретрай идёт уже через него.
 //!
-//! Отличие от JS-версии в лучшую сторону: reqwest говорит HTTP/2 по ALPN, как
-//! настоящий Chrome (undici в Node здесь оставался на HTTP/1.1 — само по себе
-//! противоречие с UA). TLS-отпечаток (JA3) всё равно НЕ браузерный: это стек ОС
-//! (schannel), а не BoringSSL. Полное совпадение даёт только запрос из живого
-//! браузера.
+//! HTTP/2 идёт по ALPN, как у настоящего Chrome. TLS-отпечаток (JA3) при этом
+//! НЕ браузерный: это стек ОС (schannel), а не BoringSSL. Полное совпадение даёт
+//! только запрос из живого браузера.
 
 use crate::accounts::{jar_to_string, parse_cookie_jar, Account, AccountsStore};
 use crate::persona::{Persona, PersonaOpts, PersonaStore};
@@ -70,7 +68,7 @@ impl Method {
 
 #[derive(Debug)]
 pub enum HttpError {
-    /// Сеть/прокси/таймаут — то, что в JS прилетало как `fetch failed`.
+    /// Сеть, прокси или таймаут.
     Network(String),
     /// Прогон остановлен пользователем.
     Aborted,
@@ -89,7 +87,7 @@ impl std::error::Error for HttpError {}
 
 pub type HttpResult = Result<Resp, HttpError>;
 
-/// Ответ сервера в том же виде, что отдавал `hc.request` в JS.
+/// Ответ сервера.
 #[derive(Debug, Clone)]
 pub struct Resp {
     pub status: u16,
@@ -171,7 +169,7 @@ impl ReqOpts {
     }
 }
 
-// Порядки заголовков сняты измерением с Chrome 148 (см. комментарий в httpclient.js).
+// Порядки заголовков сняты измерением с Chrome 148.
 const CHROME_ORDER_GET: &[&str] = &[
     "sec-ch-ua-platform",
     "user-agent",
@@ -224,7 +222,7 @@ impl Http {
         &self.store
     }
 
-    /// Персона аккаунта. Сохранённая в самом аккаунте (`_persona` от JS-версии)
+    /// Персона аккаунта. Сохранённая в самом аккаунте (`_persona`)
     /// имеет приоритет: под одними куками отпечаток меняться не должен.
     pub fn persona_for(&self, acc: &Account) -> Persona {
         if let Some(p) = acc.cached_persona() {
@@ -286,7 +284,7 @@ impl Http {
     }
 
     /// Базовый запрос. Возвращает `Resp` даже на 4xx/5xx; `Err` — только сеть,
-    /// таймаут или «Стоп» (как `fetch` в JS: он тоже бросает лишь на сети).
+    /// таймаут или «Стоп»: ошибка возвращается только на сетевых сбоях.
     pub async fn request(&self, acc: &Account, path_or_url: &str, opts: ReqOpts, stop: &Stop) -> HttpResult {
         // Пауза проверяется здесь, а не только в паузах между шагами: «на паузе»
         // должно значить «на сайт не уходит ни одного запроса», в каком бы месте

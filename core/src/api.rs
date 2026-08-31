@@ -1,5 +1,5 @@
 //! api.rs — прикладные вызовы otvet.mail.ru: кто я, жив ли аккаунт, карма,
-//! профиль, смена имени/аватара. Порт соответствующих функций httpclient.js.
+//! профиль, смена имени и аватара.
 
 use crate::accounts::{Account, Karma};
 use crate::http::{base_url, HttpError, Method, ReqOpts, Resp};
