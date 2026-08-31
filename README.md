@@ -10,8 +10,6 @@
 Работает чистым HTTP: браузер нужен один раз, чтобы войти в аккаунт. Ни
 Node.js, ни веб-панели, ни локального сервера — только один `.exe`.
 
-![Главное окно](docs/screenshot-votes.png)
-
 ---
 
 ## Что умеет
@@ -101,19 +99,6 @@ cargo run --release -p otvet-gui
 Для режимов с нейросетью нужен ключ любого OpenAI-совместимого API
 — по умолчанию это [DeepSeek](https://platform.deepseek.com), но адрес и модель
 меняются в тонкой настройке. Ключ вводится прямо в панели режима.
-
-## Как выглядит
-
-<table>
-<tr>
-<td width="50%"><img src="docs/screenshot-answers.png" alt="Режим «Ответы»"><br><sub>Ответы: лента, нейросеть, темп. Редкое — под свёрнутыми заголовками</sub></td>
-<td width="50%"><img src="docs/screenshot-empty.png" alt="Первый запуск"><br><sub>Первый запуск: окно само говорит, что делать</sub></td>
-</tr>
-<tr>
-<td width="50%"><img src="docs/screenshot-subscribe.png" alt="Режим «Подписки»"><br><sub>Подписки и разовая проверка «кто уже подписан»</sub></td>
-<td width="50%"><img src="docs/screenshot-complain.png" alt="Режим «Жалобы»"><br><sub>Жалобы: цель, причина, темп</sub></td>
-</tr>
-</table>
 
 ## Как устроено
 
