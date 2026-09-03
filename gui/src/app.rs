@@ -346,6 +346,7 @@ impl App {
                     ui.add_space(4.0);
                 });
                 let mut open_pool = false;
+                let mut check_ai = false;
                 egui::ScrollArea::vertical().id_salt("settings_scroll").show(ui, |ui| {
                     match self.mode {
                         Mode::Votes => self.forms.votes.ui(ui),
@@ -359,6 +360,7 @@ impl App {
                         }
                         Mode::Comments => self.forms.comments.ui(ui, &mut self.forms.ai, &self.styles),
                     }
+                    check_ai = std::mem::take(&mut self.forms.ai.check_now);
                     self.tools(ui);
 
                     ui.add_space(10.0);
@@ -374,6 +376,9 @@ impl App {
                 });
                 if open_pool {
                     self.pool.open(&self.bg, &self.accounts.selected_accounts(&self.bg.accounts()));
+                }
+                if check_ai {
+                    self.check_ai();
                 }
             });
     }
@@ -409,6 +414,27 @@ impl App {
     }
 
     /// Кто уже подписан: матрица «аккаунт → профили».
+    /// Разовая проверка нейросети — тем же телом запроса, каким пойдёт работа.
+    ///
+    /// Без неё узнать, что провайдер не принимает выбранный уровень размышлений
+    /// или чужое поле, можно было только запустив прогон.
+    fn check_ai(&self) {
+        let log = self.state(self.mode).log.clone();
+        let cfg = self.forms.ai.cfg();
+        if cfg.api_key.trim().is_empty() {
+            log.push("[-] Нужен ключ нейросети.");
+            return;
+        }
+        let core = self.bg.core.clone();
+        log.push(&format!("[>] Проверяю нейросеть: {}…", cfg.model));
+        self.bg.spawn(async move {
+            match core.ai.check(&cfg, &Stop::new()).await {
+                Ok(m) => log.push(&format!("[+] {m}")),
+                Err(e) => log.push(&format!("[-] {e}")),
+            }
+        });
+    }
+
     fn check_subscriptions(&self) {
         let st = self.state(self.mode);
         let log = st.log.clone();

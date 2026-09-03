@@ -51,6 +51,9 @@ pub struct AiForm {
     pub thinking: Thinking,
     #[serde(default)]
     pub extra_json: String,
+    /// Нажали «Проверить». В файл не пишется: это разовое желание, а не настройка.
+    #[serde(skip)]
+    pub check_now: bool,
     pub style: String,
     pub custom_prompt: String,
     pub use_custom: bool,
@@ -70,6 +73,7 @@ impl Default for AiForm {
             retries: 3,
             thinking: Thinking::default(),
             extra_json: String::new(),
+            check_now: false,
             style: "Обычный чел".into(),
             custom_prompt: String::new(),
             use_custom: false,
@@ -122,6 +126,13 @@ impl AiForm {
             ui.label("Модель");
             ui.add(egui::TextEdit::singleline(&mut self.model).desired_width(f32::INFINITY));
         });
+        if ui
+            .button("Проверить нейросеть")
+            .on_hover_text("Один короткий запрос теми же настройками, что уйдут в работу: ключ, модель, размышления, свои параметры")
+            .clicked()
+        {
+            self.check_now = true;
+        }
         ui.horizontal(|ui| {
             ui.label("Стиль");
             let names = styles.names();
@@ -191,7 +202,7 @@ impl AiForm {
             );
             hint(
                 ui,
-                "У DeepSeek это решает модель: deepseek-chat не думает, deepseek-reasoner думает всегда. Провайдер, который поле не понимает, ответит ошибкой — жми «Проверить», она покажет её словами провайдера.",
+                "У DeepSeek это решает модель: deepseek-chat не думает, deepseek-reasoner думает всегда. Провайдер, который поле не понимает, ответит ошибкой — жми «Проверить нейросеть», она придёт словами провайдера.",
             );
 
             ui.label("Свои параметры запроса (JSON)");
