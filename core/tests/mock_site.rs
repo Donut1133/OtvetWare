@@ -2648,3 +2648,60 @@ async fn keywords_filter_the_feed() {
     assert_eq!(about_dinner, 0, "лишний вопрос уехал в нейросеть — это деньги на ветер");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Непрерывная лента обязана говорить, почему сидит без работы.
+///
+/// Раньше эта ветка глотала и пустую ленту, и ошибку сети: `unwrap_or_default()`
+/// превращал любой отказ в пустой список. С мёртвым прокси режим выглядел
+/// зависшим — последняя строка в логе «каждый новый вопрос сразу в обработку»,
+/// и дальше тишина на любое количество часов.
+#[tokio::test]
+async fn continuous_feed_says_why_it_has_nothing_to_do() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("contquiet");
+    let acc = account("cont-acc");
+
+    route_ai(m, "неважно");
+    m.route(|r| {
+        // Лента отвечает, но пустая: отвечать не на что.
+        if r.path.starts_with("/api/topic/feed") {
+            return Some(Res::json(r#"{"result":{"feed":[]}}"#));
+        }
+        None
+    });
+
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log: otvet_core::util::Log = {
+        let seen = seen.clone();
+        Arc::new(move |l: &str| seen.lock().push(l.to_string()))
+    };
+
+    let p = answerer::AnswerParams {
+        mode: answerer::AnswerMode::Ai,
+        target: answerer::TargetMode::Feed,
+        continuous_feed: true,
+        limit: 1,
+        feed_min: 0.5,
+        feed_max: 0.5,
+        check_auth: false,
+        verify_posted: false,
+        ai: ai_cfg(&m.base),
+        style: "Обычный чел".into(),
+        ..Default::default()
+    };
+
+    // Режим крутится до «Стоп» — даём ему пару кругов и останавливаем.
+    let stop = Stop::new();
+    {
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+            stop.stop();
+        });
+    }
+    answerer::run_answerer(&core, &acc, &p, &log, &stop).await;
+
+    let lines = seen.lock().clone();
+    assert!(lines.iter().any(|l| l.contains("нет отвечаемых")), "режим промолчал о пустой ленте: {lines:#?}");
+    let _ = std::fs::remove_dir_all(dir);
+}

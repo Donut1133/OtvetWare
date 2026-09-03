@@ -72,6 +72,9 @@ pub enum HttpError {
     Network(String),
     /// Прогон остановлен пользователем.
     Aborted,
+    /// Антибот mail.ru. Отдельно от `Network`, потому что лечится не повтором,
+    /// а остановкой аккаунта.
+    Blocked,
 }
 
 impl std::fmt::Display for HttpError {
@@ -79,6 +82,7 @@ impl std::fmt::Display for HttpError {
         match self {
             HttpError::Network(m) => write!(f, "{m}"),
             HttpError::Aborted => write!(f, "остановлено"),
+            HttpError::Blocked => write!(f, "антибот mail.ru (429)"),
         }
     }
 }
@@ -86,6 +90,25 @@ impl std::fmt::Display for HttpError {
 impl std::error::Error for HttpError {}
 
 pub type HttpResult = Result<Resp, HttpError>;
+
+/// Антибот, притворяющийся обычным ответом.
+///
+/// Настоящий отказ приходит статусом 418/429, но у mail.ru есть и второй вид:
+/// **HTTP 200**, а в теле HTML-страница их WAF — «Ошибка 429. У вас большие
+/// запросы!». Статус двухсотый, JSON не разбирается, и вызывающий код видел
+/// просто пустой ответ. На ленте это выглядело как «в ленте ничего нет» —
+/// часами подряд, пока аккаунт молотил в закрытую дверь.
+///
+/// Тела API всегда начинаются с `{`, поэтому проверка почти бесплатная: всё,
+/// что не похоже на разметку, отбрасывается первой же строкой.
+fn looks_like_waf(text: &str) -> bool {
+    let t = text.trim_start();
+    if !t.starts_with('<') {
+        return false;
+    }
+    let head: String = t.chars().take(4000).collect();
+    head.contains("WAF_CHECK_RESPONSE_STATUS") || head.contains("Ошибка 429") || head.contains("Error 429")
+}
 
 /// Ответ сервера.
 #[derive(Debug, Clone)]
@@ -399,7 +422,7 @@ impl Http {
         Ok(Resp {
             status,
             ok: (200..300).contains(&status),
-            blocked: status == 418 || status == 429,
+            blocked: status == 418 || status == 429 || looks_like_waf(&text),
             text,
             json,
             url: final_url,
@@ -705,6 +728,35 @@ fn short_err(e: &reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Кусок настоящей страницы, которую mail.ru отдаёт вместо ленты, когда
+    /// закрывает доступ. Статус у неё ДВУХСОТЫЙ — в этом вся беда: пять часов
+    /// подряд бот читал её как «в ленте ничего нет» и ждал новых вопросов,
+    /// которых ему уже не показывали.
+    #[test]
+    fn the_antibot_page_is_recognised_even_with_status_200() {
+        let waf = r#"<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8">
+<title data-lang-key="title">Ошибка 429</title></head>
+<body><h1 data-lang-key="heading">У вас большие запросы!</h1>
+<script>var WAF_CHECK_RESPONSE_STATUS = 429;</script></body></html>"#;
+        assert!(looks_like_waf(waf));
+        assert!(
+            looks_like_waf(&format!(
+                "
+
+  {waf}"
+            )),
+            "отступы в начале не должны мешать"
+        );
+        assert!(looks_like_waf("<html><script>var WAF_CHECK_RESPONSE_STATUS = 429;</script></html>"));
+        assert!(looks_like_waf("<html><title>Error 429</title></html>"));
+
+        // Обычные ответы трогать нельзя.
+        assert!(!looks_like_waf(r#"{"result":{"feed":[{"id":1,"title":"Ошибка 429 в игре"}]}}"#));
+        assert!(!looks_like_waf("<html><body>Обычная страница профиля</body></html>"));
+        assert!(!looks_like_waf(""));
+    }
 
     #[test]
     fn detects_cookie_deletion() {

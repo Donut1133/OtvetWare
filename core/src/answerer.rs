@@ -312,6 +312,12 @@ pub async fn collect_questions(
         // `limit=50` возвращает те же 20. Интерфейс поэтому и не даёт больше.
         .request(acc, &format!("/api/topic/feed?limit={recent}&pos=0&dir=0&sort=id"), ReqOpts::get(), stop)
         .await?;
+    // Антибот отдаёт свою страницу с двухсотым статусом. Без этой проверки
+    // лента просто «пустая», и режим бесконечно ждёт вопросов, которых ему
+    // больше не покажут.
+    if r.blocked {
+        return Err(HttpError::Blocked);
+    }
     let feed =
         r.result().and_then(|res| res.get("feed")).and_then(|f| f.as_array()).cloned().unwrap_or_default();
     let mut out = Vec::new();
@@ -1669,6 +1675,14 @@ async fn answer_feed(
             match collect_questions(ctx.core, ctx.acc, &exclude, &tried, ctx.mine, recent, ctx.stop).await {
                 Ok(q) => q,
                 Err(HttpError::Aborted) => break,
+                Err(HttpError::Blocked) => {
+                    ctx.sh.blocked.store(true, Ordering::SeqCst);
+                    (ctx.log)(
+                        "
+[x] Антибот mail.ru (429) на ленте. Останавливаю аккаунт.",
+                    );
+                    break;
+                }
                 Err(e) => {
                     let wait = rand_f(f_min.max(8.0), f_max.max(8.0));
                     (ctx.log)(&format!(
@@ -1759,13 +1773,34 @@ async fn answer_feed_continuous(ctx: &RunCtx<'_>, recent: i64, batch_per: i64, f
         // Подливаем новые вопросы, пока есть свободные слоты И место под лимитом:
         // брать вопрос, на который уже нельзя ответить, — потраченный запрос.
         let room = ctx.sh.remaining(ctx.p.limit) - tasks.len() as i64;
+        // Почему лента не дала работы — это надо сказать вслух. Раньше ошибка
+        // молча превращалась в пустой список, и с мёртвым прокси режим выглядел
+        // зависшим: ни строчки в логе, ни одного ответа, а бот всё это время
+        // ходил по кругу.
+        let mut feed_err: Option<String> = None;
         if !ctx.done() && tasks.len() < max_active && room > 0 {
-            let fresh = {
+            let got = {
                 let exclude = ctx.sh.exclude.lock().clone();
                 let tried = ctx.sh.tried.lock().clone();
-                collect_questions(ctx.core, ctx.acc, &exclude, &tried, ctx.mine, recent, ctx.stop)
-                    .await
-                    .unwrap_or_default()
+                collect_questions(ctx.core, ctx.acc, &exclude, &tried, ctx.mine, recent, ctx.stop).await
+            };
+            let fresh = match got {
+                Ok(q) => q,
+                Err(HttpError::Aborted) => break,
+                Err(HttpError::Blocked) => {
+                    // Не рвём круг: начатые ответы надо доработать, а новых
+                    // вопросов флаг больше набрать не даст.
+                    ctx.sh.blocked.store(true, Ordering::SeqCst);
+                    (ctx.log)(
+                        "
+[x] Антибот mail.ru (429) на ленте. Останавливаю аккаунт.",
+                    );
+                    Vec::new()
+                }
+                Err(e) => {
+                    feed_err = Some(e.to_string());
+                    Vec::new()
+                }
             };
             let mut room = room;
             for q in fresh {
@@ -1791,11 +1826,31 @@ async fn answer_feed_continuous(ctx: &RunCtx<'_>, recent: i64, batch_per: i64, f
             if ctx.done() {
                 break;
             }
-            let wait = rand_f(f_min.max(0.5), f_max.max(0.5));
+            let wait = match &feed_err {
+                // Сеть подождать надо подольше: долбиться в лежащий прокси
+                // каждые полсекунды бессмысленно.
+                Some(e) => {
+                    let w = rand_f(f_min.max(8.0), f_max.max(8.0));
+                    (ctx.log)(&format!(
+                        "   [!] Сеть/прокси при загрузке ленты ({e}) — повторю через {w:.0} сек."
+                    ));
+                    w
+                }
+                None => {
+                    let w = rand_f(f_min.max(0.5), f_max.max(0.5));
+                    (ctx.log)(&format!(
+                        "   Среди {recent} последних новых нет отвечаемых — обновлю ленту через {w:.1} сек..."
+                    ));
+                    w
+                }
+            };
             if ctx.stop.sleep_ms((wait * 1000.0) as u64).await {
                 break;
             }
         } else {
+            if let Some(e) = &feed_err {
+                (ctx.log)(&format!("   [!] Сеть/прокси при загрузке ленты ({e}) — дорабатываю начатое."));
+            }
             // Ждём завершения одной задачи и сразу подливаем следующую.
             if tasks.next().await.is_none() {
                 break;
