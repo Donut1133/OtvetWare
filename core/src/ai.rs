@@ -15,6 +15,62 @@ use std::time::Duration;
 /// попадают в пост как есть — выглядит неестественно и пахнет ботом.
 pub const NO_MARKDOWN: &str = " НЕ ИСПОЛЬЗУЙ markdown: никаких **жирных**, ## заголовков, `кода`, списков через дефис/номер, таблиц или разметки вообще. Пиши простым текстом, как в мессенджере.";
 
+/// Сколько модели «думать» перед ответом.
+///
+/// Поле называется `reasoning_effort` — это имя из OpenAI, и его же понимают
+/// OpenRouter, Gemini и большинство шлюзов. Провайдеру, который его не знает,
+/// поле лучше не слать вовсе: строгие API отвечают 400 на любой лишний
+/// параметр. Поэтому по умолчанию — `Provider`, то есть не трогать.
+///
+/// Для ответов на otvet.mail.ru размышления обычно вредны: они стоят токенов и
+/// времени, а текст от них становится суше и «правильнее», чем нужно живому
+/// комментарию.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Thinking {
+    /// Поле не отправляем — как настроено у провайдера.
+    #[default]
+    Provider,
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl Thinking {
+    pub const ALL: [Thinking; 6] = [
+        Thinking::Provider,
+        Thinking::Off,
+        Thinking::Minimal,
+        Thinking::Low,
+        Thinking::Medium,
+        Thinking::High,
+    ];
+
+    /// Значение для `reasoning_effort`. `None` — поле не отправлять.
+    pub fn effort(self) -> Option<&'static str> {
+        match self {
+            Thinking::Provider => None,
+            Thinking::Off => Some("none"),
+            Thinking::Minimal => Some("minimal"),
+            Thinking::Low => Some("low"),
+            Thinking::Medium => Some("medium"),
+            Thinking::High => Some("high"),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Thinking::Provider => "как у провайдера",
+            Thinking::Off => "выключить",
+            Thinking::Minimal => "минимум",
+            Thinking::Low => "низкий",
+            Thinking::Medium => "средний",
+            Thinking::High => "высокий",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AiCfg {
     pub url: String,
@@ -26,6 +82,49 @@ pub struct AiCfg {
     pub timeout_sec: u64,
     /// Сколько ПОВТОРНЫХ попыток (всего запросов = retries + 1).
     pub retries: u32,
+    /// Уровень размышлений.
+    #[serde(default)]
+    pub thinking: Thinking,
+    /// Свои поля в теле запроса, JSON-объект строкой.
+    ///
+    /// Провайдеров много, и называют они одно и то же по-разному:
+    /// `enable_thinking`, `reasoning`, `thinking`, `max_completion_tokens`.
+    /// Заводить галку под каждого — гиблое дело, поэтому есть прямой ход к телу
+    /// запроса.
+    #[serde(default)]
+    pub extra_json: String,
+}
+
+/// Свои поля пользователя. `Err` — JSON не разобрался.
+pub fn extra_fields(raw: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(serde_json::Value::Object(m)) => Ok(m),
+        Ok(_) => Err("нужен объект вида {\"поле\": значение}".into()),
+        Err(e) => Err(crate::util::clip(&e.to_string(), 90)),
+    }
+}
+
+/// Дописать в тело запроса уровень размышлений и свои поля.
+///
+/// Свои поля кладутся ПОСЛЕДНИМИ и перекрывают всё остальное: иначе точечную
+/// настройку нельзя было бы довести до конца там, где провайдер ждёт своё имя
+/// параметра вместо `reasoning_effort`, — или где надо переопределить
+/// `max_tokens` на `max_completion_tokens`.
+fn dress_body(cfg: &AiCfg, mut body: serde_json::Value) -> serde_json::Value {
+    let Some(obj) = body.as_object_mut() else { return body };
+    if let Some(effort) = cfg.thinking.effort() {
+        obj.insert("reasoning_effort".into(), json!(effort));
+    }
+    if let Ok(extra) = extra_fields(&cfg.extra_json) {
+        for (k, v) in extra {
+            obj.insert(k, v);
+        }
+    }
+    body
 }
 
 impl AiCfg {
@@ -38,6 +137,8 @@ impl AiCfg {
             max_tokens: 5000,
             timeout_sec: 15,
             retries: 3,
+            thinking: Thinking::default(),
+            extra_json: String::new(),
         }
     }
 }
@@ -136,11 +237,20 @@ impl AiClient {
 
     /// Проверка ключа/модели перед прогоном: понятные сообщения вместо «HTTP 4xx».
     pub async fn check(&self, cfg: &AiCfg, stop: &Stop) -> Result<String, String> {
-        let body = json!({
-            "model": cfg.model,
-            "messages": [{"role": "user", "content": "тест"}],
-            "max_tokens": 5,
-        });
+        if let Err(e) = extra_fields(&cfg.extra_json) {
+            return Err(format!("Свои параметры — не JSON: {e}"));
+        }
+        // Проверяем ровно тем же телом, что уйдёт в работу: иначе «Проверить»
+        // скажет ОК, а на первом же ответе провайдер отвергнет уровень
+        // размышлений или чужое поле.
+        let body = dress_body(
+            cfg,
+            json!({
+                "model": cfg.model,
+                "messages": [{"role": "user", "content": "тест"}],
+                "max_tokens": 5,
+            }),
+        );
         let req = self
             .http
             .post(&cfg.url)
@@ -184,12 +294,15 @@ impl AiClient {
         // Свежая директива на КАЖДЫЙ вызов, в том числе на каждый ретрай.
         let msgs = apply_directives(msgs);
         let msgs: Vec<serde_json::Value> = msgs.iter().map(Msg::to_api).collect();
-        let body = json!({
-            "model": cfg.model,
-            "messages": msgs,
-            "temperature": temperature,
-            "max_tokens": if max_tokens > 0 { max_tokens } else { 2000 },
-        });
+        let body = dress_body(
+            cfg,
+            json!({
+                "model": cfg.model,
+                "messages": msgs,
+                "temperature": temperature,
+                "max_tokens": if max_tokens > 0 { max_tokens } else { 2000 },
+            }),
+        );
         let req = self
             .http
             .post(&cfg.url)
@@ -389,6 +502,45 @@ pub fn apply_directives(msgs: &[Msg]) -> Vec<Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Тело запроса собирается из трёх слоёв, и порядок тут — договор с
+    /// человеком: его собственные поля должны побеждать. Иначе провайдера,
+    /// который зовёт размышления по-своему, не настроить вообще.
+    #[test]
+    fn own_fields_win_over_everything_else() {
+        let base = || json!({ "model": "m", "max_tokens": 100 });
+
+        // По умолчанию поле размышлений не отправляется вовсе: строгий API
+        // отвечает 400 на любой лишний параметр.
+        let plain = AiCfg { thinking: Thinking::Provider, ..AiCfg::preset() };
+        assert!(dress_body(&plain, base()).get("reasoning_effort").is_none());
+
+        let off = AiCfg { thinking: Thinking::Off, ..AiCfg::preset() };
+        assert_eq!(dress_body(&off, base())["reasoning_effort"], json!("none"));
+
+        let high = AiCfg { thinking: Thinking::High, ..AiCfg::preset() };
+        assert_eq!(dress_body(&high, base())["reasoning_effort"], json!("high"));
+
+        // Своё поле перекрывает и наше, и базовое.
+        let custom = AiCfg {
+            thinking: Thinking::High,
+            extra_json: r#"{"reasoning_effort":"low","max_tokens":7,"enable_thinking":false}"#.into(),
+            ..AiCfg::preset()
+        };
+        let b = dress_body(&custom, base());
+        assert_eq!(b["reasoning_effort"], json!("low"));
+        assert_eq!(b["max_tokens"], json!(7));
+        assert_eq!(b["enable_thinking"], json!(false));
+        assert_eq!(b["model"], json!("m"), "остальное тело не трогаем");
+
+        // Сломанный JSON молча игнорируем: запрос уйдёт без него, а человеку
+        // про ошибку скажут форма и «Проверить».
+        let broken = AiCfg { extra_json: "{это не json".into(), ..AiCfg::preset() };
+        assert_eq!(dress_body(&broken, base())["max_tokens"], json!(100));
+        assert!(extra_fields("{это не json").is_err());
+        assert!(extra_fields("[1,2]").is_err(), "нужен объект, а не список");
+        assert!(extra_fields("   ").unwrap().is_empty());
+    }
 
     #[test]
     fn markers_are_replaced_and_vary() {

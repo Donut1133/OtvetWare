@@ -12,7 +12,7 @@ use crate::forms::{
 };
 use crate::theme;
 use egui::Ui;
-use otvet_core::ai::AiCfg;
+use otvet_core::ai::{AiCfg, Thinking};
 use otvet_core::answerer::{AnswerMode, AnswerParams, ImageMode, TargetMode};
 use otvet_core::asker::{AskMode, AskParams};
 use otvet_core::journals::Styles;
@@ -47,6 +47,10 @@ pub struct AiForm {
     pub max_tokens: i64,
     pub timeout_sec: u64,
     pub retries: u32,
+    #[serde(default)]
+    pub thinking: Thinking,
+    #[serde(default)]
+    pub extra_json: String,
     pub style: String,
     pub custom_prompt: String,
     pub use_custom: bool,
@@ -64,6 +68,8 @@ impl Default for AiForm {
             max_tokens: 5000,
             timeout_sec: 15,
             retries: 3,
+            thinking: Thinking::default(),
+            extra_json: String::new(),
             style: "Обычный чел".into(),
             custom_prompt: String::new(),
             use_custom: false,
@@ -82,6 +88,8 @@ impl AiForm {
             max_tokens: self.max_tokens,
             timeout_sec: self.timeout_sec,
             retries: self.retries,
+            thinking: self.thinking,
+            extra_json: self.extra_json.clone(),
         }
     }
 
@@ -159,6 +167,48 @@ impl AiForm {
                 ui.label("повторов при сбое");
                 ui.add(egui::DragValue::new(&mut self.retries).range(0..=10));
             });
+
+            ui.horizontal(|ui| {
+                ui.label("Размышления");
+                egui::ComboBox::from_id_salt("ai_thinking")
+                    .selected_text(self.thinking.label())
+                    .width(170.0)
+                    .show_ui(ui, |ui| {
+                        for t in Thinking::ALL {
+                            if ui.selectable_label(self.thinking == t, t.label()).clicked() {
+                                self.thinking = t;
+                            }
+                        }
+                    });
+            });
+            hint(
+                ui,
+                "Уходит как reasoning_effort — его понимают OpenAI, OpenRouter, Gemini и большинство шлюзов. «Как у провайдера» не отправляет поле вовсе: тем, кто его не знает, лишний параметр возвращается ошибкой 400.",
+            );
+            hint(
+                ui,
+                "Для ответов размышления обычно лишние: стоят токенов и времени, а текст выходит суше и правильнее, чем у живого человека.",
+            );
+            hint(
+                ui,
+                "У DeepSeek это решает модель: deepseek-chat не думает, deepseek-reasoner думает всегда. Провайдер, который поле не понимает, ответит ошибкой — жми «Проверить», она покажет её словами провайдера.",
+            );
+
+            ui.label("Свои параметры запроса (JSON)");
+            crate::forms::boxed_multiline(ui, "ai_extra_json", &mut self.extra_json, 2, "{\"top_p\": 0.9}");
+            match otvet_core::ai::extra_fields(&self.extra_json) {
+                Err(e) => {
+                    ui.colored_label(theme::WARN, format!("не JSON: {e}"));
+                }
+                Ok(m) if !m.is_empty() => {
+                    hint(ui, &format!("уйдёт полей: {}", m.len()));
+                }
+                Ok(_) => {}
+            }
+            hint(
+                ui,
+                "Кладутся прямо в тело запроса и перекрывают всё остальное. Нужны, когда провайдер зовёт то же самое по-своему: enable_thinking, reasoning, thinking, max_completion_tokens.",
+            );
             ui.horizontal(|ui| {
                 ui.label("Упоминание");
                 ui.add(

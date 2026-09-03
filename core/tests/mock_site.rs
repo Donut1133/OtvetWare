@@ -888,6 +888,7 @@ fn ai_cfg(base: &str) -> otvet_core::ai::AiCfg {
         max_tokens: 100,
         timeout_sec: 10,
         retries: 1,
+        ..Default::default()
     }
 }
 
