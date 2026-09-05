@@ -145,7 +145,8 @@ impl AccountsPanel {
                 ui.label(
                     RichText::new(
                         "Нажми «Добавить аккаунт» — откроется браузер.\n\
-                         Заходишь в почту как обычно, окно закроется само, аккаунт появится здесь.",
+                         Заходишь в почту как обычно — аккаунт появится здесь,\n\
+                         а рядом откроются Ответы. Окно закроешь сам.",
                     )
                     .color(theme::FG_DIM),
                 );
@@ -497,7 +498,7 @@ impl AccountsPanel {
                                     *error = "Пустые куки".into();
                                 } else if !otvet_core::accounts::looks_logged_in(&jar) {
                                     *error =
-                                        "В куках нет Mpop/Auth-Token — это гостевая сессия, аккаунт будет разлогинен"
+                                        "В куках нет Auth-Token — это ещё не сессия, аккаунт будет разлогинен"
                                             .into();
                                 } else {
                                     let mut acc = Account::new(name.trim());
@@ -851,8 +852,9 @@ fn spawn_login(bg: &Arc<Bg>, log: Arc<LogBuf>, name: String, proxy: String, exis
                         v.user_id.map(|i| format!(" (id{i})")).unwrap_or_default()
                     ));
                 }
-                // Временный профиль браузера больше не нужен.
-                let _ = std::fs::remove_dir_all(&profile_dir);
+                // Профиль НЕ трогаем: окно после входа остаётся открытым, и
+                // папку держит работающий браузер. Её убирает сам вход, когда
+                // человек закроет окно.
             }
         }
         stop.stop(); // снимаем признак «идёт вход»

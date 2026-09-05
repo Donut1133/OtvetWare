@@ -35,6 +35,8 @@ pub struct Harvest {
 
 /// Страница входа в почту — с неё начинается добыча кук.
 const LOGIN_URL: &str = "https://account.mail.ru/login";
+/// Куда уводит вторая вкладка после входа — туда, где аккаунт и будет работать.
+const SITE_URL: &str = "https://otvet.mail.ru/";
 
 pub fn chrome_path(root: &Path) -> Option<PathBuf> {
     // Явный путь важнее всего: так подключают портативную сборку или браузер,
@@ -761,6 +763,33 @@ async fn close_other_tabs(cdp: &mut Cdp, keep: &str) {
     }
 }
 
+/// Открыть НОВУЮ вкладку под той же персоной и увести её на адрес.
+///
+/// Отпечаток надевается ДО первого документа: инжект работает только на новых
+/// документах, и вкладка, созданная сразу с адресом, его бы не увидела.
+/// Возвращает id вкладки — чтобы [`hold_persona`] не одел её второй раз.
+async fn open_dressed_tab(cdp: &mut Cdp, p: &Persona, url: &str, log: &Log) -> anyhow::Result<String> {
+    let created = cdp.call("Target.createTarget", serde_json::json!({ "url": "about:blank" })).await?;
+    let id = created
+        .get("targetId")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("CDP не создал вкладку"))?;
+    let att =
+        cdp.call("Target.attachToTarget", serde_json::json!({ "targetId": &id, "flatten": true })).await?;
+    let session = att
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("CDP не выдал сессию вкладки"))?;
+    wear_persona(cdp, &session, p, log, false).await?;
+    if let Ok(Some(err)) = cdp.navigate(&session, url).await {
+        log(&format!("[!] Страница не открылась: {err} — похоже на прокси."));
+    }
+    settle_persona(cdp, &session, p, log).await;
+    Ok(id)
+}
+
 /// Держать соединение открытым, пока живёт окно, и одевать новые вкладки.
 ///
 /// `Emulation.*` — это оверрайды ОТЛАДОЧНОЙ СЕССИИ, а не настройки браузера:
@@ -774,7 +803,7 @@ async fn close_other_tabs(cdp: &mut Cdp, keep: &str) {
 /// числом ядер и метаданными UA. Инжект при этом оставался — то есть GPU и
 /// память были поддельными, а часовой пояс настоящим. Такое противоречие
 /// заметнее, чем честное отсутствие подмен.
-async fn hold_persona(mut cdp: Cdp, first: String, p: Persona, log: Log, stop: Stop) {
+async fn hold_persona(mut cdp: Cdp, dressed: Vec<String>, p: Persona, log: Log, stop: Stop) {
     // Новая вкладка открывается без сессии, а значит и без подмен. Ловим её
     // появление и одеваем так же, как первую.
     if cdp.call("Target.setDiscoverTargets", serde_json::json!({ "discover": true })).await.is_err() {
@@ -794,10 +823,10 @@ async fn hold_persona(mut cdp: Cdp, first: String, p: Persona, log: Log, stop: S
         let Some(id) = info.and_then(|i| i.get("targetId")).and_then(|t| t.as_str()).map(String::from) else {
             continue;
         };
-        // Первую вкладку пропускаем: подписка сообщает и про уже существующие,
+        // Уже одетые вкладки пропускаем: подписка сообщает и про существующие,
         // а второй инжект положил бы шум canvas поверх шума — отпечаток
         // перестал бы быть постоянным.
-        if id == first {
+        if dressed.contains(&id) {
             continue;
         }
         let attach =
@@ -968,7 +997,7 @@ pub async fn open_as(
     let log_held = log.clone();
     let held = alive.clone();
     tokio::spawn(async move {
-        hold_persona(cdp, target, persona, log_held, held).await;
+        hold_persona(cdp, vec![target], persona, log_held, held).await;
     });
     // Ждём, пока человек закроет окно, — чтобы прибрать мост, отпустить
     // соединение и не оставлять зомби-процесс.
@@ -995,6 +1024,11 @@ pub async fn login_and_harvest(
             "не найден браузер. Он должен лежать в папке browsers рядом с программой — скачай архив с релиза целиком, там она уже внутри"
         )
     })?;
+    // Профиль входа — одноразовый, и начинать надо с чистого. Остаться он
+    // может, если программу закрыли с открытым окном входа; в нём лежат куки
+    // прошлой сессии, и вход бы «удался» сам собой, не спросив человека, — а
+    // снялись бы старые куки вместо новых.
+    let _ = std::fs::remove_dir_all(profile_dir);
     std::fs::create_dir_all(profile_dir).ok();
     let _ = std::fs::remove_file(devtools_port_file(profile_dir));
 
@@ -1023,7 +1057,10 @@ pub async fn login_and_harvest(
         // Стартуем с пустой вкладки: отпечаток надо надеть ДО первого документа,
         // а страница входа, открытая флагом, начала бы грузиться раньше.
         .arg("about:blank");
-    if let Some(p) = browser_proxy_arg(proxy, stop, log).await {
+    // Мост живёт столько же, сколько окно: `stop` — это кнопка «Отмена», и её
+    // снимают сразу после входа, а окно после этого остаётся открытым.
+    let alive = Stop::new();
+    if let Some(p) = browser_proxy_arg(proxy, &alive, log).await {
         log(&format!("[>] Браузер через прокси: {}", crate::proxy::mask_proxy(&p)));
         cmd.arg(format!("--proxy-server={p}"));
     }
@@ -1037,7 +1074,7 @@ pub async fn login_and_harvest(
     }
     cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
 
-    log("[>] Открываю браузер — войди в аккаунт вручную. Окно закроется само.");
+    log("[>] Открываю браузер — войди в аккаунт вручную. Окно закроешь сам.");
     let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("не запустить браузер: {e}"))?;
 
     let mut cdp = match wait_devtools(profile_dir, &mut child).await {
@@ -1045,11 +1082,13 @@ pub async fn login_and_harvest(
             Ok(c) => c,
             Err(e) => {
                 let _ = child.kill().await;
+                alive.stop();
                 return Err(e);
             }
         },
         Err(e) => {
             let _ = child.kill().await;
+            alive.stop();
             return Err(e);
         }
     };
@@ -1057,29 +1096,40 @@ pub async fn login_and_harvest(
     // Персона на вкладку — и только потом переход на страницу входа. Именно
     // здесь мы и показываемся сайту живым браузером: тридцать входов с одной
     // машины должны выглядеть как тридцать разных машин.
-    match cdp.attach_page().await {
+    // Первой вкладкой — Ответы, второй — страница входа. Порядок именно такой:
+    // вход браузер сам делает активным, а когда человек его закончит, слева уже
+    // лежит то, ради чего аккаунт и заводили.
+    let (site_tab, site_session) = match cdp.attach_page().await {
         Ok((target, session)) => {
             close_other_tabs(&mut cdp, &target).await;
             if let Err(e) = wear_persona(&mut cdp, &session, persona, log, true).await {
                 log(&format!("[!] Отпечаток не встал целиком ({e}) — вход как есть."));
             }
-            match cdp.navigate(&session, LOGIN_URL).await {
-                Err(e) => {
-                    let _ = child.kill().await;
-                    return Err(anyhow::anyhow!("не открылась страница входа: {e}"));
-                }
-                Ok(Some(err)) => log(&format!("[!] Страница входа не открылась: {err} — похоже на прокси.")),
-                Ok(None) => {}
+            if let Ok(Some(err)) = cdp.navigate(&session, SITE_URL).await {
+                log(&format!("[!] Ответы не открылись: {err} — похоже на прокси."));
             }
-            if settle_persona(&mut cdp, &session, persona, log).await == Settled::WindowGone {
-                log("[x] Окно закрыли, не дождавшись страницы входа.");
-            }
+            settle_persona(&mut cdp, &session, persona, log).await;
+            (target, session)
         }
         Err(e) => {
             let _ = child.kill().await;
+            alive.stop();
             return Err(e);
         }
-    }
+    };
+
+    let login_tab = match open_dressed_tab(&mut cdp, persona, LOGIN_URL, log).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            // Без второй вкладки входить негде — уводим туда первую.
+            log(&format!("[!] Не открылась вкладка входа ({e}) — открываю вход в этой же."));
+            if let Ok(Some(err)) = cdp.navigate(&site_session, LOGIN_URL).await {
+                log(&format!("[!] Страница входа не открылась: {err} — похоже на прокси."));
+            }
+            settle_persona(&mut cdp, &site_session, persona, log).await;
+            None
+        }
+    };
 
     // Ждём появления авторизационных кук. Гостевой визит ставит десяток кук,
     // поэтому смотрим именно на Mpop/Auth-Token, а не на их количество.
@@ -1104,6 +1154,17 @@ pub async fn login_and_harvest(
                 let jar = cookies_for_mailru(&list);
                 if looks_logged_in(&jar) {
                     harvested = jar;
+                    // Пара секунд паузы: вход досыпает куки ещё несколько
+                    // мгновений после главной. Снимок ровно в первый миг
+                    // получается беднее того, что видит браузер.
+                    if !stop.sleep_ms(2000).await {
+                        if let Ok(list) = cdp.cookies().await {
+                            let later = cookies_for_mailru(&list);
+                            if looks_logged_in(&later) {
+                                harvested = later;
+                            }
+                        }
+                    }
                     log("[+] Сессия появилась — снимаю куки.");
                     break;
                 }
@@ -1117,11 +1178,49 @@ pub async fn login_and_harvest(
         }
     }
 
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-
     if harvested.is_empty() {
+        // Не вошли — окно закрываем сами: держать пустое незачем.
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        alive.stop();
+        let _ = std::fs::remove_dir_all(profile_dir);
         anyhow::bail!("вход не завершён — куки сессии не появились");
+    }
+
+    // Вошли — окно остаётся человеку, закрыть его он должен сам: сразу после
+    // входа обычно надо доделать что-то руками, а окно, закрывшееся само,
+    // этого не даёт.
+    let mut dressed = vec![site_tab];
+    if let Some(id) = login_tab {
+        dressed.push(id);
+        // Ответы открывались гостем, до входа. Перечитываем их под свежей
+        // сессией, иначе человек смотрит на страницу, где он не залогинен.
+        if let Ok(Some(err)) = cdp.navigate(&site_session, SITE_URL).await {
+            log(&format!("[!] Ответы не перечитались: {err}"));
+        }
+        settle_persona(&mut cdp, &site_session, persona, log).await;
+    }
+    log("[>] Окно оставлено открытым — закрой его сам, когда закончишь.");
+
+    // Соединение НЕ закрываем: вместе с ним пропали бы все `Emulation.*`, и
+    // окно после входа начало бы светить настоящей машиной.
+    {
+        let persona = persona.clone();
+        let log = log.clone();
+        let alive = alive.clone();
+        tokio::spawn(async move {
+            hold_persona(cdp, dressed, persona, log, alive).await;
+        });
+    }
+    // Окно закроют — гасим мост, отпускаем соединение и убираем временный профиль.
+    {
+        let alive = alive.clone();
+        let dir = profile_dir.to_path_buf();
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+            alive.stop();
+            let _ = std::fs::remove_dir_all(dir);
+        });
     }
     Ok(Harvest { cookies: harvested, ua: persona.ua.clone() })
 }
@@ -1261,6 +1360,7 @@ mod tests {
     fn picks_only_mailru_cookies() {
         let list = vec![
             serde_json::json!({ "domain": ".mail.ru", "name": "Mpop", "value": "1" }),
+            serde_json::json!({ "domain": ".mail.ru", "name": "Auth-Token", "value": "9" }),
             serde_json::json!({ "domain": ".google.com", "name": "NID", "value": "2" }),
             serde_json::json!({ "domain": "otvet.mail.ru", "name": "oid", "value": "3" }),
         ];

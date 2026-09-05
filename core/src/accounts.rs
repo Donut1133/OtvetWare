@@ -227,10 +227,19 @@ impl Account {
     }
 }
 
+/// Живая ли это сессия.
+///
+/// Решает ОДНА кука — `Auth-Token`: именно её проверяет API. Раньше хватало
+/// `Mpop`, и это ломало вход: в потоке VK ID `Mpop` появляется РАНЬШЕ, бот
+/// хватал куки на этом месте и объявлял вход удавшимся, пока человек ещё
+/// дописывал пароль. В базе оседала половина сессии, а аккаунт потом на каждой
+/// проверке отвечал 403 «не авторизован» — при том что в браузере он был
+/// залогинен. Проверено по своим аккаунтам: у всех без `Auth-Token` ровно
+/// такой 403, у всех с ней — рабочая сессия.
 pub fn looks_logged_in(cookie_header: &str) -> bool {
     cookie_header.split(';').any(|part| {
         let name = part.trim().split('=').next().unwrap_or("").trim();
-        name.eq_ignore_ascii_case("Mpop") || name.eq_ignore_ascii_case("Auth-Token")
+        name.eq_ignore_ascii_case("Auth-Token")
     })
 }
 
@@ -568,7 +577,10 @@ mod tests {
         let jar = parse_cookie_jar(" a=1; b = 2 ;;c=3 ");
         assert_eq!(jar.len(), 3);
         assert_eq!(jar_to_string(&jar), "a=1; b=2; c=3");
-        assert!(looks_logged_in("foo=1; Mpop=abc"));
+        assert!(looks_logged_in("foo=1; Auth-Token=abc"));
+        assert!(looks_logged_in("auth-token=abc"), "регистр имени не важен");
+        // Половина сессии: `Mpop` без `Auth-Token` API не принимает — 403.
+        assert!(!looks_logged_in("foo=1; Mpop=abc"));
         assert!(!looks_logged_in("foo=1; _ga=2"));
         let from_json = normalize_cookies_input(r#"[{"name":"a","value":"1"},{"name":"b","value":"2"}]"#);
         assert_eq!(from_json, "a=1; b=2");
