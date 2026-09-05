@@ -486,13 +486,24 @@ impl Cdp {
     /// Подключиться к первой вкладке-странице. Возвращает `sessionId`, которым
     /// дальше адресуются команды страницы.
     async fn attach_page(&mut self) -> anyhow::Result<(String, String)> {
-        let list = self.call("Target.getTargets", serde_json::json!({})).await?;
-        let target = list
-            .get("targetInfos")
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.iter().find(|t| t.get("type").and_then(|v| v.as_str()) == Some("page")))
-            .and_then(|t| t.get("targetId").and_then(|v| v.as_str()).map(String::from))
-            .ok_or_else(|| anyhow::anyhow!("браузер не открыл ни одной вкладки"))?;
+        // Вкладку ждём, а не спрашиваем один раз: отладочный порт браузер
+        // публикует РАНЬШЕ, чем создаёт первую вкладку, и на быстрой машине
+        // первый же вопрос попадает в эту щель — «браузер не открыл ни одной
+        // вкладки» на ровном месте.
+        let mut target = None;
+        for _ in 0..40 {
+            let list = self.call("Target.getTargets", serde_json::json!({})).await?;
+            target = list
+                .get("targetInfos")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.iter().find(|t| t.get("type").and_then(|v| v.as_str()) == Some("page")))
+                .and_then(|t| t.get("targetId").and_then(|v| v.as_str()).map(String::from));
+            if target.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let target = target.ok_or_else(|| anyhow::anyhow!("браузер не открыл ни одной вкладки"))?;
         // flatten — сессия поверх того же сокета, отдельное соединение не нужно.
         let r = self
             .call("Target.attachToTarget", serde_json::json!({ "targetId": &target, "flatten": true }))
@@ -1074,7 +1085,7 @@ pub async fn login_and_harvest(
     }
     cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
 
-    log("[>] Открываю браузер — войди в аккаунт вручную. Окно закроешь сам.");
+    log("[>] Открываю браузер — войди в аккаунт вручную. Куки снимутся, когда закроешь окно.");
     let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("не запустить браузер: {e}"))?;
 
     let mut cdp = match wait_devtools(profile_dir, &mut child).await {
@@ -1131,22 +1142,28 @@ pub async fn login_and_harvest(
         }
     };
 
-    // Ждём появления авторизационных кук. Гостевой визит ставит десяток кук,
-    // поэтому смотрим именно на Mpop/Auth-Token, а не на их количество.
+    // Куки снимаются НЕ в момент входа, а те, что есть на момент закрытия окна.
+    //
+    // После входа человек обычно ещё что-то доделывает руками, и снимок «в
+    // первую же секунду» этого не застаёт. Но и прочитать куки из закрытого
+    // браузера нельзя — вместе с окном умирает отладчик. Поэтому держим свежий
+    // снимок: каждый круг перечитываем, а в дело идёт последний.
     let mut harvested = String::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(15 * 60);
+    let mut announced = false;
+    let mut keep_open = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60 * 60);
     loop {
         if stop.is_stopped() {
             log("[x] Вход отменён.");
             break;
         }
         if std::time::Instant::now() > deadline {
-            log("[!] 15 минут прошло — закрываю окно входа.");
+            log("[!] Час прошёл — перестаю ждать. Окно оставляю открытым.");
+            keep_open = true;
             break;
         }
-        // Пользователь закрыл окно сам — выходим с тем, что успели снять.
         if matches!(child.try_wait(), Ok(Some(_))) {
-            log("[>] Окно браузера закрыто.");
+            log("[>] Окно закрыто — снимаю куки.");
             break;
         }
         match cdp.cookies().await {
@@ -1154,19 +1171,19 @@ pub async fn login_and_harvest(
                 let jar = cookies_for_mailru(&list);
                 if looks_logged_in(&jar) {
                     harvested = jar;
-                    // Пара секунд паузы: вход досыпает куки ещё несколько
-                    // мгновений после главной. Снимок ровно в первый миг
-                    // получается беднее того, что видит браузер.
-                    if !stop.sleep_ms(2000).await {
-                        if let Ok(list) = cdp.cookies().await {
-                            let later = cookies_for_mailru(&list);
-                            if looks_logged_in(&later) {
-                                harvested = later;
+                    if !announced {
+                        announced = true;
+                        log("[+] Сессия есть. Доделывай что нужно — куки снимутся, когда закроешь окно.");
+                        // Ответы открывались гостем, до входа. Перечитываем их
+                        // под свежей сессией, иначе человек смотрит на страницу,
+                        // где он не залогинен.
+                        if login_tab.is_some() {
+                            if let Ok(Some(err)) = cdp.navigate(&site_session, SITE_URL).await {
+                                log(&format!("[!] Ответы не перечитались: {err}"));
                             }
+                            settle_persona(&mut cdp, &site_session, persona, log).await;
                         }
                     }
-                    log("[+] Сессия появилась — снимаю куки.");
-                    break;
                 }
             }
             Err(_) => {
@@ -1178,42 +1195,39 @@ pub async fn login_and_harvest(
         }
     }
 
-    if harvested.is_empty() {
-        // Не вошли — окно закрываем сами: держать пустое незачем.
+    // Отмена и «не вошли» окно закрывают: держать его незачем. По закрытию
+    // закрывать уже нечего, а после часа ожидания окно остаётся человеку.
+    if !keep_open {
         let _ = child.kill().await;
         let _ = child.wait().await;
+    }
+
+    if harvested.is_empty() {
         alive.stop();
         let _ = std::fs::remove_dir_all(profile_dir);
         anyhow::bail!("вход не завершён — куки сессии не появились");
     }
 
-    // Вошли — окно остаётся человеку, закрыть его он должен сам: сразу после
-    // входа обычно надо доделать что-то руками, а окно, закрывшееся само,
-    // этого не даёт.
-    let mut dressed = vec![site_tab];
-    if let Some(id) = login_tab {
-        dressed.push(id);
-        // Ответы открывались гостем, до входа. Перечитываем их под свежей
-        // сессией, иначе человек смотрит на страницу, где он не залогинен.
-        if let Ok(Some(err)) = cdp.navigate(&site_session, SITE_URL).await {
-            log(&format!("[!] Ответы не перечитались: {err}"));
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        // Окна уже нет — прибираем сразу.
+        alive.stop();
+        let _ = std::fs::remove_dir_all(profile_dir);
+    } else {
+        // Окно живо. Соединение НЕ закрываем: вместе с ним пропали бы все
+        // `Emulation.*`, и окно начало бы светить настоящей машиной.
+        let mut dressed = vec![site_tab];
+        if let Some(id) = login_tab {
+            dressed.push(id);
         }
-        settle_persona(&mut cdp, &site_session, persona, log).await;
-    }
-    log("[>] Окно оставлено открытым — закрой его сам, когда закончишь.");
-
-    // Соединение НЕ закрываем: вместе с ним пропали бы все `Emulation.*`, и
-    // окно после входа начало бы светить настоящей машиной.
-    {
-        let persona = persona.clone();
-        let log = log.clone();
-        let alive = alive.clone();
-        tokio::spawn(async move {
-            hold_persona(cdp, dressed, persona, log, alive).await;
-        });
-    }
-    // Окно закроют — гасим мост, отпускаем соединение и убираем временный профиль.
-    {
+        {
+            let persona = persona.clone();
+            let log = log.clone();
+            let alive = alive.clone();
+            tokio::spawn(async move {
+                hold_persona(cdp, dressed, persona, log, alive).await;
+            });
+        }
+        // Окно закроют — гасим мост и убираем временный профиль.
         let alive = alive.clone();
         let dir = profile_dir.to_path_buf();
         tokio::spawn(async move {
