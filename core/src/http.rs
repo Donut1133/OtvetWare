@@ -142,6 +142,9 @@ pub struct ReqOpts {
     pub timeout_ms: u64,
     /// Ретраить GET на 429/5xx и один сетевой сбой.
     pub retry: bool,
+    /// Обновлять протухшую сессию перед запросом. Снимается только у самого
+    /// запроса-обновления, иначе он вызвал бы сам себя.
+    pub refresh: bool,
 }
 
 impl Default for ReqOpts {
@@ -154,6 +157,7 @@ impl Default for ReqOpts {
             referer: None,
             timeout_ms: 30_000,
             retry: true,
+            refresh: true,
         }
     }
 }
@@ -185,6 +189,10 @@ impl ReqOpts {
     }
     pub fn no_retry(mut self) -> Self {
         self.retry = false;
+        self
+    }
+    pub fn no_refresh(mut self) -> Self {
+        self.refresh = false;
         self
     }
     pub fn html(self) -> Self {
@@ -315,6 +323,9 @@ impl Http {
         if stop.hold().await {
             return Err(HttpError::Aborted);
         }
+        if opts.refresh {
+            self.ensure_session(acc, stop).await;
+        }
         let url = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
             path_or_url.to_string()
         } else {
@@ -427,6 +438,33 @@ impl Http {
             json,
             url: final_url,
         })
+    }
+
+    /// Освежить сессию, если её токен вот-вот истечёт.
+    ///
+    /// mail.ru выдаёт `Auth-SessionToken` всего на десять минут, а рядом кладёт
+    /// `Auth-RefreshToken` на три месяца. Браузер меняет один на другой молча, и
+    /// обычная загрузка главной делает ровно это: приходит `Set-Cookie` с новой
+    /// парой. Нам остаётся сходить туда же — тогда прогон живёт дольше десяти
+    /// минут, а аккаунт не выглядит «разлогиненным» на одиннадцатой.
+    async fn ensure_session(&self, acc: &Account, stop: &Stop) {
+        let stale =
+            |acc: &Account| acc.cookie_header().map(|c| crate::accounts::session_stale(&c)).unwrap_or(false);
+        if !stale(acc) {
+            return;
+        }
+        // Аккаунт работает из нескольких задач сразу: обновляет один, ждут все.
+        let _guard = acc.rt.refreshing.lock().await;
+        if !stale(acc) {
+            return;
+        }
+        let _ = Box::pin(self.request(
+            acc,
+            "/",
+            ReqOpts::get().html().no_retry().no_refresh().timeout_ms(20_000),
+            stop,
+        ))
+        .await;
     }
 
     fn build_headers(&self, acc: &Account, persona: &Persona, opts: &ReqOpts) -> HeaderMap {

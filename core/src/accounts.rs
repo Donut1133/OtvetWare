@@ -46,6 +46,9 @@ pub struct AccountRt {
     pub persona: Mutex<Option<crate::persona::Persona>>,
     /// Куда писать сообщения о ротации прокси (лог конкретного аккаунта).
     pub rotate_log: Mutex<Option<crate::util::Log>>,
+    /// Замок на обновление сессии: аккаунт работает из нескольких задач сразу,
+    /// и без него все они кинулись бы обновлять один и тот же токен.
+    pub refreshing: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for AccountRt {
@@ -239,6 +242,39 @@ impl Account {
 /// дописывал пароль, и в базу ложилась половина сессии. Осенью 2026 mail.ru
 /// перешёл на новую пару токенов, и все аккаунты, заведённые раньше, разом
 /// стали «не авторизован» — при том что в браузере они живые.
+/// Когда истекает `Auth-SessionToken`, в секундах эпохи.
+///
+/// Токен — обычный JWT, и срок жизни у него **десять минут**: подпись нам
+/// проверять незачем, а вот дату надо знать заранее. Иначе каждый запрос после
+/// десятой минуты прогона получал бы 403 и выглядел как «аккаунт разлогинен».
+pub fn session_expiry(cookie_header: &str) -> Option<i64> {
+    let value = cookie_header.split(';').map(str::trim).find_map(|p| {
+        let (n, v) = p.split_once('=')?;
+        n.trim().eq_ignore_ascii_case("Auth-SessionToken").then_some(v)
+    })?;
+    let payload = value.split('.').nth(1)?;
+    let padded = format!("{payload}{}", "=".repeat((4 - payload.len() % 4) % 4));
+    let raw = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE.decode(padded).ok()?
+    };
+    serde_json::from_slice::<serde_json::Value>(&raw).ok()?.get("exp")?.as_i64()
+}
+
+/// Пора ли обновлять сессию. Запас в полминуты — чтобы токен не протух между
+/// проверкой и самим запросом.
+pub fn session_stale(cookie_header: &str) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match session_expiry(cookie_header) {
+        Some(exp) => exp - now < 30,
+        // Токена нет вовсе — обновлять нечего, это разлогин.
+        None => false,
+    }
+}
+
 pub fn looks_logged_in(cookie_header: &str) -> bool {
     cookie_header.split(';').any(|part| {
         let name = part.trim().split('=').next().unwrap_or("").trim();
@@ -573,6 +609,32 @@ mod tests {
         let back = serde_json::to_string(&list).unwrap();
         assert!(back.contains("_persona"));
         assert!(back.contains("profileDir"));
+    }
+
+    /// Срок жизни токена надо знать ЗАРАНЕЕ: он всего десять минут, и без
+    /// упреждающего обновления каждый запрос после десятой минуты прогона
+    /// возвращал бы 403 — ровно то, что выглядит как «аккаунт разлогинен».
+    #[test]
+    fn session_expiry_is_read_from_the_token() {
+        use base64::Engine;
+        let jwt = |exp: i64| {
+            let body =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"id":1,"exp":{exp}}}"#));
+            format!("Mpop=x; Auth-SessionToken=header.{body}.signature; b=2")
+        };
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        assert_eq!(session_expiry(&jwt(1788993150)), Some(1788993150));
+        assert!(!session_stale(&jwt(now + 600)), "свежий токен обновлять незачем");
+        assert!(session_stale(&jwt(now - 1)), "истёкший — обновить");
+        assert!(session_stale(&jwt(now + 5)), "почти истёкший — тоже, иначе протухнет в полёте");
+
+        // Не токен и не JWT — обновлять нечего, это разлогин, а не протухание.
+        assert_eq!(session_expiry("Mpop=x; b=2"), None);
+        assert!(!session_stale("Mpop=x; b=2"));
+        assert_eq!(session_expiry("Auth-SessionToken=мусор"), None);
+        assert_eq!(session_expiry("Auth-SessionToken=a.не-base64.c"), None);
     }
 
     #[test]
