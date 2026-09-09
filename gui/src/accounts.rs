@@ -498,7 +498,7 @@ impl AccountsPanel {
                                     *error = "Пустые куки".into();
                                 } else if !otvet_core::accounts::looks_logged_in(&jar) {
                                     *error =
-                                        "В куках нет Auth-Token — это ещё не сессия, аккаунт будет разлогинен"
+                                        "В куках нет Auth-SessionToken — это ещё не сессия, аккаунт будет разлогинен"
                                             .into();
                                 } else {
                                     let mut acc = Account::new(name.trim());

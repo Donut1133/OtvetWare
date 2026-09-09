@@ -873,6 +873,41 @@ fn cookies_for_mailru(list: &[Value]) -> String {
     jar_to_string(&jar)
 }
 
+/// Команда запуска браузера: одинаковая для входа, ручного окна и обновления
+/// сессии. Флаги тут не косметика, каждый закрывает свою дыру, поэтому и
+/// собраны в одном месте — чтобы три пути не разъехались.
+fn browser_cmd(chrome: &Path, profile_dir: &Path, p: &Persona) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(chrome);
+    cmd.arg(format!("--user-data-dir={}", profile_dir.display()))
+        // 0 = порт выбирает браузер и пишет его в свой профиль, см. wait_devtools.
+        .arg("--remote-debugging-port=0")
+        .arg("--remote-allow-origins=*")
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        // Прошлый раз окно могли закрыть жёстко — тогда браузер предлагает
+        // «восстановить страницы». Нам восстанавливать нечего: вкладку мы
+        // открываем свою.
+        .arg("--hide-crash-restore-bubble")
+        .arg("--disable-blink-features=AutomationControlled")
+        // WebRTC умеет ходить по UDP мимо HTTP-прокси и через STUN отдать
+        // настоящий IP. Для аккаунта на прокси это мгновенный деанон.
+        .arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+        // UA ставим ещё и флагом: первый сетевой запрос успевает уйти раньше,
+        // чем применится подмена по CDP, и на нём светился бы настоящий.
+        .arg(format!("--user-agent={}", p.ua))
+        .arg(format!("--lang={}", p.locale))
+        .arg(format!("--accept-lang={}", p.accept_language))
+        .arg(format!("--window-size={},{}", p.window.width, p.window.height))
+        .arg("about:blank");
+    // DPR флагом = настоящий DPR. Подменять его из JS нельзя: разойдутся
+    // window.devicePixelRatio и matchMedia('(resolution: Ndppx)') — дешёвая проверка.
+    if (p.dpr - 1.0).abs() > f64::EPSILON {
+        cmd.arg(format!("--force-device-scale-factor={}", p.dpr));
+    }
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    cmd
+}
+
 /// Открыть браузер ПОД аккаунтом: те же куки, тот же отпечаток, тот же прокси.
 ///
 /// Нужен для ручной работы — посмотреть, что видит аккаунт, разобрать капчу,
@@ -904,38 +939,11 @@ pub async fn open_as(
     // Своя «жизнь» моста и наблюдателя за окном.
     let alive = Stop::new();
 
-    let mut cmd = tokio::process::Command::new(&chrome);
-    cmd.arg(format!("--user-data-dir={}", profile_dir.display()))
-        // 0 = порт выбирает браузер и пишет его в свой профиль, см. wait_devtools.
-        .arg("--remote-debugging-port=0")
-        .arg("--remote-allow-origins=*")
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        // Прошлый раз окно могли закрыть жёстко — тогда браузер предлагает
-        // «восстановить страницы». Нам восстанавливать нечего: вкладку мы
-        // открываем свою.
-        .arg("--hide-crash-restore-bubble")
-        .arg("--disable-blink-features=AutomationControlled")
-        // WebRTC умеет ходить по UDP мимо HTTP-прокси и через STUN отдать
-        // настоящий IP. Для аккаунта на прокси это мгновенный деанон.
-        .arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
-        // UA ставим ещё и флагом: первый сетевой запрос успевает уйти раньше,
-        // чем применится подмена по CDP, и на нём светился бы настоящий.
-        .arg(format!("--user-agent={}", persona.ua))
-        .arg(format!("--lang={}", persona.locale))
-        .arg(format!("--accept-lang={}", persona.accept_language))
-        .arg(format!("--window-size={},{}", persona.window.width, persona.window.height))
-        .arg("about:blank");
+    let mut cmd = browser_cmd(&chrome, profile_dir, persona);
     if let Some(p) = browser_proxy_arg(proxy, &alive, log).await {
         log(&format!("[>] Браузер через прокси: {}", crate::proxy::mask_proxy(&p)));
         cmd.arg(format!("--proxy-server={p}"));
     }
-    // DPR флагом = настоящий DPR. Подменять его из JS нельзя: разойдутся
-    // window.devicePixelRatio и matchMedia('(resolution: Ndppx)') — дешёвая проверка.
-    if (persona.dpr - 1.0).abs() > f64::EPSILON {
-        cmd.arg(format!("--force-device-scale-factor={}", persona.dpr));
-    }
-    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("не запустить браузер: {e}"))?;
 
     let mut cdp = match wait_devtools(profile_dir, &mut child).await {
@@ -1043,31 +1051,7 @@ pub async fn login_and_harvest(
     std::fs::create_dir_all(profile_dir).ok();
     let _ = std::fs::remove_file(devtools_port_file(profile_dir));
 
-    let mut cmd = tokio::process::Command::new(&chrome);
-    cmd.arg(format!("--user-data-dir={}", profile_dir.display()))
-        // 0 = порт выбирает браузер и пишет его в свой профиль, см. wait_devtools.
-        .arg("--remote-debugging-port=0")
-        .arg("--remote-allow-origins=*")
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        // Прошлый раз окно могли закрыть жёстко — тогда браузер предлагает
-        // «восстановить страницы». Нам восстанавливать нечего: вкладку мы
-        // открываем свою.
-        .arg("--hide-crash-restore-bubble")
-        .arg("--disable-blink-features=AutomationControlled")
-        // WebRTC умеет ходить по UDP мимо HTTP-прокси и через STUN отдать
-        // настоящий IP. Для аккаунта на прокси это мгновенный деанон.
-        .arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
-        // UA ставим ещё и флагом: первый сетевой запрос успевает уйти раньше,
-        // чем применится подмена по CDP, и на нём светился бы настоящий.
-        .arg(format!("--user-agent={}", persona.ua))
-        .arg(format!("--lang={}", persona.locale))
-        .arg(format!("--accept-lang={}", persona.accept_language))
-        .arg(format!("--window-size={},{}", persona.window.width, persona.window.height))
-        .arg(format!("--window-position={},{}", persona.window.left, persona.window.top))
-        // Стартуем с пустой вкладки: отпечаток надо надеть ДО первого документа,
-        // а страница входа, открытая флагом, начала бы грузиться раньше.
-        .arg("about:blank");
+    let mut cmd = browser_cmd(&chrome, profile_dir, persona);
     // Мост живёт столько же, сколько окно: `stop` — это кнопка «Отмена», и её
     // снимают сразу после входа, а окно после этого остаётся открытым.
     let alive = Stop::new();
@@ -1075,15 +1059,6 @@ pub async fn login_and_harvest(
         log(&format!("[>] Браузер через прокси: {}", crate::proxy::mask_proxy(&p)));
         cmd.arg(format!("--proxy-server={p}"));
     }
-
-    // Chromium щедро сыплет в stderr предупреждениями про песочницу и GCM.
-    // Пользователю это не нужно, а в GUI консоли и нет — глушим.
-    // DPR флагом = настоящий DPR. Подменять его из JS нельзя: разойдутся
-    // window.devicePixelRatio и matchMedia('(resolution: Ndppx)') — дешёвая проверка.
-    if (persona.dpr - 1.0).abs() > f64::EPSILON {
-        cmd.arg(format!("--force-device-scale-factor={}", persona.dpr));
-    }
-    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
 
     log("[>] Открываю браузер — войди в аккаунт вручную. Куки снимутся, когда закроешь окно.");
     let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("не запустить браузер: {e}"))?;
@@ -1374,7 +1349,7 @@ mod tests {
     fn picks_only_mailru_cookies() {
         let list = vec![
             serde_json::json!({ "domain": ".mail.ru", "name": "Mpop", "value": "1" }),
-            serde_json::json!({ "domain": ".mail.ru", "name": "Auth-Token", "value": "9" }),
+            serde_json::json!({ "domain": ".mail.ru", "name": "Auth-SessionToken", "value": "9" }),
             serde_json::json!({ "domain": ".google.com", "name": "NID", "value": "2" }),
             serde_json::json!({ "domain": "otvet.mail.ru", "name": "oid", "value": "3" }),
         ];
