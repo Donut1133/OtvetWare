@@ -232,7 +232,12 @@ impl Account {
 
 /// Живая ли это сессия.
 ///
-/// Решает ОДНА кука — `Auth-SessionToken`. Проверено перебором на живом
+/// Годится любой из двух токенов: короткий `Auth-SessionToken` работает сам, а
+/// длинный `Auth-RefreshToken` позволяет получить короткий. Требовать первый
+/// нельзя: он живёт десять минут, и в наборе, снятом чуть позже, его может уже
+/// не быть — браузер выбрасывает протухшие куки.
+///
+/// Исторически решала ОДНА кука — `Auth-SessionToken`. Проверено перебором на живом
 /// аккаунте: с ней одной `/api/auth/user` отвечает 200, без неё — 403, сколько
 /// бы ни было остальных. `Mpop`, `Auth-Token` и `Auth-RefreshToken` на ответ не
 /// влияют вовсе.
@@ -263,23 +268,33 @@ pub fn session_expiry(cookie_header: &str) -> Option<i64> {
 
 /// Пора ли обновлять сессию. Запас в полминуты — чтобы токен не протух между
 /// проверкой и самим запросом.
+///
+/// Отсутствие короткого токена — тоже повод: браузер выбрасывает протухшую куку
+/// совсем, и в снятом наборе её может не быть вовсе. Пока есть чем обновляться,
+/// это не разлогин, а просто просроченная сессия.
 pub fn session_stale(cookie_header: &str) -> bool {
+    if !has_cookie(cookie_header, "Auth-RefreshToken") {
+        // Обновляться нечем: либо сессия совсем старая, либо её и не было.
+        return false;
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     match session_expiry(cookie_header) {
         Some(exp) => exp - now < 30,
-        // Токена нет вовсе — обновлять нечего, это разлогин.
-        None => false,
+        None => true,
     }
 }
 
+fn has_cookie(cookie_header: &str, name: &str) -> bool {
+    cookie_header
+        .split(';')
+        .any(|p| p.trim().split('=').next().unwrap_or("").trim().eq_ignore_ascii_case(name))
+}
+
 pub fn looks_logged_in(cookie_header: &str) -> bool {
-    cookie_header.split(';').any(|part| {
-        let name = part.trim().split('=').next().unwrap_or("").trim();
-        name.eq_ignore_ascii_case("Auth-SessionToken")
-    })
+    has_cookie(cookie_header, "Auth-SessionToken") || has_cookie(cookie_header, "Auth-RefreshToken")
 }
 
 // ─── Разбор строки кук ──────────────────────────────────────────────────────
@@ -620,7 +635,7 @@ mod tests {
         let jwt = |exp: i64| {
             let body =
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"id":1,"exp":{exp}}}"#));
-            format!("Mpop=x; Auth-SessionToken=header.{body}.signature; b=2")
+            format!("Mpop=x; Auth-RefreshToken=r; Auth-SessionToken=header.{body}.signature; b=2")
         };
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
@@ -630,9 +645,14 @@ mod tests {
         assert!(session_stale(&jwt(now - 1)), "истёкший — обновить");
         assert!(session_stale(&jwt(now + 5)), "почти истёкший — тоже, иначе протухнет в полёте");
 
-        // Не токен и не JWT — обновлять нечего, это разлогин, а не протухание.
-        assert_eq!(session_expiry("Mpop=x; b=2"), None);
+        // Короткого токена нет вовсе — браузер выбросил протухшую куку. Пока
+        // есть чем обновляться, это не разлогин: обновляем.
+        assert!(session_stale("Mpop=x; Auth-RefreshToken=r"));
+        // А обновляться нечем — тогда и пытаться незачем.
         assert!(!session_stale("Mpop=x; b=2"));
+        assert!(!session_stale(&jwt(now - 1).replace("Auth-RefreshToken=r; ", "")));
+
+        assert_eq!(session_expiry("Mpop=x; b=2"), None);
         assert_eq!(session_expiry("Auth-SessionToken=мусор"), None);
         assert_eq!(session_expiry("Auth-SessionToken=a.не-base64.c"), None);
     }
@@ -644,8 +664,10 @@ mod tests {
         assert_eq!(jar_to_string(&jar), "a=1; b=2; c=3");
         assert!(looks_logged_in("foo=1; Auth-SessionToken=abc"));
         assert!(looks_logged_in("auth-sessiontoken=abc"), "регистр имени не важен");
-        // Старая пара без новой — ровно то, что сайт отдаёт 403.
-        assert!(!looks_logged_in("Mpop=x; Auth-Token=y; Auth-RefreshToken=z"));
+        // Одного длинного тоже достаточно: коротким он разменивается сам.
+        assert!(looks_logged_in("Mpop=x; Auth-RefreshToken=z"));
+        // А старая пара без новых — ровно то, на что сайт отвечает 403.
+        assert!(!looks_logged_in("Mpop=x; Auth-Token=y"));
         assert!(!looks_logged_in("foo=1; _ga=2"));
         let from_json = normalize_cookies_input(r#"[{"name":"a","value":"1"},{"name":"b","value":"2"}]"#);
         assert_eq!(from_json, "a=1; b=2");

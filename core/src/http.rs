@@ -428,16 +428,15 @@ impl Http {
         };
 
         let (status, final_url, set_cookies, text) = out;
-        self.merge_set_cookie(acc, &set_cookies);
+        let blocked = status == 418 || status == 429 || looks_like_waf(&text);
+        // Куки из страницы антибота не применяем. Она приходит вместо ответа
+        // API и может нести `Set-Cookie`, стирающий токены, — у живого аккаунта
+        // так уносило сессию целиком, и в базе оставался огрызок из `Mpop`.
+        if !blocked {
+            self.merge_set_cookie(acc, &set_cookies);
+        }
         let json = if text.is_empty() { None } else { serde_json::from_str::<Value>(&text).ok() };
-        Ok(Resp {
-            status,
-            ok: (200..300).contains(&status),
-            blocked: status == 418 || status == 429 || looks_like_waf(&text),
-            text,
-            json,
-            url: final_url,
-        })
+        Ok(Resp { status, ok: (200..300).contains(&status), blocked, text, json, url: final_url })
     }
 
     /// Освежить сессию, если её токен вот-вот истечёт.
@@ -584,6 +583,10 @@ impl Http {
         path: &std::path::Path,
         stop: &Stop,
     ) -> Result<UploadedPicture, String> {
+        // Заливка идёт мимо общего `request`, а значит и мимо продления сессии.
+        // Без этой строки картинка не уходит: токен живёт десять минут, и на
+        // момент заливки сохранённый почти всегда уже протух.
+        self.ensure_session(acc, stop).await;
         let bytes = std::fs::read(path).map_err(|e| format!("не прочитать файл: {e}"))?;
         let filename =
             path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "image.jpg".into());
@@ -622,7 +625,8 @@ impl Http {
                 Err(_) => return Err("таймаут заливки".into()),
             },
         };
-        if status == 418 || status == 429 {
+        // Антибот приходит и сюда, причём двухсотым статусом и страницей.
+        if status == 418 || status == 429 || looks_like_waf(&text) {
             return Err("blocked".into());
         }
         let json: Option<Value> = serde_json::from_str(&text).ok();
