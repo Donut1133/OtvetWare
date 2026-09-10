@@ -187,7 +187,11 @@ pub async fn validate_account(core: &Core, acc: &Account, stop: &Stop) -> Valida
         Ok(p) => {
             out.blocked = p.blocked;
             out.auth_bad = auth_failed(&p);
-            out.alive = p.ok;
+            // Антибот отдаёт свою страницу ДВУХСОТЫМ статусом, и по одному
+            // `ok` аккаунт выглядел бы живым — при том что до API запрос не
+            // дошёл вовсе. Тут узнать про аккаунт нечего, и красить его нельзя
+            // ни в какую сторону.
+            out.alive = p.ok && !p.blocked;
             if let Some(j) = p.json.as_ref().filter(|_| p.ok) {
                 // `user_status`: 0 — обычный аккаунт, отрицательное — бан.
                 // Поле приходит в том же ответе, так что проверка бана не стоит
@@ -534,6 +538,24 @@ mod tests {
             json: serde_json::from_str(body).ok(),
             url: "https://otvet.mail.ru/api/auth/user".into(),
         }
+    }
+
+    /// Страница антибота приходит со статусом 200, и без отдельной проверки
+    /// аккаунт после неё числился бы живым — на пустом месте, потому что до
+    /// API запрос не дошёл.
+    #[test]
+    fn the_antibot_page_does_not_count_as_alive() {
+        let waf = Resp {
+            status: 200,
+            ok: true,
+            blocked: true,
+            text: "<html><title>Ошибка 429</title></html>".into(),
+            json: None,
+            url: "https://otvet.mail.ru/api/auth/user".into(),
+        };
+        assert!(!auth_failed(&waf), "антибот — не разлогин");
+        let alive = waf.ok && !waf.blocked;
+        assert!(!alive, "и не признак живого аккаунта");
     }
 
     /// Тела сняты с живого сайта: так отвечает otvet.mail.ru аккаунту, у

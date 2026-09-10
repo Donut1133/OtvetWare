@@ -843,7 +843,17 @@ fn spawn_login(bg: &Arc<Bg>, log: Arc<LogBuf>, name: String, proxy: String, exis
                 };
                 log.push(&format!("Куки сняты ({} шт.)", h.cookies.split(';').count()));
                 // Сразу выясняем, кто вошёл: userId нужен для публикации вопросов.
-                let v = api::validate_account(&core, &acc, &Stop::new()).await;
+                //
+                // Со второй попытки, если первая сказала «не авторизован»:
+                // свежий токен доходит до API не мгновенно, и проверка в ту же
+                // секунду, что и снятие кук, ловит 403 на живой сессии. Через
+                // пару секунд тот же запрос отвечает 200 — наблюдалось живьём.
+                let stop = Stop::new();
+                let mut v = api::validate_account(&core, &acc, &stop).await;
+                if v.auth_bad {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    v = api::validate_account(&core, &acc, &stop).await;
+                }
                 api::persist_validation(&core, &name, &v);
                 log.push(&fmt_validation(&name, &v));
                 if let Some(u) = &v.username {
@@ -874,6 +884,14 @@ fn spawn_open_browser(bg: &Arc<Bg>, log: Arc<LogBuf>, acc: Account) {
             let l = log.clone();
             Arc::new(move |line: &str| l.push(line))
         };
+        // Сессию продлеваем ДО открытия окна.
+        //
+        // Токен живёт десять минут, и сохранённый почти всегда уже протух. Со
+        // старым браузер получает от сайта страницу ГОСТЯ — свежие куки сайт
+        // пришлёт в том же ответе, но отрисованная страница так и останется
+        // «войдите». Человек видит окно без аккаунта, хотя сессия рабочая.
+        // Один запрос перед запуском — и окно открывается уже под аккаунтом.
+        let _ = core.http.request(&acc, "/", otvet_core::http::ReqOpts::get().html(), &Stop::new()).await;
         let cookies = acc.cookie_header().unwrap_or_default();
         if let Err(e) = otvet_core::cdp::open_as(
             &core.root,
