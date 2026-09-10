@@ -962,19 +962,29 @@ pub async fn open_as(
         }
     };
 
-    let jar = crate::accounts::parse_cookie_jar(cookies);
-    let list: Vec<Value> = jar
-        .iter()
-        .map(|(n, v)| {
-            serde_json::json!({ "name": n, "value": v, "domain": ".mail.ru", "path": "/", "secure": true })
-        })
-        .collect();
-    let n = list.len();
-    if let Err(e) = cdp.call("Storage.setCookies", serde_json::json!({ "cookies": list })).await {
-        let _ = child.kill().await;
-        alive.stop();
-        return Err(anyhow::anyhow!("не удалось поставить куки: {e}"));
-    }
+    // Куки из базы ставим ТОЛЬКО если это настоящая сессия. У аккаунта, которым
+    // работают вручную, живая сессия лежит в самом профиле браузера, а в базе —
+    // старый огрызок. Подставить огрызок поверх — уронить рабочую сессию:
+    // `Auth-RefreshToken` одноразовый, и старый `Mpop` рядом с ним сайт уже не
+    // принимает. Поэтому пустой набор в профиль не несём.
+    let n = if crate::accounts::looks_logged_in(cookies) {
+        let jar = crate::accounts::parse_cookie_jar(cookies);
+        let list: Vec<Value> = jar
+            .iter()
+            .map(|(n, v)| {
+                serde_json::json!({ "name": n, "value": v, "domain": ".mail.ru", "path": "/", "secure": true })
+            })
+            .collect();
+        let n = list.len();
+        if let Err(e) = cdp.call("Storage.setCookies", serde_json::json!({ "cookies": list })).await {
+            let _ = child.kill().await;
+            alive.stop();
+            return Err(anyhow::anyhow!("не удалось поставить куки: {e}"));
+        }
+        n
+    } else {
+        0
+    };
     // Дальше работаем в ТОЙ ЖЕ пустой вкладке, а не открываем новую: отпечаток
     // надо надеть до первого документа, а `Target.createTarget` с адресом
     // навигирует сразу — инжект уже не успел бы.
