@@ -848,6 +848,59 @@ async fn validation_refreshes_stale_username() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Перелогин аккаунта, по которому программа уже ходила. Ровно то, на чём
+/// ломалось: живая строка кук хранила мёртвую сессию, проверка после входа шла
+/// с ней и говорила «не авторизован», а Set-Cookie из её ответа сливался со
+/// старой строкой и затирал свежую сессию в файле. Помогало только удалить
+/// аккаунт и завести заново.
+#[tokio::test]
+async fn relogin_of_a_used_account_takes_effect() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("relogin");
+    let mut acc = Account::new("relogin");
+    acc.cookies = Some("Mpop=OLD; oid=1".into());
+    core.accounts.add(acc).unwrap();
+
+    m.route(|r| {
+        if r.path == "/api/auth/user" {
+            if r.cookie.contains("mpop=new") {
+                return Some(Res::json(r#"{"id":555,"username":"ok","nick":"ok"}"#));
+            }
+            // Мёртвая сессия, и сайт по пути ставит свою куку — как в жизни.
+            return Some(Res::status(403).with_header("set-cookie", "hitw429=1; Path=/"));
+        }
+        if r.path.starts_with("/api/karma/score/") {
+            return Some(Res::json(
+                r#"{"result":{"total_score":1,"score":{"history":1,"knowledge":0,"discussion":0}}}"#,
+            ));
+        }
+        None
+    });
+
+    // Аккаунт разлогинен, и программа это уже увидела: живая строка кук есть.
+    let before = core.accounts.get("relogin").unwrap();
+    let worker = before.clone();
+    let v = otvet_core::api::validate_account(&core, &before, &Stop::new()).await;
+    assert!(v.auth_bad, "старая сессия мертва: {v:?}");
+    assert!(
+        before.cookie_header().unwrap_or_default().contains("hitw429"),
+        "живая строка должна была появиться"
+    );
+
+    // Перелогин — ровно как в интерфейсе.
+    core.accounts.mutate("relogin", |x| x.replace_cookies("Mpop=NEW; oid=2"));
+    let after = core.accounts.get("relogin").unwrap();
+
+    let v = otvet_core::api::validate_account(&core, &after, &Stop::new()).await;
+    assert!(v.alive && !v.auth_bad, "после перелогина аккаунт обязан быть жив: {v:?}");
+    let saved = core.accounts.get("relogin").and_then(|a| a.cookies).unwrap_or_default();
+    assert!(saved.contains("Mpop=NEW"), "свежая сессия затёрта в файле: {saved}");
+    assert!(!saved.contains("Mpop=OLD"), "в файл вернулась мёртвая сессия: {saved}");
+    // Задача, взявшая аккаунт в работу ещё до входа, тоже ходит уже с новой.
+    assert!(worker.cookie_header().unwrap_or_default().contains("Mpop=NEW"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// 403 без кук — это «не залогинен», и красить аккаунт можно. 418 — антибот,
 /// и трогать статус нельзя: иначе мёртвый прокси «разлогинит» живые аккаунты.
 #[tokio::test]

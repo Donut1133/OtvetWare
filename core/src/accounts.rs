@@ -139,6 +139,21 @@ impl Account {
         *self.rt.cookies.lock() = Some(cookies.to_string());
     }
 
+    /// Новая сессия целиком — и в поле, и в живую строку.
+    ///
+    /// Одного поля мало: `cookie_header()` берёт сначала живую строку, а в ней
+    /// после любого запроса по аккаунту лежит прежняя сессия. Перелогин писал
+    /// только в поле — проверка сразу после входа уходила со старыми куками и
+    /// говорила «не авторизован», а Set-Cookie из её же ответа сливался со
+    /// старой строкой и затирал свежую сессию ещё и в файле. Помогало только
+    /// удалить аккаунт и завести заново: у нового живой строки ещё нет.
+    pub fn replace_cookies(&mut self, cookies: &str) {
+        self.cookies = Some(cookies.to_string());
+        // Именно поставить, а не сбросить в None: клоны аккаунта, уже ушедшие в
+        // воркеры, делят эту строку, а их собственное поле — старая копия.
+        self.set_cookie_header(cookies);
+    }
+
     /// Лог, куда уходят сообщения о смене прокси во время прогона.
     pub fn set_rotate_log(&self, log: crate::util::Log) {
         *self.rt.rotate_log.lock() = Some(log);
@@ -671,6 +686,24 @@ mod tests {
         assert!(!looks_logged_in("foo=1; _ga=2"));
         let from_json = normalize_cookies_input(r#"[{"name":"a","value":"1"},{"name":"b","value":"2"}]"#);
         assert_eq!(from_json, "a=1; b=2");
+    }
+
+    /// Перелогин аккаунта, по которому уже ходили запросы. Живая строка к этому
+    /// моменту хранит прежнюю сессию, и новая обязана заменить и её — иначе
+    /// все запросы, включая проверку сразу после входа, уходят со старой.
+    #[test]
+    fn relogin_replaces_the_live_session_too() {
+        let mut a = Account::new("acc");
+        a.cookies = Some("Auth-RefreshToken=old".into());
+        // Прогон успел слить Set-Cookie в живую строку.
+        a.set_cookie_header("Auth-RefreshToken=old; hitw429=1");
+        let worker = a.clone();
+
+        a.replace_cookies("Auth-RefreshToken=new");
+        assert_eq!(a.cookie_header().as_deref(), Some("Auth-RefreshToken=new"));
+        assert_eq!(a.cookies.as_deref(), Some("Auth-RefreshToken=new"));
+        // Клон, ушедший в воркер ещё до входа, тоже видит новую сессию.
+        assert_eq!(worker.cookie_header().as_deref(), Some("Auth-RefreshToken=new"));
     }
 
     /// Ротация кук пишется на диск отложенно — но НЕ теряется: в памяти она

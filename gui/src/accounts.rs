@@ -810,7 +810,7 @@ fn spawn_login(bg: &Arc<Bg>, log: Arc<LogBuf>, name: String, proxy: String, exis
                 let acc = match (existing, core.accounts.get(&name)) {
                     (true, Some(a)) => {
                         core.accounts.mutate(&name, |x| {
-                            x.cookies = Some(h.cookies.clone());
+                            x.replace_cookies(&h.cookies);
                             x.ua = Some(h.ua.clone());
                             x.auth_bad = Some(false);
                             // Сессия новая — прежняя отметка бана к ней не
