@@ -312,6 +312,15 @@ pub fn looks_logged_in(cookie_header: &str) -> bool {
     has_cookie(cookie_header, "Auth-SessionToken") || has_cookie(cookie_header, "Auth-RefreshToken")
 }
 
+/// Есть ли чем обменять протухшую сессию на свежую.
+///
+/// Это то, что отличает «токен просрочен» от «разлогин»: короткий токен живёт
+/// десять минут, длинный — месяцы. Пока длинный на месте, 403 от сайта означает
+/// первое, и красить аккаунт красным по нему нельзя.
+pub fn can_refresh(cookie_header: &str) -> bool {
+    has_cookie(cookie_header, "Auth-RefreshToken")
+}
+
 // ─── Разбор строки кук ──────────────────────────────────────────────────────
 
 /// `a=1; b=2` → упорядоченный список пар. Порядок важен: mail.ru его не требует,

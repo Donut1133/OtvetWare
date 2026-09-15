@@ -259,29 +259,45 @@ pub enum PostResult {
 
 /// Виден ли опубликованный вопрос на сайте.
 ///
-/// Строго наоборот к проверке ответов: там «не нашли среди ответов» — повод
-/// заподозрить снос, здесь же снос признаётся ТОЛЬКО по прямому «нет такого
-/// вопроса» (404/410). Всё остальное — сеть, антибот, странный ответ сервера —
-/// это `Unknown`, и вопрос считается опубликованным. Ошибка в другую сторону
-/// стоит дорого: бот задаст второй такой же вопрос от того же аккаунта.
+/// Смотрим ЧУЖИМИ глазами, без кук аккаунта. Автомодерация вопрос НЕ удаляет —
+/// она прячет его от посторонних, а автору он виден как ни в чём не бывало.
+/// Своей же сессией снос не разглядеть в принципе: она всегда ответит «на
+/// месте». Проверено живьём: через десять секунд после публикации гость на тот
+/// же вопрос получал 400, а автор — спокойные 200 с полным текстом.
+///
+/// Скрытое и несуществующее гость получает одинаково — 400 с «content view
+/// deny» либо «topic does not exist». Для нас это одно и то же: посторонние
+/// вопроса не видят, значит его нет. Всё остальное — сеть, антибот, странный
+/// ответ сервера — это `Unknown`, и вопрос считается опубликованным: ошибка в
+/// эту сторону дешевле, чем второй такой же вопрос от того же аккаунта.
 pub async fn verify_question(core: &Core, acc: &Account, topic_id: i64, stop: &Stop) -> Verify {
-    let Ok(r) =
-        core.http.request(acc, &format!("/api/topic/question/{topic_id}"), ReqOpts::get(), stop).await
+    let Ok(r) = core
+        .http
+        .request(acc, &format!("/api/topic/question/{topic_id}"), ReqOpts::get().guest(), stop)
+        .await
     else {
         return Verify::Unknown;
     };
     if r.blocked {
         return Verify::Unknown;
     }
-    if r.status == 404 || r.status == 410 {
+    // «Нет такого» — однозначно. А 400/403 засчитываем только когда отказ
+    // пришёл от самого API (то есть json'ом): гостевой запрос идёт без кук, и
+    // на него легче прочего прилетает страница-заглушка, которую нельзя
+    // принимать за снос.
+    if matches!(r.status, 404 | 410) || (matches!(r.status, 400 | 403) && r.json.is_some()) {
         return Verify::Missing;
     }
     if !r.ok {
         return Verify::Unknown;
     }
-    match r.result().and_then(|res| res.get("id")).and_then(|v| v.as_i64()) {
+    // Не json — отвечал не API: гадать не о чем.
+    let Some(j) = r.json.as_ref() else {
+        return Verify::Unknown;
+    };
+    match j.get("result").and_then(|res| res.get("id")).and_then(|v| v.as_i64()) {
         Some(id) if id == topic_id => Verify::Present,
-        // HTTP 200 без вопроса в теле — так mail.ru отвечает на удалённый.
+        // Ответ API без вопроса в теле — вопроса посторонним не видно.
         None => Verify::Missing,
         _ => Verify::Unknown,
     }
@@ -386,7 +402,7 @@ pub async fn run_asker(core: &Core, acc: &Account, p: &AskParams, log: &Log, sto
             out.blocked = true;
             log("[x] Антибот (418/429) при проверке — статус не меняю.");
         } else if v.banned {
-            log("[x] Аккаунт заблокирован сайтом — пропускаю. Сессия жива, но действия молча не проходят.");
+            log(&api::ban_message(&v));
             out.skipped = true;
             return out;
         } else if v.alive {

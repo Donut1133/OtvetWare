@@ -347,14 +347,16 @@ pub async fn vote_on_profile(
 
         let sub = if want_replies { "replies" } else { "topics" };
         let storage = format!("profile-{}-{}", victim.id, if want_replies { "replies" } else { "posts" });
+        // У ответов курсор слушается только при `dir=1`, а первую страницу
+        // отдаёт только `dir=0` — при `dir=1&pos=0` в ответ приходит пустота.
+        // Проверено живьём. Раньше `dir` у ответов был нулём всегда: сайт
+        // молча игнорировал курсор и возвращал ту же свежую страницу, цикл
+        // видел одни дубли и останавливался — до хвоста профиля дело не
+        // доходило никогда, голоса доставались двум десяткам свежих ответов.
+        let dir = if want_replies && pos == 0 { 0 } else { 1 };
         let feed = format!(
             "/api/topic/profile/{}/{}?userID={}&dir={}&pos={}&limit=20&storage={}",
-            victim.id,
-            sub,
-            victim.id,
-            if want_replies { 0 } else { 1 },
-            pos,
-            storage
+            victim.id, sub, victim.id, dir, pos, storage
         );
         let r = match core.http.request(acc, &feed, ReqOpts::get(), stop).await {
             Ok(r) => r,
@@ -498,7 +500,7 @@ pub async fn run_votes(core: &Core, acc: &Account, p: &VoteParams, log: &Log, st
             out.blocked = true;
             log("[x] Антибот (418/429) при проверке — статус не меняю.");
         } else if v.banned {
-            log("[x] Аккаунт заблокирован сайтом — пропускаю. Сессия жива, но действия молча не проходят.");
+            log(&api::ban_message(&v));
             out.skipped = true;
             return out;
         } else if v.alive {

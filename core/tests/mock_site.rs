@@ -322,6 +322,68 @@ async fn votes_never_hit_the_same_post_twice() {
 }
 
 /// 418 — это антибот: аккаунт обязан остановиться, а не долбиться дальше.
+/// Голоса по ОТВЕТАМ профиля должны уходить дальше первой страницы.
+///
+/// У ответов курсор слушается только при `dir=1`, а `dir=0` отдаёт свежую
+/// страницу, что ему ни передай. Раньше бот всегда слал `dir=0`: вторая
+/// страница приходила той же самой, цикл видел одни дубли и вставал — до
+/// хвоста профиля голоса не доходили никогда.
+#[tokio::test]
+async fn votes_walk_past_the_first_page_of_replies() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("votesreplies");
+    let acc = account("voter2");
+
+    m.route(|r| {
+        if r.path.starts_with("/api/auth/users/") {
+            return Some(Res::json(r#"{"id":555,"username":"victim"}"#));
+        }
+        None
+    });
+    // Заглушка ведёт себя как живой сайт: при dir=0 курсор игнорируется.
+    m.route(|r| {
+        if !r.path.starts_with("/api/topic/profile/555/replies") {
+            return None;
+        }
+        let q = |k: &str| -> i64 {
+            r.path.split(k).nth(1).and_then(|s| s.split('&').next()).and_then(|s| s.parse().ok()).unwrap_or(0)
+        };
+        let all = [40i64, 39, 38, 37];
+        let page: Vec<i64> = if q("dir=") == 0 {
+            all[..2].to_vec()
+        } else {
+            let pos = q("pos=");
+            all.iter().skip_while(|x| **x != pos).skip(1).take(2).copied().collect()
+        };
+        let items: Vec<String> = page.iter().map(|id| format!(r#"{{"id":{id},"topic_id":900}}"#)).collect();
+        Some(Res::json(format!(r#"{{"result":{{"replies":[{}]}}}}"#, items.join(","))))
+    });
+    m.route(|r| {
+        if r.method == "POST" && r.path.starts_with("/api/topic/reply/") {
+            return Some(Res::json(r#"{"result":{"user_reaction":1}}"#));
+        }
+        None
+    });
+
+    let mut blocked = false;
+    let voted = votes::vote_on_profile(
+        &core,
+        &acc,
+        &format!("{}/profile/id555/answers", m.base),
+        Vote::Plus,
+        0,
+        0.0,
+        &no_log(),
+        &Stop::new(),
+        &mut blocked,
+        &Default::default(),
+    )
+    .await;
+
+    assert_eq!(voted, 4, "до хвоста профиля голоса не дошли: проголосовано {voted} из 4");
+    assert!(!blocked);
+}
+
 #[tokio::test]
 async fn antibot_stops_the_account() {
     let (m, _lock) = exclusive().await;
@@ -899,6 +961,339 @@ async fn relogin_of_a_used_account_takes_effect() {
     // Задача, взявшая аккаунт в работу ещё до входа, тоже ходит уже с новой.
     assert!(worker.cookie_header().unwrap_or_default().contains("Mpop=NEW"));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Протухший короткий токен — НЕ разлогин. Упреждающее обновление может не
+/// пройти (сеть, прокси, заглушка антибота вместо главной), и тогда сайт
+/// отвечает 403 на живой аккаунт. Раньше прогон красил такой аккаунт
+/// разлогиненным и выкидывал из круга, а нажатая через минуту кнопка
+/// «Проверить» говорила, что всё в порядке.
+#[tokio::test]
+async fn a_failed_refresh_is_not_a_logout() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("refresh");
+    let mut acc = Account::new("stale-session");
+    // Короткого токена нет, длинный на месте — ровно то состояние, из которого
+    // сессия обязана восстановиться сама.
+    acc.cookies = Some("Auth-RefreshToken=OLD".into());
+    core.accounts.add(acc).unwrap();
+    let acc = core.accounts.get("stale-session").unwrap();
+
+    // Первое обновление проваливается, дальше сайт отдаёт свежую пару.
+    static REFRESHES: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    REFRESHES.store(0, std::sync::atomic::Ordering::SeqCst);
+    m.route(|r| {
+        if r.path == "/" {
+            if REFRESHES.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Some(Res::status(429));
+            }
+            return Some(
+                Res::json("<html>ok</html>")
+                    .with_header("set-cookie", "Auth-SessionToken=NEW; Path=/")
+                    .with_header("set-cookie", "Auth-RefreshToken=NEW2; Path=/"),
+            );
+        }
+        if r.path == "/api/auth/user" {
+            if r.cookie.contains("auth-sessiontoken=new") {
+                return Some(Res::json(r#"{"id":42,"username":"живой","user_status":0}"#));
+            }
+            return Some(Res::status(403));
+        }
+        if r.path.starts_with("/api/karma/score/") {
+            return Some(Res::json(
+                r#"{"result":{"total_score":0,"score":{"history":0,"knowledge":0,"discussion":0}}}"#,
+            ));
+        }
+        None
+    });
+
+    let v = otvet_core::api::validate_account(&core, &acc, &Stop::new()).await;
+    assert!(v.alive && !v.auth_bad, "403 с живым длинным токеном — не разлогин: {v:?}");
+    assert_eq!(v.user_id, Some(42));
+    // Новый длинный токен сохранён: он одноразовый, потерять его нельзя.
+    let saved = core.accounts.get("stale-session").and_then(|a| a.cookies).unwrap_or_default();
+    assert!(saved.contains("Auth-RefreshToken=NEW2"), "обновлённый токен не сохранён: {saved}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Протухшую сессию mail.ru отдаёт не только как 403, но и как 400 с «token
+/// expired» в теле — по одному статусу вторую форму не поймать. Она же и
+/// частая, так что без неё починка 403 закрывала бы половину случаев.
+#[tokio::test]
+async fn token_expired_in_the_body_is_also_refreshed() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("expiredbody");
+    let mut acc = Account::new("expired");
+    acc.cookies = Some("Auth-RefreshToken=OLD".into());
+    core.accounts.add(acc).unwrap();
+    let acc = core.accounts.get("expired").unwrap();
+
+    m.route(|r| {
+        if r.path == "/" {
+            return Some(
+                Res::json("<html>ok</html>").with_header("set-cookie", "Auth-SessionToken=NEW; Path=/"),
+            );
+        }
+        if r.path == "/api/auth/user" {
+            if r.cookie.contains("auth-sessiontoken=new") {
+                return Some(Res::json(r#"{"id":7,"username":"живой","user_status":0}"#));
+            }
+            return Some(Res {
+                status: 400,
+                body: r#"{"code":4,"message":"token expired: token expired"}"#.into(),
+                headers: vec![],
+            });
+        }
+        if r.path.starts_with("/api/karma/score/") {
+            return Some(Res::json(
+                r#"{"result":{"total_score":0,"score":{"history":0,"knowledge":0,"discussion":0}}}"#,
+            ));
+        }
+        None
+    });
+
+    let v = otvet_core::api::validate_account(&core, &acc, &Stop::new()).await;
+    assert!(v.alive && !v.auth_bad, "400 «token expired» — повод обновиться, а не разлогин: {v:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// А вот когда обновляться нечем, 403 — это правда разлогин.
+#[tokio::test]
+async fn a_dead_session_is_still_a_logout() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("reallydead");
+    let mut acc = Account::new("dead");
+    acc.cookies = Some("Mpop=old".into());
+    core.accounts.add(acc).unwrap();
+    let acc = core.accounts.get("dead").unwrap();
+
+    m.route(|r| if r.path == "/api/auth/user" { Some(Res::status(403)) } else { None });
+
+    let v = otvet_core::api::validate_account(&core, &acc, &Stop::new()).await;
+    assert!(v.auth_bad && !v.alive, "без длинного токена 403 = разлогин: {v:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Опубликованный вопрос проверяется глазами постороннего. Снятый автомодерацией
+/// вопрос сайт не удаляет, а прячет: автору он виден по-прежнему, а гостю
+/// приходит 400 «content view deny». Ответы сайта сняты с живого прогона.
+#[tokio::test]
+async fn posted_question_is_checked_as_a_stranger() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("askverify");
+    let acc = account("ask-acc");
+
+    static SAW_COOKIE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    SAW_COOKIE.store(false, std::sync::atomic::Ordering::SeqCst);
+    m.route(|r| {
+        if !r.path.starts_with("/api/topic/question/") {
+            return None;
+        }
+        if !r.cookie.is_empty() {
+            SAW_COOKIE.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        // Живой вопрос.
+        if r.path.ends_with("/111") {
+            return Some(Res::json(r#"{"result":{"id":111,"title":"живой"}}"#));
+        }
+        // Скрытый: ровно так сайт отвечает постороннему.
+        if r.path.ends_with("/222") {
+            return Some(Res {
+                status: 400,
+                body: r#"{"error":{"code":"x[999-999]","message":"content view deny"}}"#.into(),
+                headers: vec![],
+            });
+        }
+        // Сервер сломался — это не «снесли».
+        Some(Res::status(500))
+    });
+
+    use otvet_core::answerer::Verify;
+    use otvet_core::asker::verify_question;
+    let s = Stop::new();
+    assert_eq!(verify_question(&core, &acc, 111, &s).await, Verify::Present);
+    assert_eq!(verify_question(&core, &acc, 222, &s).await, Verify::Missing);
+    assert_eq!(verify_question(&core, &acc, 333, &s).await, Verify::Unknown);
+    assert!(
+        !SAW_COOKIE.load(std::sync::atomic::Ordering::SeqCst),
+        "проверка ушла с куками автора — своей сессией скрытый вопрос виден всегда"
+    );
+}
+
+/// Реплику, не влезшую в страницу списка, нельзя объявлять удалённой: список
+/// отдаёт лишь верхушку и по нескольку штук, а «не нашли» здесь приговор —
+/// цель уходит в журнал обработанных и больше не берётся никогда.
+#[tokio::test]
+async fn a_reply_missing_from_the_page_is_confirmed_by_id() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("locate");
+    let acc = account("loc-acc");
+
+    m.route(|r| {
+        // В списке ответов вопроса нашей реплики нет — только чужие.
+        if r.path == "/api/topic/answers/900" {
+            return Some(Res::json(r#"{"result":{"replies":[{"id":1},{"id":2}]}}"#));
+        }
+        // Зато сама она жива и отвечает по своему id.
+        if r.path == "/api/topic/topic/900/reply/777/rootpath" {
+            return Some(Res::json(r#"{"result":[777]}"#));
+        }
+        if r.path.contains("/rootpath") {
+            return Some(Res::json(r#"{"result":null}"#));
+        }
+        None
+    });
+
+    let alive =
+        otvet_core::replier::Target { topic_id: "900".into(), entity_id: "777".into(), ..Default::default() };
+    let gone =
+        otvet_core::replier::Target { topic_id: "900".into(), entity_id: "888".into(), ..Default::default() };
+    let s = Stop::new();
+    assert!(otvet_core::replier::locate_entity(&core, &acc, &alive, &s).await.found, "реплика жива");
+    assert!(!otvet_core::replier::locate_entity(&core, &acc, &gone, &s).await.found, "реплики правда нет");
+}
+
+/// Реплика в ветке проверяется так же, как ответ: глазами постороннего и по
+/// её собственному id. Раньше ветка читалась ПОД КУКАМИ АККАУНТА — то есть
+/// снос был не виден в принципе, автору скрытое видно всегда.
+#[tokio::test]
+async fn posted_reply_is_checked_as_a_stranger() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("replyverify");
+    let acc = account("rep-acc");
+
+    static SAW_COOKIE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    SAW_COOKIE.store(false, std::sync::atomic::Ordering::SeqCst);
+    m.route(|r| {
+        if !r.path.contains("/rootpath") {
+            return None;
+        }
+        if !r.cookie.is_empty() {
+            SAW_COOKIE.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if r.path.ends_with("/reply/501/rootpath") {
+            return Some(Res::json(r#"{"result":[500,501]}"#));
+        }
+        Some(Res::json(r#"{"result":null}"#))
+    });
+
+    let t = otvet_core::replier::Target {
+        topic_id: "900".into(),
+        root_id: "500".into(),
+        entity_id: "500".into(),
+        ..Default::default()
+    };
+    let s = Stop::new();
+    assert!(otvet_core::replier::reply_is_there(&core, &acc, &t, 501, &s).await, "реплика на месте");
+    assert!(!otvet_core::replier::reply_is_there(&core, &acc, &t, 502, &s).await, "реплику снесли");
+    assert!(
+        !SAW_COOKIE.load(std::sync::atomic::Ordering::SeqCst),
+        "проверка ушла с куками автора — так снос не увидеть"
+    );
+}
+
+/// Бан ставится только по двум ответам подряд. Сайт отдавал отрицательный
+/// `user_status` и живым аккаунтам: в списке загоралось БАН, аккаунт вылетал
+/// из круга, а нажатая следом кнопка «Проверить» говорила, что всё в порядке.
+#[tokio::test]
+async fn a_one_off_ban_reading_is_not_believed() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("flakyban");
+    let acc = account("ban-acc");
+
+    // Первый ответ — «забанен», второй — обычный.
+    static CALLS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    m.route(|r| {
+        if r.path == "/api/auth/user" {
+            let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let status = if n == 0 { -1 } else { 0 };
+            return Some(Res::json(format!(r#"{{"id":1000,"username":"живой","user_status":{status}}}"#)));
+        }
+        if r.path.starts_with("/api/karma/score/") {
+            return Some(Res::json(
+                r#"{"result":{"total_score":0,"score":{"history":0,"knowledge":0,"discussion":0}}}"#,
+            ));
+        }
+        None
+    });
+
+    let v = otvet_core::api::validate_account(&core, &acc, &Stop::new()).await;
+    assert!(!v.banned, "разовый отрицательный статус — ещё не бан: {v:?}");
+    assert!(v.alive, "аккаунт живой: {v:?}");
+    assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 2, "бан обязан переспрашиваться");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// А настоящий бан сайт подтверждает и со второго раза — тогда верим.
+#[tokio::test]
+async fn a_confirmed_ban_is_reported() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("realban");
+    let acc = account("banned-acc");
+
+    m.route(|r| {
+        if r.path == "/api/auth/user" {
+            return Some(Res::json(r#"{"id":1000,"username":"битый","user_status":-3}"#));
+        }
+        if r.path.starts_with("/api/karma/score/") {
+            return Some(Res::json(
+                r#"{"result":{"total_score":0,"score":{"history":0,"knowledge":0,"discussion":0}}}"#,
+            ));
+        }
+        None
+    });
+
+    let v = otvet_core::api::validate_account(&core, &acc, &Stop::new()).await;
+    assert!(v.banned && v.alive, "подтверждённый бан: {v:?}");
+    // В лог уходит то, что ответил сайт: смысл отрицательных значений неизвестен.
+    assert!(otvet_core::api::ban_message(&v).contains("user_status -3"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Проверка опубликованного ответа спрашивает про КОНКРЕТНЫЙ id, а не ищет его
+/// в списке ответов вопроса: список отдаёт лишь верхушку и по нескольку штук,
+/// и под людным вопросом живой ответ раньше объявлялся снесённым.
+#[tokio::test]
+async fn posted_answer_is_checked_by_its_own_id() {
+    let (m, _lock) = exclusive().await;
+    let (core, _dir) = temp_core("verify");
+    let acc = account("verify-acc");
+
+    // Проверка обязана идти БЕЗ кук аккаунта: снесённый ответ автор видит
+    // по-прежнему, и своей сессией снос не разглядеть в принципе.
+    static SAW_COOKIE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    SAW_COOKIE.store(false, std::sync::atomic::Ordering::SeqCst);
+    m.route(|r| {
+        if r.path.contains("/rootpath") && !r.cookie.is_empty() {
+            SAW_COOKIE.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        // Ответ верхнего уровня: цепочка из одного id.
+        if r.path == "/api/topic/topic/100/reply/777/rootpath" {
+            return Some(Res::json(r#"{"result":[777]}"#));
+        }
+        // Комментарий: цепочка из нескольких, наш — последний.
+        if r.path == "/api/topic/topic/100/reply/779/rootpath" {
+            return Some(Res::json(r#"{"result":[777,779]}"#));
+        }
+        // Снесённый: сайт про него не знает.
+        if r.path == "/api/topic/topic/100/reply/778/rootpath" {
+            return Some(Res::json(r#"{"result":null}"#));
+        }
+        None
+    });
+
+    use otvet_core::answerer::{verify_answer, Verify};
+    let s = Stop::new();
+    assert_eq!(verify_answer(&core, &acc, "100", 777, &s).await, Verify::Present);
+    assert_eq!(verify_answer(&core, &acc, "100", 779, &s).await, Verify::Present);
+    assert_eq!(verify_answer(&core, &acc, "100", 778, &s).await, Verify::Missing);
+    // Сайт не ответил — это не «снесли», это «не знаю».
+    assert_eq!(verify_answer(&core, &acc, "100", 999, &s).await, Verify::Unknown);
+    assert!(
+        !SAW_COOKIE.load(std::sync::atomic::Ordering::SeqCst),
+        "проверка ушла с куками аккаунта — так снос не увидеть"
+    );
 }
 
 /// 403 без кук — это «не залогинен», и красить аккаунт можно. 418 — антибот,
@@ -1664,11 +2059,9 @@ async fn vanished_answer_is_not_counted() {
         if r.method == "POST" && r.path == "/api/topic/answers" {
             return Some(Res::json(r#"{"result":{"id":4242}}"#));
         }
-        // В ветке нашего ответа нет — только чужой.
-        if r.path.starts_with("/api/topic/answers/") {
-            return Some(Res::json(
-                r#"{"result":{"replies":[{"id":777,"content":{"type":"doc","content":[]}}]}}"#,
-            ));
+        // Сайт про наш ответ не знает — значит, снесли.
+        if r.path.ends_with("/reply/4242/rootpath") {
+            return Some(Res::json(r#"{"result":null}"#));
         }
         None
     });

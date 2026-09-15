@@ -414,6 +414,32 @@ pub async fn locate_entity(core: &Core, acc: &Account, t: &Target, stop: &Stop) 
     let siblings = res.get("replies").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let entity =
         siblings.iter().find(|x| x.get("id").map(val_to_string).unwrap_or_default() == t.entity_id).cloned();
+
+    // Не нашли в списке — это ещё не «удалена». Список ответов вопроса отдаёт
+    // только верхний уровень и по нескольку штук за раз, так что под людным
+    // вопросом нужная реплика туда просто не попадает. А «не нашли» тут
+    // приговор: цель уходит в журнал обработанных и больше не берётся никогда.
+    // Поэтому переспрашиваем сайт про неё отдельно, по её собственному id.
+    if entity.is_none() {
+        let alive = match t.entity_id.parse::<i64>() {
+            Ok(id) => {
+                crate::answerer::verify_answer(core, acc, &t.topic_id, id, stop).await
+                    == crate::answerer::Verify::Present
+            }
+            Err(_) => false,
+        };
+        if alive {
+            // Текста реплики у нас нет — ответим по тексту из уведомления.
+            return Located {
+                found: true,
+                entity: None,
+                siblings,
+                blocked: false,
+                throttled: false,
+                error: None,
+            };
+        }
+    }
     Located { found: entity.is_some(), entity, siblings, blocked: false, throttled: false, error: None }
 }
 
@@ -619,26 +645,18 @@ pub async fn post_reply(
     Ok(PostRes::Failed)
 }
 
-/// Осталась ли наша реплика в ветке. `true` и при сетевом сбое: наказывать за
-/// то, что не удалось проверить, нельзя — иначе живой ответ уедет в «не вышло».
+/// Осталась ли отправленная реплика на виду У ПОСТОРОННИХ.
+///
+/// Ровно та же проверка, что и у ответов, и по той же причине: автомодерация
+/// реплику не удаляет, а прячет от других людей — автору она видна как прежде.
+/// Раньше здесь читалась ветка ПОД КУКАМИ АККАУНТА, то есть снос был
+/// принципиально не виден, да ещё и гадалось по размеру страницы.
+///
+/// Сомнение трактуем в пользу «на месте»: вторая реплика в той же ветке хуже,
+/// чем незамеченный снос.
 pub async fn reply_is_there(core: &Core, acc: &Account, t: &Target, reply_id: i64, stop: &Stop) -> bool {
-    let url = format!("/api/topic/answers/{}?reply_id={}", t.topic_id, t.entity_id);
-    let Ok(r) = core.http.request(acc, &url, ReqOpts::get(), stop).await else { return true };
-    if r.blocked || !r.ok {
-        return true;
-    }
-    let Some(res) = r.result() else { return true };
-    let Some(list) = res.get("replies").and_then(|v| v.as_array()) else { return true };
-    // Пустая ветка сразу после отправки — это «снесли». А вот полная страница
-    // может просто не вместить нашу реплику: считать её пропавшей и слать
-    // вторую нельзя.
-    if list.is_empty() {
-        return false;
-    }
-    if list.len() >= 20 {
-        return true;
-    }
-    list.iter().any(|x| x.get("id").and_then(|v| v.as_i64()) == Some(reply_id))
+    let v = crate::answerer::verify_answer(core, acc, &t.topic_id, reply_id, stop).await;
+    v != crate::answerer::Verify::Missing
 }
 
 pub async fn mark_all_read(core: &Core, acc: &Account, stop: &Stop) -> bool {
@@ -820,7 +838,7 @@ pub async fn run_replier(core: &Core, acc: &Account, p: &ReplyParams, log: &Log,
             out.blocked = true;
             log("[x] Антибот (418/429) при проверке — статус не меняю.");
         } else if v.banned {
-            log("[x] Аккаунт заблокирован сайтом — пропускаю. Сессия жива, но действия молча не проходят.");
+            log(&api::ban_message(&v));
             out.skipped = true;
             return out;
         } else if v.alive {

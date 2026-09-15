@@ -145,6 +145,9 @@ pub struct ReqOpts {
     /// Обновлять протухшую сессию перед запросом. Снимается только у самого
     /// запроса-обновления, иначе он вызвал бы сам себя.
     pub refresh: bool,
+    /// Идти с куками аккаунта. Снимается там, где нужно увидеть сайт ЧУЖИМИ
+    /// глазами: снесённый ответ автор видит по-прежнему, а посторонние — нет.
+    pub cookies: bool,
 }
 
 impl Default for ReqOpts {
@@ -158,6 +161,7 @@ impl Default for ReqOpts {
             timeout_ms: 30_000,
             retry: true,
             refresh: true,
+            cookies: true,
         }
     }
 }
@@ -192,6 +196,12 @@ impl ReqOpts {
         self
     }
     pub fn no_refresh(mut self) -> Self {
+        self.refresh = false;
+        self
+    }
+    /// Запрос от постороннего: без кук аккаунта и без возни с сессией.
+    pub fn guest(mut self) -> Self {
+        self.cookies = false;
         self.refresh = false;
         self
     }
@@ -390,6 +400,31 @@ impl Http {
                 }
             }
         }
+
+        // Отказ по авторизации — ещё не разлогин. Короткий токен живёт десять минут, и
+        // упреждающее обновление могло не пройти: сеть моргнула, прокси отвалился,
+        // антибот показал заглушку вместо главной. Дальше сайт отвечает 403 на
+        // всё подряд, и прогон объявлял живой аккаунт разлогиненным — а через
+        // минуту кнопка «Проверить» говорила, что всё в порядке.
+        //
+        // Пока есть чем обновляться, меняем токен и повторяем запрос. Повтор
+        // безопасен и для POST: такой ответ означает, что сайт запрос ОТКЛОНИЛ,
+        // то есть ответа не создалось. Настоящий разлогин виден по тому, что
+        // обновление не дало новых кук, — и тогда отказ остаётся как есть.
+        //
+        // Спрашиваем ровно тем же способом, каким проверка аккаунта отличает
+        // разлогин: mail.ru отдаёт протухшую сессию и как 401/403, и как 400
+        // с «token expired» в теле — по одному статусу второе не поймать.
+        if opts.refresh
+            && crate::api::auth_failed(&resp)
+            && !stop.is_stopped()
+            && acc.cookie_header().map(|c| crate::accounts::can_refresh(&c)).unwrap_or(false)
+            && self.refresh_session(acc, stop).await
+        {
+            if let Ok(r2) = self.attempt(acc, &url, &opts, stop).await {
+                resp = r2;
+            }
+        }
         Ok(resp)
     }
 
@@ -432,7 +467,7 @@ impl Http {
         // Куки из страницы антибота не применяем. Она приходит вместо ответа
         // API и может нести `Set-Cookie`, стирающий токены, — у живого аккаунта
         // так уносило сессию целиком, и в базе оставался огрызок из `Mpop`.
-        if !blocked {
+        if !blocked && opts.cookies {
             self.merge_set_cookie(acc, &set_cookies);
         }
         let json = if text.is_empty() { None } else { serde_json::from_str::<Value>(&text).ok() };
@@ -449,13 +484,24 @@ impl Http {
     async fn ensure_session(&self, acc: &Account, stop: &Stop) {
         let stale =
             |acc: &Account| acc.cookie_header().map(|c| crate::accounts::session_stale(&c)).unwrap_or(false);
-        if !stale(acc) {
-            return;
+        if stale(acc) {
+            self.refresh_session(acc, stop).await;
         }
+    }
+
+    /// Обменять длинный токен на свежую сессию. `true` — куки сменились.
+    ///
+    /// Результат важен: обновление может и не пройти (сеть, прокси, заглушка
+    /// антибота вместо главной). Молчаливый провал раньше выглядел как разлогин
+    /// — следующий же запрос получал 403 на живом аккаунте.
+    async fn refresh_session(&self, acc: &Account, stop: &Stop) -> bool {
+        let before = acc.cookie_header().unwrap_or_default();
         // Аккаунт работает из нескольких задач сразу: обновляет один, ждут все.
         let _guard = acc.rt.refreshing.lock().await;
-        if !stale(acc) {
-            return;
+        // Пока стояли в очереди, сессию мог обновить сосед — второй раз менять
+        // токен нельзя: он одноразовый, и повтор убил бы только что полученный.
+        if acc.cookie_header().unwrap_or_default() != before {
+            return true;
         }
         let _ = Box::pin(self.request(
             acc,
@@ -464,6 +510,7 @@ impl Http {
             stop,
         ))
         .await;
+        acc.cookie_header().unwrap_or_default() != before
     }
 
     fn build_headers(&self, acc: &Account, persona: &Persona, opts: &ReqOpts) -> HeaderMap {
@@ -483,9 +530,11 @@ impl Http {
         set_pair(&mut pairs, "sec-fetch-site", "same-origin");
         set_pair(&mut pairs, "sec-fetch-mode", "cors");
         set_pair(&mut pairs, "sec-fetch-dest", "empty");
-        if let Some(c) = acc.cookie_header() {
-            if !c.is_empty() {
-                set_pair(&mut pairs, "cookie", &c);
+        if opts.cookies {
+            if let Some(c) = acc.cookie_header() {
+                if !c.is_empty() {
+                    set_pair(&mut pairs, "cookie", &c);
+                }
             }
         }
         if let Some(r) = &opts.referer {

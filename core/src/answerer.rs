@@ -532,11 +532,7 @@ pub async fn post_answer(
     Ok(PostRes::Failed)
 }
 
-/// Сколько ответов сайт отдаёт одной страницей. Точное число неважно: важно не
-/// принять «страница кончилась» за «ответа нет».
-const PAGE_GUESS: usize = 20;
-
-/// Виден ли отправленный ответ на сайте.
+/// Виден ли отправленный ответ на сайте — ПОСТОРОННИМ, а не автору.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verify {
     /// Ответ на месте.
@@ -549,42 +545,42 @@ pub enum Verify {
 
 /// Проверить, что ответ действительно опубликован.
 ///
-/// mail.ru отвечает «принято» и на то, что через несколько секунд удалит
-/// автомодерация: id в ответе есть, а самого ответа под вопросом нет. Без этой
-/// проверки бот считает такие ответы отправленными и идёт дальше, а вопрос
-/// остаётся без ответа — и в журнале записан как отвеченный.
+/// Спрашиваем сайт ОТ ПОСТОРОННЕГО, без кук аккаунта. Автомодерация ответ не
+/// удаляет — она прячет его от других людей, а автору он виден как прежде.
+/// Своей же сессией проверять бессмысленно: она всегда скажет «на месте».
+///
+/// Гостю `rootpath` отдаёт цепочку id от верхнего ответа до нашего, а про то,
+/// чего он не видит, отвечает `result: null`.
+/// Проверено на живых ответах: у ответа верхнего уровня цепочка из одного id,
+/// у комментария — из нескольких, у снесённого и у чужого вопроса — null.
+///
+/// Раньше проверка читала список ответов вопроса и искала свой среди них. Но
+/// тот эндпоинт отдаёт только верхний уровень и всего несколько штук за раз:
+/// под людным вопросом свежий ответ в выдачу не попадал, и живой ответ
+/// объявлялся снесённым. Бот возвращал место под лимитом и писал второй ответ
+/// другим текстом — то есть из-за ошибки проверки под вопросом оказывались два
+/// ответа с одного аккаунта, ровно то, чего проверка и должна была избежать.
 pub async fn verify_answer(core: &Core, acc: &Account, topic_id: &str, reply_id: i64, stop: &Stop) -> Verify {
-    let Ok(r) = core.http.request(acc, &format!("/api/topic/answers/{topic_id}"), ReqOpts::get(), stop).await
-    else {
+    let path = format!("/api/topic/topic/{topic_id}/reply/{reply_id}/rootpath");
+    let Ok(r) = core.http.request(acc, &path, ReqOpts::get().guest(), stop).await else {
         return Verify::Unknown;
     };
     if r.blocked || !r.ok {
         return Verify::Unknown;
     }
-    let Some(res) = r.result() else { return Verify::Unknown };
-    let mut all: Vec<&Value> =
-        res.get("replies").and_then(|v| v.as_array()).map(|a| a.iter().collect()).unwrap_or_default();
-    match res.get("best_replies") {
-        Some(Value::Array(a)) => all.extend(a.iter()),
-        Some(v) if !v.is_null() => all.push(v),
-        _ => {}
-    }
-    // Пустой список ответов на только что отвеченный вопрос — это не «нет
-    // ответа», а подозрительный ответ сервера: считаем неизвестным.
-    if all.is_empty() {
+    // `result` берём сырым: у отсутствующего ответа там `null`, а помощник
+    // `result()` не отличает его от «поля вообще нет».
+    let Some(res) = r.json.as_ref().and_then(|j| j.get("result")) else {
         return Verify::Unknown;
+    };
+    if res.is_null() {
+        return Verify::Missing;
     }
-    // Ответы приходят страницей. Если страница выглядит полной, нашего ответа
-    // могло просто не хватить места — и «не нашли» тут НЕ значит «снесли».
-    // Ошибиться в эту сторону дорого: бот отправит второй ответ, и под вопросом
-    // окажутся два от одного аккаунта.
-    if all.len() >= PAGE_GUESS {
-        return Verify::Unknown;
-    }
-    if all.iter().any(|x| x.get("id").and_then(|v| v.as_i64()) == Some(reply_id)) {
-        Verify::Present
-    } else {
-        Verify::Missing
+    match res.as_array() {
+        Some(ids) if ids.iter().any(|v| v.as_i64() == Some(reply_id)) => Verify::Present,
+        // Ответ непонятной формы — не гадаем: ошибиться в сторону «снесли»
+        // дороже, чем промолчать.
+        _ => Verify::Unknown,
     }
 }
 
@@ -877,7 +873,7 @@ pub async fn run_answerer(
             log("[x] Антибот (418/429) при проверке — статус не меняю.");
             out.blocked = true;
         } else if v.banned {
-            log("[x] Аккаунт заблокирован сайтом — пропускаю. Сессия жива, но действия молча не проходят.");
+            log(&api::ban_message(&v));
             if convo_mode {
                 core.convo.release(&acc.name);
             }

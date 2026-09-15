@@ -35,6 +35,23 @@ pub struct Validation {
     pub username: Option<String>,
     /// Сеть/прокси не дали ответа — статус трогать нельзя.
     pub error: Option<String>,
+    /// Сырое `user_status` из ответа сайта. Смысл отрицательных значений
+    /// нигде не описан, поэтому число уходит в лог: если «бан» окажется
+    /// временным ограничением, разбираться будем по нему.
+    pub user_status: Option<i64>,
+}
+
+/// Строка в лог о забаненном аккаунте — одна на все режимы.
+///
+/// С числом, которое ответил сайт: смысл отрицательных значений нигде не
+/// описан, и если «бан» окажется временным ограничением, разбираться будем
+/// по нему.
+pub fn ban_message(v: &Validation) -> String {
+    let note = match v.user_status {
+        Some(s) => format!(" (user_status {s})"),
+        None => String::new(),
+    };
+    format!("[x] Аккаунт заблокирован сайтом{note} — пропускаю. Сессия жива, но действия молча не проходят.")
 }
 
 /// Сессия протухла — это видно по ответу сайта.
@@ -169,21 +186,20 @@ pub async fn fetch_karma(core: &Core, acc: &Account, user_id: i64, stop: &Stop) 
     })
 }
 
-/// Проверка аккаунта без браузера. Заодно освежает userId и ник.
+/// Один опрос `/api/auth/user` — всё, что узнаётся об аккаунте одним запросом:
+/// жив ли, не забанен ли, какие у него id и ник.
 ///
-/// Пробуем `/api/auth/user`: без живой сессии он отдаёт 403 или 400 «token
-/// expired», а с куками — актуальные id и ник одним запросом. Карма для
-/// проверки не годится в принципе:
-/// `/api/karma/score` публичный и отвечает 200 даже разлогиненному.
+/// Эндпоинт выбран не случайно: без живой сессии он отдаёт 403 или 400 «token
+/// expired», а с куками — актуальные id и ник разом. Карма для проверки не
+/// годится в принципе: `/api/karma/score` публичный и отвечает 200 даже
+/// разлогиненному.
 ///
 /// Ник ОБЯЗАТЕЛЬНО перечитываем каждый раз. Раньше он брался из базы, только
 /// если там пусто, и переименование на сайте не подхватывалось никогда: в
 /// accounts.json годами лежал старый ник, а ссылка на свой профиль отдавала 404.
-pub async fn validate_account(core: &Core, acc: &Account, stop: &Stop) -> Validation {
+async fn auth_probe(core: &Core, acc: &Account, stop: &Stop) -> Validation {
     let mut out = Validation { user_id: acc.user_id, username: acc.username.clone(), ..Default::default() };
-
-    let probe = core.http.request(acc, "/api/auth/user", ReqOpts::get(), stop).await;
-    match probe {
+    match core.http.request(acc, "/api/auth/user", ReqOpts::get(), stop).await {
         Ok(p) => {
             out.blocked = p.blocked;
             out.auth_bad = auth_failed(&p);
@@ -196,7 +212,8 @@ pub async fn validate_account(core: &Core, acc: &Account, stop: &Stop) -> Valida
                 // `user_status`: 0 — обычный аккаунт, отрицательное — бан.
                 // Поле приходит в том же ответе, так что проверка бана не стоит
                 // ни одного лишнего запроса.
-                out.banned = j.get("user_status").and_then(|v| v.as_i64()).is_some_and(|s| s < 0);
+                out.user_status = j.get("user_status").and_then(|v| v.as_i64());
+                out.banned = out.user_status.is_some_and(|s| s < 0);
                 if let Some(id) = j.get("id").and_then(|v| v.as_i64()) {
                     out.user_id = Some(id);
                 }
@@ -209,13 +226,40 @@ pub async fn validate_account(core: &Core, acc: &Account, stop: &Stop) -> Valida
                 }
             }
         }
-        Err(HttpError::Aborted) => {
-            out.error = Some("остановлено".into());
-            return out;
-        }
-        Err(e) => {
-            out.error = Some(e.to_string());
-            return out;
+        Err(HttpError::Aborted) => out.error = Some("остановлено".into()),
+        Err(e) => out.error = Some(e.to_string()),
+    }
+    out
+}
+
+/// Сколько ждать перед вторым взглядом на бан. Достаточно, чтобы сайт успел
+/// ответить иначе, и мало, чтобы не тормозить круг.
+const BAN_RECHECK_MS: u64 = 2500;
+
+/// Проверка аккаунта без браузера. Заодно освежает userId и ник.
+///
+/// Одного опроса хватает почти всегда; второй уходит только на подозрение в
+/// бане — см. ниже, почему одному ответу тут верить нельзя.
+pub async fn validate_account(core: &Core, acc: &Account, stop: &Stop) -> Validation {
+    let mut out = auth_probe(core, acc, stop).await;
+    if out.error.is_some() {
+        return out;
+    }
+
+    // На бан смотрим дважды.
+    //
+    // Бан — приговор: аккаунт пропускается в режиме и выкидывается из круга,
+    // а снять отметку может только удачная проверка. Между тем сайт отдавал
+    // отрицательный `user_status` и живым аккаунтам — через минуту тот же
+    // запрос отвечал «всё в порядке», и человек видел в списке БАН у рабочего
+    // аккаунта. Одного ответа для такого вывода мало.
+    if out.banned && !stop.is_stopped() && !stop.sleep_ms(BAN_RECHECK_MS).await {
+        let again = auth_probe(core, acc, stop).await;
+        // Верим второму ответу, каким бы он ни был: «не забанен» снимает
+        // подозрение, а антибот или сеть делают проверку несостоявшейся —
+        // и статус тогда просто не трогается.
+        if !again.banned {
+            out = again;
         }
     }
 

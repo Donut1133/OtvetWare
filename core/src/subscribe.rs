@@ -133,7 +133,7 @@ pub async fn run_subscriber(core: &Core, acc: &Account, p: &SubParams, log: &Log
             out.blocked = true;
             log("[x] Антибот (418/429) при проверке — статус не меняю.");
         } else if v.banned {
-            log("[x] Аккаунт заблокирован сайтом — пропускаю. Сессия жива, но действия молча не проходят.");
+            log(&api::ban_message(&v));
             out.skipped = true;
             return out;
         } else if v.alive {
