@@ -419,10 +419,16 @@ impl Http {
             && crate::api::auth_failed(&resp)
             && !stop.is_stopped()
             && acc.cookie_header().map(|c| crate::accounts::can_refresh(&c)).unwrap_or(false)
-            && self.refresh_session(acc, stop).await
         {
-            if let Ok(r2) = self.attempt(acc, &url, &opts, stop).await {
-                resp = r2;
+            if self.refresh_session(acc, stop).await {
+                if let Ok(r2) = self.attempt(acc, &url, &opts, stop).await {
+                    resp = r2;
+                }
+            } else {
+                // Главная не открылась — значит, отказ не про аккаунт, а про
+                // дорогу до сайта. Отдаём его сетевой ошибкой: по ней статус
+                // аккаунта не трогается вовсе, а по 403 его бы покрасили.
+                return Err(HttpError::Network("сайт не отвечает — судить об аккаунте нельзя".into()));
             }
         }
         Ok(resp)
@@ -489,11 +495,12 @@ impl Http {
         }
     }
 
-    /// Обменять длинный токен на свежую сессию. `true` — куки сменились.
+    /// Обменять длинный токен на свежую сессию.
     ///
-    /// Результат важен: обновление может и не пройти (сеть, прокси, заглушка
-    /// антибота вместо главной). Молчаливый провал раньше выглядел как разлогин
-    /// — следующий же запрос получал 403 на живом аккаунте.
+    /// Возвращает, ОТКРЫЛАСЬ ли при этом сама главная страница. Это важнее, чем
+    /// сменились ли куки: главная публичная и разлогиненному отдаётся как
+    /// обычно. Значит, если не открылась и она — 403 прилетел не от сайта, а от
+    /// прокси или пограничного сервера, и про аккаунт он не говорит ничего.
     async fn refresh_session(&self, acc: &Account, stop: &Stop) -> bool {
         let before = acc.cookie_header().unwrap_or_default();
         // Аккаунт работает из нескольких задач сразу: обновляет один, ждут все.
@@ -503,14 +510,14 @@ impl Http {
         if acc.cookie_header().unwrap_or_default() != before {
             return true;
         }
-        let _ = Box::pin(self.request(
+        let r = Box::pin(self.request(
             acc,
             "/",
             ReqOpts::get().html().no_retry().no_refresh().timeout_ms(20_000),
             stop,
         ))
         .await;
-        acc.cookie_header().unwrap_or_default() != before
+        matches!(r, Ok(ref x) if x.ok && !x.blocked)
     }
 
     fn build_headers(&self, acc: &Account, persona: &Persona, opts: &ReqOpts) -> HeaderMap {

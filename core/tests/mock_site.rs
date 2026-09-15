@@ -1057,6 +1057,62 @@ async fn token_expired_in_the_body_is_also_refreshed() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Когда 403 отвечает ВСЁ, включая публичную главную, — это не разлогин, а
+/// оборванная дорога до сайта: прокси, пограничный сервер, что угодно. Статус
+/// аккаунта по такому отказу трогать нельзя.
+#[tokio::test]
+async fn a_site_wide_refusal_is_not_a_logout() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("edge403");
+    let mut acc = Account::new("edge");
+    acc.cookies = Some("Auth-RefreshToken=OLD".into());
+    core.accounts.add(acc).unwrap();
+    let acc = core.accounts.get("edge").unwrap();
+
+    // Ни главная, ни API — ничего не отдаётся.
+    m.route(|_r| Some(Res::status(403)));
+
+    let v = otvet_core::api::validate_account(&core, &acc, &Stop::new()).await;
+    assert!(!v.auth_bad, "отказ от дороги, а не от сайта — красить нельзя: {v:?}");
+    assert!(!v.alive);
+    assert!(v.error.is_some(), "должна остаться причина «не смог проверить»: {v:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Разовый отказ по авторизации — ещё не приговор: смотрим второй раз.
+#[tokio::test]
+async fn a_one_off_auth_refusal_is_not_believed() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("flakyauth");
+    let mut acc = Account::new("flaky");
+    acc.cookies = Some("Mpop=x".into()); // обновляться нечем — повтора внутри не будет
+    core.accounts.add(acc).unwrap();
+    let acc = core.accounts.get("flaky").unwrap();
+
+    static CALLS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    m.route(|r| {
+        if r.path == "/api/auth/user" {
+            let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                return Some(Res::status(403));
+            }
+            return Some(Res::json(r#"{"id":9,"username":"живой","user_status":0}"#));
+        }
+        if r.path.starts_with("/api/karma/score/") {
+            return Some(Res::json(
+                r#"{"result":{"total_score":0,"score":{"history":0,"knowledge":0,"discussion":0}}}"#,
+            ));
+        }
+        None
+    });
+
+    let v = otvet_core::api::validate_account(&core, &acc, &Stop::new()).await;
+    assert!(v.alive && !v.auth_bad, "разовый 403 не должен красить аккаунт: {v:?}");
+    assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 2, "разлогин обязан переспрашиваться");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// А вот когда обновляться нечем, 403 — это правда разлогин.
 #[tokio::test]
 async fn a_dead_session_is_still_a_logout() {
@@ -1190,6 +1246,40 @@ async fn posted_reply_is_checked_as_a_stranger() {
         !SAW_COOKIE.load(std::sync::atomic::Ordering::SeqCst),
         "проверка ушла с куками автора — так снос не увидеть"
     );
+}
+
+/// Ответ про чужой аккаунт не должен приниматься ни в каком виде: ни его бан,
+/// ни его id с ником. Такое приезжает, когда на пути до сайта оказался кэш.
+#[tokio::test]
+async fn an_answer_about_someone_else_is_refused() {
+    let (m, _lock) = exclusive().await;
+    let (core, dir) = temp_core("foreign");
+    let mut acc = Account::new("наш");
+    acc.cookies = Some("Mpop=x".into());
+    acc.user_id = Some(1000);
+    acc.username = Some("наш_ник".into());
+    core.accounts.add(acc).unwrap();
+    let acc = core.accounts.get("наш").unwrap();
+
+    m.route(|r| {
+        if r.path == "/api/auth/user" {
+            // Чужой профиль, да ещё и забаненный.
+            return Some(Res::json(r#"{"id":2000,"username":"сосед","user_status":-1}"#));
+        }
+        None
+    });
+
+    let v = otvet_core::api::validate_account(&core, &acc, &Stop::new()).await;
+    assert!(!v.banned, "чужой бан примерять на себя нельзя: {v:?}");
+    assert!(!v.alive && !v.auth_bad, "проверка не состоялась: {v:?}");
+    assert!(v.error.unwrap_or_default().contains("чужой аккаунт"));
+
+    // И ни id, ни ник соседа в базу не попали.
+    otvet_core::api::persist_validation(&core, "наш", &otvet_core::api::Validation::default());
+    let a = core.accounts.get("наш").unwrap();
+    assert_eq!(a.user_id, Some(1000));
+    assert_eq!(a.username.as_deref(), Some("наш_ник"));
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Бан ставится только по двум ответам подряд. Сайт отдавал отрицательный
@@ -2435,7 +2525,8 @@ async fn banned_account_is_seen_and_skipped() {
 
     m.route(|r| {
         if r.path == "/api/auth/user" {
-            return Some(Res::json(r#"{"id":100200301,"username":"botik","user_status":-1}"#));
+            // id тот же, что у аккаунта: ответ про чужой бот теперь отвергает.
+            return Some(Res::json(r#"{"id":1000,"username":"botik","user_status":-1}"#));
         }
         if r.path.starts_with("/api/karma/score/") {
             return Some(Res::json(
